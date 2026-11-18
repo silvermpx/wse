@@ -1,61 +1,11 @@
+use super::{collect, prometheus, reply, topic_count, Checks};
 use crate::config::Cli;
-use crate::protocol::{self, parse_wse_message, WsStream};
+use crate::protocol::{self, WsStream};
 use crate::report::TierResult;
 use crate::stats;
-use futures_util::{SinkExt, StreamExt};
+use futures_util::SinkExt;
 use std::time::Duration;
 use tokio_tungstenite::tungstenite::protocol::Message;
-
-struct CheckResult {
-    passed: u32,
-    failed: u32,
-}
-
-impl CheckResult {
-    fn new() -> Self {
-        Self {
-            passed: 0,
-            failed: 0,
-        }
-    }
-
-    fn check(&mut self, name: &str, condition: bool) {
-        if condition {
-            self.passed += 1;
-            say!("    [PASS] {}", name);
-        } else {
-            self.failed += 1;
-            // Said in the run's exit code, however the test ends.
-            crate::report::failed();
-            say!("    [FAIL] {}", name);
-        }
-    }
-}
-
-/// Drain messages looking for a specific type.
-async fn drain_for_type(
-    ws: &mut WsStream,
-    msg_type: &str,
-    deadline_ms: u64,
-) -> Option<serde_json::Value> {
-    let deadline = tokio::time::Instant::now() + Duration::from_millis(deadline_ms);
-    loop {
-        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-        if remaining.is_zero() {
-            return None;
-        }
-        match tokio::time::timeout(remaining, ws.next()).await {
-            Ok(Some(Ok(msg))) => {
-                if let Some(parsed) = parse_wse_message(&msg) {
-                    if parsed.get("t").and_then(|t| t.as_str()) == Some(msg_type) {
-                        return Some(parsed);
-                    }
-                }
-            }
-            _ => return None,
-        }
-    }
-}
 
 /// Parse a Prometheus metric value from the metrics text.
 fn parse_prometheus_value(metrics: &str, metric_name: &str) -> Option<f64> {
@@ -73,22 +23,9 @@ fn parse_prometheus_value(metrics: &str, metric_name: &str) -> Option<f64> {
     None
 }
 
-/// Parse a Prometheus metric with a specific label.
-fn parse_prometheus_labeled(metrics: &str, metric_name: &str, label_value: &str) -> Option<f64> {
-    let pattern = format!("{}{{topic=\"{}\"}}", metric_name, label_value);
-    for line in metrics.lines() {
-        if line.starts_with('#') {
-            continue;
-        }
-        if line.starts_with(&pattern) {
-            let parts: Vec<&str> = line.rsplitn(2, ' ').collect();
-            if parts.len() == 2 {
-                return parts[0].parse::<f64>().ok();
-            }
-        }
-    }
-    None
-}
+const ALL: u64 = 500;
+const HALF: u64 = 300;
+const WITHIN: Duration = Duration::from_secs(5);
 
 /// Battle Test: Per-Topic Prometheus Metrics
 ///
@@ -104,17 +41,23 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
         "Tests per-topic Prometheus counters and standard server metrics.",
     );
 
-    let mut checks = CheckResult::new();
+    let mut checks = Checks::default();
 
     // =========================================================================
     // Phase 1: Connect and subscribe
     // =========================================================================
-    say!("\n  Phase 1: Connect 3 clients and subscribe");
+    say!("\n  Phase 1: Connect 3 clients and a publisher, and subscribe");
 
+    // The publisher asks for the publications and the metrics; the clients
+    // only receive.
     let mut clients: Vec<WsStream> = Vec::new();
-    for i in 0..3 {
-        let user_id = format!("metrics-user-{}", i);
-        let t = crate::jwt::generate_bench_token(cli.secret.as_bytes(), &user_id);
+    for name in [
+        "metrics-user-0",
+        "metrics-user-1",
+        "metrics-user-2",
+        "metrics-publisher",
+    ] {
+        let t = crate::jwt::generate_bench_token(cli.secret.as_bytes(), name);
         match protocol::connect_and_handshake(
             &cli.host,
             cli.port,
@@ -125,17 +68,21 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
         .await
         {
             Ok(ws) => clients.push(ws),
-            Err(e) => {
-                fail!("    [FAIL] Failed to connect client {}: {}", i, e);
-            }
+            Err(e) => fail!("    [FAIL] Failed to connect {}: {}", name, e),
         }
     }
-    checks.check(
-        &format!("Connected {}/3 clients", clients.len()),
-        clients.len() == 3,
-    );
+    if !checks.check(
+        &format!("Connected {}/4 connections", clients.len()),
+        clients.len() == 4,
+    ) {
+        protocol::close_all(clients).await;
+        checks.finish();
+        return Vec::new();
+    }
+    let Some(mut publisher) = clients.pop() else {
+        return Vec::new();
+    };
 
-    // Subscribe all to battle_all and battle_half
     for client in clients.iter_mut() {
         let cmd = serde_json::json!({
             "t": "battle_cmd",
@@ -149,59 +96,59 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
             .await
             .ok();
     }
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    // The server takes a connection's commands in order: once it has
+    // answered the next one, the subscription is in place.
+    let mut settled = 0;
+    for client in clients.iter_mut() {
+        settled += usize::from(protocol::query_health(client, 5).await.is_some());
+    }
+    checks.check(
+        &format!("The server took all 3 subscriptions (answered {settled})"),
+        settled == 3,
+    );
+
+    // The counters as they stand before: they count since the server
+    // started, so what this run adds is what it compares.
+    let before = prometheus(&mut publisher).await;
+    if !checks.check("Prometheus metrics before publishing", before.is_some()) {
+        let _ = publisher.close(None).await;
+        protocol::close_all(clients).await;
+        checks.finish();
+        return Vec::new();
+    }
+    let before = before.unwrap_or_default();
 
     // =========================================================================
     // Phase 2: Publish controlled traffic to both topics
     // =========================================================================
-    say!("\n  Phase 2: Publish controlled traffic");
+    say!("\n  Phase 2: Publish {ALL} to battle_all, {HALF} to battle_half");
 
-    // Publish 500 messages to battle_all
-    let pub_all = serde_json::json!({
-        "t": "battle_cmd",
-        "p": {
-            "action": "publish_messages",
-            "topic": "battle_all",
-            "count": 500
-        }
-    });
-    clients[0]
-        .send(Message::Text(pub_all.to_string().into()))
-        .await
-        .ok();
-    let _ = drain_for_type(&mut clients[0], "publish_ack", 5000).await;
+    for (topic, count) in [("battle_all", ALL), ("battle_half", HALF)] {
+        let cmd = serde_json::json!({
+            "t": "battle_cmd",
+            "p": {"action": "publish_messages", "topic": topic, "count": count}
+        });
+        publisher
+            .send(Message::Text(cmd.to_string().into()))
+            .await
+            .ok();
+        let ack = reply(&mut publisher, "publish_ack", WITHIN).await;
+        let acked = ack.as_ref().and_then(|p| p["count"].as_u64());
+        checks.check(
+            &format!("Published {count} to {topic} (ack: {acked:?})"),
+            acked == Some(count),
+        );
+    }
 
-    // Publish 300 messages to battle_half
-    let pub_half = serde_json::json!({
-        "t": "battle_cmd",
-        "p": {
-            "action": "publish_messages",
-            "topic": "battle_half",
-            "count": 300
-        }
-    });
-    clients[0]
-        .send(Message::Text(pub_half.to_string().into()))
-        .await
-        .ok();
-    let _ = drain_for_type(&mut clients[0], "publish_ack", 5000).await;
-
-    say!("    Published 500 to battle_all, 300 to battle_half");
-
-    // Drain the received messages so they don't interfere
-    tokio::time::sleep(Duration::from_millis(500)).await;
-    for client in clients.iter_mut() {
-        let deadline = tokio::time::Instant::now() + Duration::from_millis(500);
-        loop {
-            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-            if remaining.is_zero() {
-                break;
-            }
-            match tokio::time::timeout(remaining, client.next()).await {
-                Ok(Some(Ok(_))) => continue,
-                _ => break,
-            }
-        }
+    for (i, client) in clients.iter_mut().enumerate() {
+        let got = collect(client, (ALL, HALF), WITHIN).await;
+        checks.check(
+            &format!(
+                "Client {i} received battle_all={}, battle_half={} (want {ALL}, {HALF})",
+                got.0, got.1
+            ),
+            got == (ALL, HALF),
+        );
     }
 
     // =========================================================================
@@ -209,109 +156,70 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
     // =========================================================================
     say!("\n  Phase 3: Query Prometheus metrics");
 
-    let metrics_cmd = serde_json::json!({
-        "t": "battle_cmd",
-        "p": {"action": "prometheus"}
-    });
-    clients[0]
-        .send(Message::Text(metrics_cmd.to_string().into()))
-        .await
-        .ok();
-
-    let metrics_response = drain_for_type(&mut clients[0], "prometheus_result", 5000).await;
-
-    if let Some(ref parsed) = metrics_response {
-        let metrics_text = parsed
-            .get("p")
-            .and_then(|p| p.get("metrics"))
-            .and_then(|m| m.as_str())
-            .unwrap_or("");
-
-        if metrics_text.is_empty() {
-            checks.check("Prometheus metrics returned data", false);
-            say!("    WARNING: Empty metrics response");
-        } else {
+    match prometheus(&mut publisher).await {
+        Some(metrics_text) => {
             checks.check("Prometheus metrics returned data", true);
+            say!(
+                "    Metrics response: {} lines",
+                metrics_text.lines().count()
+            );
 
-            let line_count = metrics_text.lines().count();
-            say!("    Metrics response: {} lines", line_count);
-
-            // =========================================================================
+            // =================================================================
             // Phase 4: Verify standard metrics
-            // =========================================================================
+            // =================================================================
             say!("\n  Phase 4: Verify standard metrics");
 
-            let connections = parse_prometheus_value(metrics_text, "wse_connections ");
+            let at_least = |name: &str, least: f64| {
+                let got = parse_prometheus_value(&metrics_text, &format!("{name} "));
+                (
+                    format!("{name} >= {least} (got {got:?})"),
+                    got.is_some_and(|v| v >= least),
+                )
+            };
+            // This run's own 4 connections are open, and 2 topics have its
+            // subscribers.
+            for (name, least) in [
+                ("wse_connections", 4.0),
+                ("wse_connections_accepted_total", 4.0),
+                ("wse_topics", 2.0),
+            ] {
+                let (said, holds) = at_least(name, least);
+                checks.check(&said, holds);
+            }
+            let uptime = parse_prometheus_value(&metrics_text, "wse_uptime_seconds ");
             checks.check(
-                &format!("wse_connections > 0 (got {})", connections.unwrap_or(0.0)),
-                connections.map(|v| v > 0.0).unwrap_or(false),
+                &format!("wse_uptime_seconds > 0 (got {uptime:?})"),
+                uptime.is_some_and(|v| v > 0.0),
             );
 
-            let accepted = parse_prometheus_value(metrics_text, "wse_connections_accepted_total ");
-            checks.check(
-                &format!(
-                    "wse_connections_accepted_total > 0 (got {})",
-                    accepted.unwrap_or(0.0)
-                ),
-                accepted.map(|v| v > 0.0).unwrap_or(false),
-            );
-
-            let uptime = parse_prometheus_value(metrics_text, "wse_uptime_seconds ");
-            checks.check(
-                &format!("wse_uptime_seconds > 0 (got {})", uptime.unwrap_or(0.0)),
-                uptime.map(|v| v > 0.0).unwrap_or(false),
-            );
-
-            let topics = parse_prometheus_value(metrics_text, "wse_topics ");
-            checks.check(
-                &format!("wse_topics > 0 (got {})", topics.unwrap_or(0.0)),
-                topics.map(|v| v > 0.0).unwrap_or(false),
-            );
-
-            // =========================================================================
+            // =================================================================
             // Phase 5: Verify per-topic metrics
-            // =========================================================================
+            // =================================================================
             say!("\n  Phase 5: Verify per-topic metrics");
 
-            let battle_all_count =
-                parse_prometheus_labeled(metrics_text, "wse_topic_messages_total", "battle_all");
-            checks.check(
-                &format!(
-                    "Per-topic: battle_all > 0 (got {})",
-                    battle_all_count.unwrap_or(0.0)
-                ),
-                battle_all_count.map(|v| v > 0.0).unwrap_or(false),
-            );
-
-            let battle_half_count =
-                parse_prometheus_labeled(metrics_text, "wse_topic_messages_total", "battle_half");
-            checks.check(
-                &format!(
-                    "Per-topic: battle_half > 0 (got {})",
-                    battle_half_count.unwrap_or(0.0)
-                ),
-                battle_half_count.map(|v| v > 0.0).unwrap_or(false),
-            );
+            for (topic, count) in [("battle_all", ALL), ("battle_half", HALF)] {
+                let added =
+                    topic_count(&metrics_text, topic).checked_sub(topic_count(&before, topic));
+                checks.check(
+                    &format!("Per-topic: {topic} counted {added:?} more (want {count})"),
+                    added == Some(count),
+                );
+            }
         }
-    } else {
-        checks.check("Prometheus metrics response received", false);
+        None => {
+            checks.check("Prometheus metrics returned data", false);
+        }
     }
 
     // =========================================================================
     // Clean up
     // =========================================================================
     say!("\n  Clean up");
+    let _ = publisher.close(None).await;
     protocol::close_all(clients).await;
     say!("    All clients disconnected");
 
-    let total = checks.passed + checks.failed;
-    say!("\n  Result: {}/{} checks passed", checks.passed, total);
-    if checks.failed > 0 {
-        say!("  FAILED");
-        crate::report::failed();
-    } else {
-        say!("  PASSED");
-    }
+    checks.finish();
 
     Vec::new()
 }

@@ -2,7 +2,7 @@ use crate::config::Cli;
 use crate::protocol::{self, WsStream};
 use crate::report::{LatencySummary, TierResult};
 use crate::stats::{self, LatencyHistogram};
-use futures_util::{SinkExt, StreamExt};
+use futures_util::SinkExt;
 use tokio_tungstenite::tungstenite::protocol::Message;
 
 const PINGS_PER_CONNECTION: usize = 50;
@@ -124,7 +124,7 @@ async fn ping_loop(mut ws: WsStream) -> (LatencyHistogram, WsStream, u64) {
         // connection's run, counted short.
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
         let mut answered = false;
-        while let Ok(Some(Ok(msg))) = tokio::time::timeout_at(deadline, ws.next()).await {
+        while let Some(msg) = super::next_before(&mut ws, deadline).await {
             if let Some(parsed) = protocol::parse_wse_message(&msg) {
                 if protocol::is_pong(&parsed) {
                     let rtt_us = t0.elapsed().as_micros() as u64;

@@ -20,7 +20,7 @@ use std::time::Duration;
 ///   bench_fanout_server.py --mode cluster --port 5006 --peers 127.0.0.1:7007 --cluster-port 7006 --cluster-addr 127.0.0.1:7006
 ///   bench_fanout_server.py --mode cluster --port 5007 --peers 127.0.0.1:7006 --cluster-port 7007 --cluster-addr 127.0.0.1:7007
 pub async fn run(cli: &Cli) -> Vec<TierResult> {
-    let port2 = cli.port2.unwrap_or(cli.port + 1);
+    let port2 = cli.port2();
 
     stats::print_header(
         "TEST 11: Multi-Instance Fan-out (Cluster, two servers, split 50/50)",

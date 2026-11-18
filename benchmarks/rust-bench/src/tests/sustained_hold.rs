@@ -168,6 +168,10 @@ async fn hold_loop(
                 let pong_deadline = tokio::time::Instant::now()
                     + std::time::Duration::from_secs(5);
                 loop {
+                    // A ready message is handed over however late it is.
+                    if tokio::time::Instant::now() >= pong_deadline {
+                        break;
+                    }
                     match tokio::time::timeout_at(pong_deadline, ws.next()).await {
                         Ok(Some(Ok(msg))) => {
                             if let Some(parsed) = protocol::parse_wse_message(&msg) {

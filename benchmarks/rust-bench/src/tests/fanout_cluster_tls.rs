@@ -21,7 +21,7 @@ use std::time::Duration;
 ///       --cluster-port 6007 --cluster-addr 127.0.0.1:6007 \
 ///       --tls-cert /tmp/wse_tls_test/server.crt --tls-key /tmp/wse_tls_test/server.key --tls-ca /tmp/wse_tls_test/ca.crt
 pub async fn run(cli: &Cli) -> Vec<TierResult> {
-    let port2 = cli.port2.unwrap_or(cli.port + 1);
+    let port2 = cli.port2();
 
     stats::print_header(
         "TEST 12: Multi-Instance Fan-out with TLS (Cluster, two servers)",

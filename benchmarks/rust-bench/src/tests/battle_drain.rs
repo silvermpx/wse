@@ -1,63 +1,14 @@
+use super::{collect, reply, Checks};
 use crate::config::Cli;
 use crate::protocol::{self, parse_wse_message, WsStream};
 use crate::report::TierResult;
 use crate::stats;
 use futures_util::{SinkExt, StreamExt};
 use std::time::Duration;
+use tokio_tungstenite::tungstenite::handshake::client::generate_key;
 use tokio_tungstenite::tungstenite::protocol::Message;
 
 const CLIENT_COUNT: usize = 10;
-
-struct CheckResult {
-    passed: u32,
-    failed: u32,
-}
-
-impl CheckResult {
-    fn new() -> Self {
-        Self {
-            passed: 0,
-            failed: 0,
-        }
-    }
-
-    fn check(&mut self, name: &str, condition: bool) {
-        if condition {
-            self.passed += 1;
-            say!("    [PASS] {}", name);
-        } else {
-            self.failed += 1;
-            // Said in the run's exit code, however the test ends.
-            crate::report::failed();
-            say!("    [FAIL] {}", name);
-        }
-    }
-}
-
-/// Drain messages looking for a specific type.
-async fn drain_for_type(
-    ws: &mut WsStream,
-    msg_type: &str,
-    deadline_ms: u64,
-) -> Option<serde_json::Value> {
-    let deadline = tokio::time::Instant::now() + Duration::from_millis(deadline_ms);
-    loop {
-        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-        if remaining.is_zero() {
-            return None;
-        }
-        match tokio::time::timeout(remaining, ws.next()).await {
-            Ok(Some(Ok(msg))) => {
-                if let Some(parsed) = parse_wse_message(&msg) {
-                    if parsed.get("t").and_then(|t| t.as_str()) == Some(msg_type) {
-                        return Some(parsed);
-                    }
-                }
-            }
-            _ => return None,
-        }
-    }
-}
 
 /// Wait for a WebSocket Close frame and return the close code.
 async fn wait_for_close(ws: &mut WsStream, deadline_ms: u64) -> Option<u16> {
@@ -73,6 +24,60 @@ async fn wait_for_close(ws: &mut WsStream, deadline_ms: u64) -> Option<u16> {
             }
             Ok(Some(Ok(_))) => continue,
             Ok(Some(Err(_))) | Ok(None) | Err(_) => return None,
+        }
+    }
+}
+
+/// How a new connection to a draining server ended: refused as the
+/// server refuses while it drains (503 to the upgrade, or 1013 "try again
+/// later" when the upgrade got in first), or anything else, said.
+async fn refused_while_draining(cli: &Cli, token: &str) -> Result<String, String> {
+    let request = http::Request::builder()
+        .uri(format!(
+            "ws://{}:{}/wse?protocol_version=1",
+            cli.host, cli.port
+        ))
+        .header("Host", format!("{}:{}", cli.host, cli.port))
+        .header("Connection", "Upgrade")
+        .header("Upgrade", "websocket")
+        .header("Sec-WebSocket-Version", "13")
+        .header("Sec-WebSocket-Key", generate_key())
+        .header("Cookie", format!("access_token={token}"))
+        .body(())
+        .map_err(|e| e.to_string())?;
+    let connected = tokio::time::timeout(
+        Duration::from_secs(5),
+        tokio_tungstenite::connect_async(request),
+    )
+    .await
+    .map_err(|_| "no answer to the upgrade".to_owned())?;
+    let mut ws = match connected {
+        Ok((ws, _)) => ws,
+        Err(tokio_tungstenite::tungstenite::Error::Http(response)) => {
+            return if response.status() == http::StatusCode::SERVICE_UNAVAILABLE {
+                Ok("503 to the upgrade".to_owned())
+            } else {
+                Err(format!("HTTP {} to the upgrade", response.status()))
+            };
+        }
+        Err(e) => return Err(format!("connect failed: {e}")),
+    };
+    loop {
+        match tokio::time::timeout(Duration::from_secs(3), ws.next()).await {
+            Ok(Some(Ok(Message::Close(Some(frame))))) if u16::from(frame.code) == 1013 => {
+                return Ok("closed with 1013".to_owned());
+            }
+            Ok(Some(Ok(Message::Close(frame)))) => {
+                return Err(format!("closed with {:?}", frame.map(|f| f.code)));
+            }
+            Ok(Some(Ok(msg))) => {
+                if parse_wse_message(&msg).is_some_and(|p| p["t"] == "server_ready") {
+                    return Err("let in: server_ready".to_owned());
+                }
+            }
+            Ok(Some(Err(e))) => return Err(format!("read failed: {e}")),
+            Ok(None) => return Err("ended without a close frame".to_owned()),
+            Err(_) => return Err("let in, and nothing came".to_owned()),
         }
     }
 }
@@ -93,7 +98,7 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
         "Tests drain() sends Close(4300) to all clients and rejects new connections.",
     );
 
-    let mut checks = CheckResult::new();
+    let mut checks = Checks::default();
     let token = crate::jwt::generate_bench_token(cli.secret.as_bytes(), "bench-user");
 
     // =========================================================================
@@ -136,7 +141,23 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
             .await
             .ok();
     }
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    // The server takes a connection's commands in order: once it has
+    // answered the next one, the subscription is in place.
+    let mut settled = 0;
+    for client in clients.iter_mut() {
+        settled += usize::from(protocol::query_health(client, 5).await.is_some());
+    }
+    checks.check(
+        &format!(
+            "The server took all {} subscriptions (answered {settled})",
+            clients.len()
+        ),
+        settled == clients.len(),
+    );
+    if clients.is_empty() {
+        checks.finish();
+        return Vec::new();
+    }
 
     // =========================================================================
     // Phase 2: Verify server is handling messages
@@ -156,24 +177,18 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
         .send(Message::Text(pub_cmd.to_string().into()))
         .await
         .ok();
-    let ack = drain_for_type(&mut clients[0], "publish_ack", 5000).await;
-    checks.check("Server accepting messages", ack.is_some());
-
-    // Drain the published messages from all clients
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    // Every client gets all 10 (the publish_ack is passed over).
+    let mut whole = 0;
     for client in clients.iter_mut() {
-        let deadline = tokio::time::Instant::now() + Duration::from_millis(200);
-        loop {
-            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-            if remaining.is_zero() {
-                break;
-            }
-            match tokio::time::timeout(remaining, client.next()).await {
-                Ok(Some(Ok(_))) => continue,
-                _ => break,
-            }
-        }
+        whole += usize::from(collect(client, (10, 0), Duration::from_secs(5)).await == (10, 0));
     }
+    checks.check(
+        &format!(
+            "Server accepting messages: {whole}/{} clients got all 10",
+            clients.len()
+        ),
+        whole == clients.len(),
+    );
 
     // =========================================================================
     // Phase 3: Trigger drain via battle_cmd
@@ -192,7 +207,7 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
         .await
         .ok();
 
-    let drain_ack = drain_for_type(&mut clients[0], "drain_started", 3000).await;
+    let drain_ack = reply(&mut clients[0], "drain_started", Duration::from_secs(3)).await;
     checks.check("Drain started acknowledgment received", drain_ack.is_some());
 
     // =========================================================================
@@ -244,30 +259,10 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
     // =========================================================================
     say!("\n  Phase 5: Verify new connections rejected after drain");
 
-    tokio::time::sleep(Duration::from_secs(1)).await;
-
-    let new_conn_result = protocol::connect_and_handshake(
-        &cli.host,
-        cli.port,
-        &token,
-        "compression=false&protocol_version=1",
-        5,
-    )
-    .await;
-
-    match new_conn_result {
-        Ok(mut ws) => {
-            let close_code = wait_for_close(&mut ws, 3000).await;
-            if close_code.is_some() {
-                checks.check("New connection rejected (got close after connect)", true);
-            } else {
-                checks.check("New connection rejected after drain", false);
-            }
-        }
-        Err(_) => {
-            checks.check("New connection rejected after drain", true);
-        }
-    }
+    match refused_while_draining(cli, &token).await {
+        Ok(how) => checks.check(&format!("New connection refused: {how}"), true),
+        Err(how) => checks.check(&format!("New connection refused (got: {how})"), false),
+    };
 
     // =========================================================================
     // Clean up
@@ -275,14 +270,7 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
     say!("\n  Clean up");
     protocol::close_all(clients_back).await;
 
-    let total = checks.passed + checks.failed;
-    say!("\n  Result: {}/{} checks passed", checks.passed, total);
-    if checks.failed > 0 {
-        say!("  FAILED");
-        crate::report::failed();
-    } else {
-        say!("  PASSED");
-    }
+    checks.finish();
 
     Vec::new()
 }

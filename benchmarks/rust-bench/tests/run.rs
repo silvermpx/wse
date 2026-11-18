@@ -1,7 +1,8 @@
 //! The bench as whatever runs it sees it: a check that failed fails the run,
 //! however its test ends, and `--output json` is the report alone on stdout.
 
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 use futures_util::{SinkExt, StreamExt};
 use tokio::net::TcpListener;
@@ -45,6 +46,26 @@ async fn silent() -> u16 {
                 };
                 let _ = ws.send(Message::text(r#"{"t":"server_ready"}"#)).await;
                 while ws.next().await.is_some() {}
+            });
+        }
+    });
+    port
+}
+
+/// A server that lets every connection in and then floods it with
+/// messages as fast as it can, and answers nothing.
+async fn flood() -> u16 {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        while let Ok((stream, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                let Ok(mut ws) = tokio_tungstenite::accept_async(stream).await else {
+                    return;
+                };
+                let _ = ws.send(Message::text(r#"{"t":"server_ready"}"#)).await;
+                let message = Message::text(r#"{"t":"battle","p":{"ch":"all","seq":0}}"#);
+                while ws.feed(message.clone()).await.is_ok() {}
             });
         }
     });
@@ -175,4 +196,41 @@ async fn a_measurement_of_what_never_came_fails_the_run() {
         assert!(!ok, "{test} got nothing and exited 0: {said}");
         assert!(said.contains("FAILED"), "{test} said no FAILED: {said}");
     }
+}
+
+/// A reader of a flood stops at its deadline: against a server that floods
+/// every connection and answers no ping, the run ends, failed, when its
+/// waits for an answer run out.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_flood_that_answers_nothing_ends_the_run_in_time() {
+    let port = flood().await;
+    let mut child = Command::new(env!("CARGO_BIN_EXE_wse-bench"))
+        .args(["--test", "ping-latency", "--tiers", "2", "--port"])
+        .arg(port.to_string())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let ended = tokio::task::spawn_blocking(move || {
+        // Each connection waits 5 s for its first pong.
+        let deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                return Some(status.success());
+            }
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        ended,
+        Some(false),
+        "None: still reading the flood after 60 s; Some(true): no pong and exited 0"
+    );
 }

@@ -363,9 +363,11 @@ pub async fn query_health(ws: &mut WsStream, timeout_secs: u64) -> Option<serde_
 }
 
 /// Query slow_consumer_drops_total from the server's Prometheus metrics HTTP endpoint.
-/// Returns the counter value, or None if the endpoint is unreachable or metric not found.
-pub async fn query_slow_consumer_drops(host: &str, metrics_port: u16) -> Option<u64> {
+/// Returns the counter value, or None without a metrics port, if the endpoint
+/// is unreachable or the metric not found.
+pub async fn query_slow_consumer_drops(host: &str, metrics_port: Option<u16>) -> Option<u64> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let metrics_port = metrics_port?;
 
     let addr = format!("{host}:{metrics_port}");
     let mut stream = tokio::time::timeout(

@@ -1,3 +1,4 @@
+use super::Checks;
 use crate::config::Cli;
 use crate::protocol::{self, WsStream};
 use crate::report::TierResult;
@@ -39,32 +40,6 @@ impl ChannelCounts {
     }
 }
 
-struct CheckResult {
-    passed: u32,
-    failed: u32,
-}
-
-impl CheckResult {
-    fn new() -> Self {
-        Self {
-            passed: 0,
-            failed: 0,
-        }
-    }
-
-    fn check(&mut self, name: &str, condition: bool) {
-        if condition {
-            self.passed += 1;
-            say!("    [PASS] {}", name);
-        } else {
-            self.failed += 1;
-            // Said in the run's exit code, however the test ends.
-            crate::report::failed();
-            say!("    [FAIL] {}", name);
-        }
-    }
-}
-
 /// Battle Test: Cluster Cross-Instance Verification
 ///
 /// Tests that messages published on Server A are correctly delivered to
@@ -79,7 +54,7 @@ impl CheckResult {
 ///   python benchmarks/bench_battle_server.py --mode cluster --port 5006 --peers 127.0.0.1:5007
 ///   python benchmarks/bench_battle_server.py --mode cluster-subscribe --port 5007 --peers 127.0.0.1:5006
 pub async fn run(cli: &Cli) -> Vec<TierResult> {
-    let port2 = cli.port2.unwrap_or(cli.port + 1);
+    let port2 = cli.port2();
 
     stats::print_header(
         "BATTLE TEST: Cluster Cross-Instance Verification",
@@ -91,7 +66,7 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
 
     let token = crate::jwt::generate_bench_token(cli.secret.as_bytes(), "bench-user");
     let duration = Duration::from_secs(cli.duration);
-    let mut checks = CheckResult::new();
+    let mut checks = Checks::default();
 
     // Verify connectivity to Server B
     say_on!("  Checking Server B (:{})... ", port2);
@@ -338,17 +313,7 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
     // =========================================================================
     // Summary
     // =========================================================================
-    say!(
-        "\n  Result: {}/{} checks passed",
-        checks.passed,
-        checks.passed + checks.failed
-    );
-    if checks.failed > 0 {
-        say!("  FAILED");
-        crate::report::failed();
-    } else {
-        say!("  PASSED");
-    }
+    checks.finish();
 
     Vec::new()
 }

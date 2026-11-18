@@ -1,57 +1,37 @@
+use super::{next_before, prometheus, topic_count, Checks};
 use crate::config::Cli;
-use crate::protocol::{self, query_health};
+use crate::protocol::{self, parse_wse_message, query_health, WsStream};
 use crate::report::TierResult;
 use crate::stats;
-use futures_util::{SinkExt, StreamExt};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use futures_util::SinkExt;
 use std::time::Duration;
 use tokio_tungstenite::tungstenite::protocol::Message;
 
-struct CheckResult {
-    passed: u32,
-    failed: u32,
-}
-
-impl CheckResult {
-    fn new() -> Self {
-        Self {
-            passed: 0,
-            failed: 0,
-        }
-    }
-
-    fn check(&mut self, name: &str, condition: bool) {
-        if condition {
-            self.passed += 1;
-            say!("    [PASS] {}", name);
-        } else {
-            self.failed += 1;
-            // Said in the run's exit code, however the test ends.
-            crate::report::failed();
-            say!("    [FAIL] {}", name);
-        }
-    }
+/// What Server B has taken off the cluster link: the wire bytes and the
+/// battle_all messages they carried.
+async fn cluster_in(ws: &mut WsStream) -> Option<(u64, u64)> {
+    let bytes = query_health(ws, 5).await?["cluster_bytes_received"].as_u64()?;
+    let messages = topic_count(&prometheus(ws).await?, "battle_all");
+    Some((bytes, messages))
 }
 
 /// Battle Test: Inter-Peer zstd Compression
 ///
-/// Verifies zstd compression on cluster wire by comparing compressed bytes
-/// received vs message count. With ~1KB messages, compressed bytes/message
-/// should be significantly less than 1024 if zstd is working.
+/// Measures what the cluster link carries per message on Server B: the wire
+/// bytes it took off the link over the battle_all messages that came in on
+/// it, against the size of those messages as its subscriber gets them. The
+/// 1 KiB messages of `--message-size 1024` are padded, so zstd takes them to
+/// a fraction of their size; uncompressed, a message costs more than itself.
 ///
 /// Uses two connections to Server B:
 ///   - A subscriber connection that counts received messages (spawned task)
-///   - A separate health-only connection for reliable bytes_received queries
-///
-/// The subscriber connection gets flooded by cluster-forwarded messages,
-/// so it cannot be used for health queries (backpressure would drop responses).
+///   - A separate health-only connection for the counters
 ///
 /// Requires: 2 cluster servers with --message-size 1024
 ///   python benchmarks/bench_battle_server.py --mode cluster --port 5006 --peers 127.0.0.1:5007 --message-size 1024
 ///   python benchmarks/bench_battle_server.py --mode cluster-subscribe --port 5007 --peers 127.0.0.1:5006
 pub async fn run(cli: &Cli) -> Vec<TierResult> {
-    let port2 = cli.port2.unwrap_or(cli.port + 1);
+    let port2 = cli.port2();
 
     stats::print_header(
         "BATTLE TEST: Inter-Peer Compression",
@@ -62,8 +42,8 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
     );
 
     let token = crate::jwt::generate_bench_token(cli.secret.as_bytes(), "bench-user");
-    let duration = Duration::from_secs(cli.duration);
-    let mut checks = CheckResult::new();
+    let duration = Duration::from_secs(cli.duration.max(1));
+    let mut checks = Checks::default();
 
     // =========================================================================
     // Phase 1: Connect health + subscriber connections to Server B
@@ -110,8 +90,6 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
     };
     say!("    Connected 2 connections to Server B (:{})", port2);
 
-    tokio::time::sleep(Duration::from_secs(2)).await;
-
     let health_b = query_health(&mut ws_health, 5).await;
     if let Some(ref h) = health_b {
         let connected = h
@@ -130,171 +108,115 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
     } else {
         say!("    WARNING: No health response from Server B");
         checks.check("Cluster connected (Server B)", false);
-        checks.check("No unknown message types", false);
     }
 
     // =========================================================================
-    // Phase 2: Subscribe and start counting messages
+    // Phase 2: Subscribe, and wait for Server A's messages to arrive
     // =========================================================================
-    say!("\n  Phase 2: Subscribe and start counting messages");
+    say!("\n  Phase 2: Subscribe and wait for messages from Server A");
 
-    // Subscribe the subscriber connection (triggers RESYNC to Server A)
     let cmd = serde_json::json!({
         "t": "battle_cmd",
         "p": {"action": "subscribe", "topics": ["battle_all"]}
     });
     let _ = ws_sub.send(Message::Text(cmd.to_string().into())).await;
-    say!("    Subscribed to battle_all (subscriber conn)");
 
-    // Wait for RESYNC propagation
-    say!("    Waiting 3s for RESYNC propagation...");
-    tokio::time::sleep(Duration::from_secs(3)).await;
-
-    // Record initial bytes_received via health connection
-    let initial = query_health(&mut ws_health, 5).await;
-    let initial_bytes = initial
-        .as_ref()
-        .and_then(|h| h.get("cluster_bytes_received").and_then(|v| v.as_u64()))
-        .unwrap_or(0);
-    say!("    Initial cluster_bytes_received: {}", initial_bytes);
+    // Server A forwards battle_all once it hears of the subscription.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let mut flowing = false;
+    while let Some(msg) = next_before(&mut ws_sub, deadline).await {
+        if parse_wse_message(&msg).is_some_and(|p| p["t"] == "battle") {
+            flowing = true;
+            break;
+        }
+    }
+    let before = if flowing {
+        cluster_in(&mut ws_health).await
+    } else {
+        None
+    };
+    if !checks.check(
+        &format!("Messages from Server A arrive, counters read ({before:?})"),
+        before.is_some(),
+    ) {
+        protocol::close_all(vec![ws_health, ws_sub]).await;
+        checks.finish();
+        return Vec::new();
+    }
+    let (bytes_before, messages_before) = before.unwrap_or_default();
 
     // =========================================================================
     // Phase 3: Count messages on subscriber for duration
     // =========================================================================
     say!("\n  Phase 3: Count messages for {}s", duration.as_secs());
 
-    let msg_count = Arc::new(AtomicU64::new(0));
-    let counter = msg_count.clone();
-    let deadline_ms = duration.as_millis() as u64;
-
-    // Spawn a task to count received messages on the subscriber connection
+    // The subscriber is read on its own task: its flood never waits for the
+    // counter queries.
     let count_handle = tokio::spawn(async move {
-        let deadline = tokio::time::Instant::now() + Duration::from_millis(deadline_ms);
-        loop {
-            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-            if remaining.is_zero() {
-                break;
-            }
-            match tokio::time::timeout(remaining, ws_sub.next()).await {
-                Ok(Some(Ok(Message::Text(_)))) => {
-                    counter.fetch_add(1, Ordering::Relaxed);
-                }
-                Ok(Some(Ok(_))) => continue,
-                _ => break,
+        let deadline = tokio::time::Instant::now() + duration;
+        let (mut received, mut size) = (0u64, 0u64);
+        while let Some(msg) = next_before(&mut ws_sub, deadline).await {
+            if let Message::Text(text) = &msg {
+                received += 1;
+                size += text.len() as u64;
             }
         }
-        ws_sub
+        (ws_sub, received, size)
     });
-
-    // Wait for the counting task to finish
-    let ws_sub = count_handle.await.unwrap();
-    let received = msg_count.load(Ordering::Relaxed);
+    let (ws_sub, received, size) = match count_handle.await {
+        Ok(counted) => counted,
+        Err(e) => {
+            fail!("    [FAIL] The subscriber's reader failed: {}", e);
+            protocol::close_all(vec![ws_health]).await;
+            checks.finish();
+            return Vec::new();
+        }
+    };
     say!("    Subscriber received {} messages", received);
 
     // =========================================================================
-    // Phase 4: Verify compression via metrics
+    // Phase 4: Verify compression on the wire
     // =========================================================================
-    say!("\n  Phase 4: Verify compression ratio");
+    say!("\n  Phase 4: Verify compression on the wire");
 
-    let final_health = query_health(&mut ws_health, 5).await;
-    let final_bytes = final_health
-        .as_ref()
-        .and_then(|h| h.get("cluster_bytes_received").and_then(|v| v.as_u64()))
-        .unwrap_or(0);
-    let final_delivered = final_health
-        .as_ref()
-        .and_then(|h| h.get("cluster_messages_delivered").and_then(|v| v.as_u64()))
-        .unwrap_or(0);
-    let final_dropped = final_health
-        .as_ref()
-        .and_then(|h| h.get("cluster_messages_dropped").and_then(|v| v.as_u64()))
-        .unwrap_or(0);
-
-    let bytes_delta = final_bytes.saturating_sub(initial_bytes);
-    let initial_delivered = initial
-        .as_ref()
-        .and_then(|h| h.get("cluster_messages_delivered").and_then(|v| v.as_u64()))
-        .unwrap_or(0);
-    let initial_dropped = initial
-        .as_ref()
-        .and_then(|h| h.get("cluster_messages_dropped").and_then(|v| v.as_u64()))
-        .unwrap_or(0);
-    let delivered_delta = final_delivered.saturating_sub(initial_delivered);
-    let dropped_delta = final_dropped.saturating_sub(initial_dropped);
-    // Total messages = delivered + dropped (all messages that arrived via cluster wire)
-    let total_msgs = delivered_delta + dropped_delta + received;
-
-    say!("    Final cluster_bytes_received: {}", final_bytes);
-    say!("    Delta bytes: {}", bytes_delta);
+    let after = cluster_in(&mut ws_health).await;
+    checks.check(&format!("Counters read again ({after:?})"), after.is_some());
+    let (bytes_after, messages_after) = after.unwrap_or((bytes_before, messages_before));
+    let wire = bytes_after.saturating_sub(bytes_before);
+    let carried = messages_after.saturating_sub(messages_before);
+    let message_size = size.checked_div(received).unwrap_or(0);
+    let per_message = wire.checked_div(carried).unwrap_or(u64::MAX);
     say!(
-        "    Cluster delivered_delta={}, dropped_delta={}, subscriber_received={}",
-        delivered_delta,
-        dropped_delta,
-        received
-    );
-    say!("    Total messages estimate: {}", total_msgs);
-
-    // Check 1: Cluster bytes are flowing
-    checks.check(
-        &format!("Cluster bytes received > 0 (got {})", bytes_delta),
-        bytes_delta > 0,
+        "    {} wire bytes for {} messages over the link: {} per message",
+        wire,
+        carried,
+        per_message
     );
 
-    // Check 2: Messages are being received by subscriber
     checks.check(
-        &format!("Subscriber received messages (got {})", received),
+        &format!("Messages came over the link (got {carried})"),
+        carried > 0,
+    );
+    checks.check(
+        &format!("Subscriber received messages (got {received})"),
         received > 0,
     );
-
-    // Check 3: Compression active
-    // broadcast_all messages bypass cluster_messages_delivered/dropped counters,
-    // so we can't compute exact per-message compression. Instead verify that
-    // the cluster wire bandwidth is significantly less than the uncompressed rate.
-    // Server A publishes 1KB messages at 100K+/s => 100MB/s uncompressed minimum.
-    // With zstd on repetitive data we expect < 50MB/s on the wire.
-    let bytes_per_sec = if duration.as_secs() > 0 {
-        bytes_delta / duration.as_secs()
-    } else {
-        bytes_delta
-    };
-    let mb_per_sec = bytes_per_sec as f64 / (1024.0 * 1024.0);
-    // Estimate uncompressed rate: subscriber gets ~52K/s (with drops).
-    // With ~90% drop rate, real publish rate is ~500K/s.
-    // 500K/s * 1024 bytes = 500 MB/s uncompressed.
-    let estimated_uncompressed_mbps =
-        (received as f64 / duration.as_secs() as f64) * 1024.0 / (1024.0 * 1024.0) * 10.0; // ~10x drop factor
-    say!(
-        "    Wire throughput: {:.1} MB/s (estimated uncompressed: {:.0} MB/s)",
-        mb_per_sec,
-        estimated_uncompressed_mbps
+    // The measure holds only for messages zstd has something to take off.
+    checks.check(
+        &format!("The messages are the 1 KiB ones (got {message_size} bytes each)"),
+        message_size >= 1000,
     );
-    // Wire throughput should be less than estimated uncompressed throughput
-    // if compression is working. Use a generous threshold.
     checks.check(
         &format!(
-            "Wire throughput {:.0} MB/s < estimated uncompressed {:.0} MB/s",
-            mb_per_sec, estimated_uncompressed_mbps
+            "Compressed on the wire: {per_message} bytes per {message_size}-byte message (want under half)"
         ),
-        mb_per_sec < estimated_uncompressed_mbps,
+        per_message.saturating_mul(2) < message_size,
     );
 
     // Cleanup
     protocol::close_all(vec![ws_health, ws_sub]).await;
 
-    // =========================================================================
-    // Summary
-    // =========================================================================
-    say!(
-        "\n  Result: {}/{} checks passed",
-        checks.passed,
-        checks.passed + checks.failed
-    );
-    if checks.failed > 0 {
-        say!("  FAILED");
-        crate::report::failed();
-    } else {
-        say!("  PASSED");
-    }
+    checks.finish();
 
     Vec::new()
 }

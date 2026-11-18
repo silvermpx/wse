@@ -1,3 +1,4 @@
+use super::Checks;
 use crate::config::Cli;
 use crate::protocol::{self, parse_wse_message, WsStream};
 use crate::report::TierResult;
@@ -12,32 +13,6 @@ const WORKER_COUNT: usize = 5;
 const FANOUT_COUNT: usize = 2;
 const PUBLISH_COUNT: u64 = 500;
 const QUEUE_GROUP_TOPIC: &str = "battle_all";
-
-struct CheckResult {
-    passed: u32,
-    failed: u32,
-}
-
-impl CheckResult {
-    fn new() -> Self {
-        Self {
-            passed: 0,
-            failed: 0,
-        }
-    }
-
-    fn check(&mut self, name: &str, condition: bool) {
-        if condition {
-            self.passed += 1;
-            say!("    [PASS] {}", name);
-        } else {
-            self.failed += 1;
-            // Said in the run's exit code, however the test ends.
-            crate::report::failed();
-            say!("    [FAIL] {}", name);
-        }
-    }
-}
 
 /// Drain messages, counting those with t="battle". Returns count.
 async fn drain_battle_count(ws: &mut WsStream, deadline_ms: u64) -> u64 {
@@ -99,7 +74,7 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
         "Tests round-robin dispatch to queue group members vs normal fanout subscribers.",
     );
 
-    let mut checks = CheckResult::new();
+    let mut checks = Checks::default();
     let token = crate::jwt::generate_bench_token(cli.secret.as_bytes(), "bench-user");
 
     // =========================================================================
@@ -415,14 +390,7 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
     protocol::close_all(fanout_back).await;
     say!("    All clients disconnected");
 
-    let total = checks.passed + checks.failed;
-    say!("\n  Result: {}/{} checks passed", checks.passed, total);
-    if checks.failed > 0 {
-        say!("  FAILED");
-        crate::report::failed();
-    } else {
-        say!("  PASSED");
-    }
+    checks.finish();
 
     Vec::new()
 }

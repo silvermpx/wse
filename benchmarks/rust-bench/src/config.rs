@@ -65,9 +65,32 @@ pub struct Cli {
 }
 
 impl Cli {
-    /// Metrics port for a given server port. Defaults to port + 1000.
-    pub fn metrics_port_for(&self, server_port: u16) -> u16 {
-        self.metrics_port.unwrap_or(server_port + 1000)
+    /// The second server's port: --port2, or the port after --port.
+    pub fn port2(&self) -> u16 {
+        self.port2.unwrap_or_else(|| self.port_after(1, "--port2"))
+    }
+
+    /// The third server's port: --port3, or two after --port.
+    pub fn port3(&self) -> u16 {
+        self.port3.unwrap_or_else(|| self.port_after(2, "--port3"))
+    }
+
+    /// `n` ports after --port; with no such port, the run ends as on a bad
+    /// argument, naming the one to give.
+    fn port_after(&self, n: u16, flag: &str) -> u16 {
+        self.port.checked_add(n).unwrap_or_else(|| {
+            eprintln!(
+                "error: --port {} has no port {n} after it: give {flag}",
+                self.port
+            );
+            std::process::exit(2)
+        })
+    }
+
+    /// Metrics port for a given server port. Defaults to port + 1000; a
+    /// port with no room for that above it has none.
+    pub fn metrics_port_for(&self, server_port: u16) -> Option<u16> {
+        self.metrics_port.or(server_port.checked_add(1000))
     }
 }
 
@@ -143,5 +166,36 @@ impl Cli {
             "ws://{}:{}/wse?format=msgpack&protocol_version=1",
             self.host, self.port
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_port_with_no_room_above_it_has_no_default_metrics_port() {
+        let cli = Cli::parse_from(["wse-bench"]);
+        assert_eq!(cli.metrics_port_for(5006), Some(6006));
+        assert_eq!(cli.metrics_port_for(64_535), Some(65_535));
+        assert_eq!(cli.metrics_port_for(64_536), None);
+        let given = Cli::parse_from(["wse-bench", "--metrics-port", "9100"]);
+        assert_eq!(given.metrics_port_for(65_000), Some(9100));
+    }
+
+    #[test]
+    fn the_other_servers_default_to_the_ports_after() {
+        let cli = Cli::parse_from(["wse-bench", "--port", "65533"]);
+        assert_eq!((cli.port2(), cli.port3()), (65_534, 65_535));
+        let given = Cli::parse_from([
+            "wse-bench",
+            "--port",
+            "65535",
+            "--port2",
+            "7",
+            "--port3",
+            "8",
+        ]);
+        assert_eq!((given.port2(), given.port3()), (7, 8));
     }
 }

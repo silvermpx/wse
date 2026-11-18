@@ -1,3 +1,4 @@
+use super::{reply, Checks, EXTRA};
 use crate::config::Cli;
 use crate::protocol::{self, parse_wse_message, WsStream};
 use crate::report::TierResult;
@@ -9,79 +10,50 @@ use tokio_tungstenite::tungstenite::protocol::Message;
 const PRESENCE_CLIENTS: usize = 5;
 const PRESENCE_TOPIC: &str = "presence_room";
 
-struct CheckResult {
-    passed: u32,
-    failed: u32,
+fn user(i: usize) -> String {
+    format!("presence-user-{i}")
 }
 
-impl CheckResult {
-    fn new() -> Self {
-        Self {
-            passed: 0,
-            failed: 0,
-        }
-    }
-
-    fn check(&mut self, name: &str, condition: bool) {
-        if condition {
-            self.passed += 1;
-            say!("    [PASS] {}", name);
-        } else {
-            self.failed += 1;
-            // Said in the run's exit code, however the test ends.
-            crate::report::failed();
-            say!("    [FAIL] {}", name);
-        }
-    }
-}
-
-/// Read messages from a WsStream until deadline, looking for messages with
-/// a specific "t" type. Returns the count found.
-async fn drain_for_type(ws: &mut WsStream, msg_type: &str, deadline_ms: u64) -> u32 {
-    let deadline = tokio::time::Instant::now() + Duration::from_millis(deadline_ms);
-    let mut count = 0u32;
+/// The payloads of the `kind` events `ws` gets: `want` of them, or fewer if
+/// `within` passes first, and whatever else of the kind comes in a short
+/// while after, so that one too many shows.
+async fn events_of(
+    ws: &mut WsStream,
+    kind: &str,
+    want: usize,
+    within: Duration,
+) -> Vec<serde_json::Value> {
+    let mut got = Vec::with_capacity(want);
+    let mut until = tokio::time::Instant::now() + if want == 0 { EXTRA } else { within };
     loop {
-        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-        if remaining.is_zero() {
+        let left = until.saturating_duration_since(tokio::time::Instant::now());
+        if left.is_zero() {
             break;
         }
-        match tokio::time::timeout(remaining, ws.next()).await {
+        match tokio::time::timeout(left, ws.next()).await {
             Ok(Some(Ok(msg))) => {
-                if let Some(parsed) = parse_wse_message(&msg) {
-                    if parsed.get("t").and_then(|t| t.as_str()) == Some(msg_type) {
-                        count += 1;
+                let Some(mut parsed) = parse_wse_message(&msg) else {
+                    continue;
+                };
+                if parsed["t"] == kind {
+                    got.push(parsed["p"].take());
+                    if got.len() == want {
+                        until = tokio::time::Instant::now() + EXTRA;
                     }
                 }
             }
             _ => break,
         }
     }
-    count
+    got
 }
 
-/// Drain messages looking for a specific type and return the parsed JSON payload.
-async fn drain_for_type_with_data(
-    ws: &mut WsStream,
-    msg_type: &str,
-    deadline_ms: u64,
-) -> Option<serde_json::Value> {
-    let deadline = tokio::time::Instant::now() + Duration::from_millis(deadline_ms);
-    loop {
-        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-        if remaining.is_zero() {
-            return None;
-        }
-        match tokio::time::timeout(remaining, ws.next()).await {
-            Ok(Some(Ok(msg))) => {
-                if let Some(parsed) = parse_wse_message(&msg) {
-                    if parsed.get("t").and_then(|t| t.as_str()) == Some(msg_type) {
-                        return Some(parsed);
-                    }
-                }
-            }
-            _ => return None,
-        }
-    }
+/// The users the events are of, in the order they came.
+fn users(events: &[serde_json::Value]) -> Vec<&str> {
+    events
+        .iter()
+        .filter_map(|p| p["user_id"].as_str())
+        .collect()
 }
 
 /// Battle Test: Presence Tracking
@@ -99,7 +71,7 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
         "Tests presence join/leave events, multi-user tracking, presence query, data updates.",
     );
 
-    let mut checks = CheckResult::new();
+    let mut checks = Checks::default();
 
     // =========================================================================
     // Phase 1: Connect clients with DIFFERENT user IDs
@@ -137,13 +109,17 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
     );
 
     // =========================================================================
-    // Phase 2: Subscribe first 3 clients with presence data
+    // Phase 2: Subscribe the first 3 clients with presence, one at a time
     // =========================================================================
     say!(
         "\n  Phase 2: Subscribe 3 clients to '{}' with presence",
         PRESENCE_TOPIC
     );
 
+    // Each waits for its own join before the next subscribes, so the topic
+    // has been told of it first: client k hears the joins of k and later.
+    let within = Duration::from_secs(3);
+    let mut joins: [Vec<serde_json::Value>; 3] = Default::default();
     for (i, client) in clients.iter_mut().enumerate().take(3) {
         let subscribe_msg = serde_json::json!({
             "t": "battle_cmd",
@@ -157,33 +133,24 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
             .send(Message::Text(subscribe_msg.to_string().into()))
             .await
             .ok();
+        joins[i] = events_of(client, "presence_join", 1, within).await;
     }
-
-    // Wait for server to process subscriptions and broadcast presence events
-    tokio::time::sleep(Duration::from_millis(800)).await;
 
     // =========================================================================
     // Phase 3: Verify presence_join events
     // =========================================================================
     say!("\n  Phase 3: Verify presence_join events");
 
-    // Use hard deadline (3s) - battle server may be flooding, so per-message
-    // timeout won't work. Drain all messages within deadline looking for joins.
-    let mut join_counts = [0u32; 3];
     for (i, client) in clients.iter_mut().enumerate().take(3) {
-        join_counts[i] = drain_for_type(client, "presence_join", 3000).await;
+        let later = events_of(client, "presence_join", 2 - i, within).await;
+        joins[i].extend(later);
+        let want: Vec<String> = (i..3).map(user).collect();
+        let got = users(&joins[i]);
+        checks.check(
+            &format!("Client {i} heard the joins of {want:?} (got {got:?})"),
+            got == want,
+        );
     }
-
-    // Client 0 subscribed first, should see joins from client 1 and 2 (+ possibly self)
-    checks.check(
-        &format!("Client 0 received join events (got {})", join_counts[0]),
-        join_counts[0] >= 2,
-    );
-    // Client 2 subscribed last, should see at least its own join
-    checks.check(
-        &format!("Client 2 received join events (got {})", join_counts[2]),
-        join_counts[2] >= 1,
-    );
 
     // =========================================================================
     // Phase 4: Query presence via battle_cmd
@@ -202,32 +169,20 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
         .await
         .ok();
 
-    let mut query_members = 0usize;
-    if let Some(parsed) = drain_for_type_with_data(&mut clients[0], "presence_result", 3000).await {
-        say!(
-            "    presence_result payload: {}",
-            serde_json::to_string(&parsed).unwrap_or_default()
-        );
-        if let Some(members) = parsed
-            .get("p")
-            .and_then(|p| p.get("members"))
-            .and_then(|m| m.as_object())
-        {
-            query_members = members.len();
-        } else if let Some(members) = parsed
-            .get("p")
-            .and_then(|p| p.get("members"))
-            .and_then(|m| m.as_array())
-        {
-            query_members = members.len();
-            say!("    NOTE: members is array, not object");
+    let mut members: Vec<String> = Vec::new();
+    match reply(&mut clients[0], "presence_result", within).await {
+        Some(p) => {
+            if let Some(found) = p["members"].as_object() {
+                members = found.keys().cloned().collect();
+                members.sort_unstable();
+            }
         }
-    } else {
-        say!("    WARNING: No presence_result response received");
+        None => say!("    WARNING: No presence_result response received"),
     }
+    let want: Vec<String> = (0..3).map(user).collect();
     checks.check(
-        &format!("Presence query shows 3 members (got {})", query_members),
-        query_members == 3,
+        &format!("Presence query shows {want:?} (got {members:?})"),
+        members == want,
     );
 
     // =========================================================================
@@ -236,13 +191,14 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
     say!("\n  Phase 5: Disconnect client 2, verify presence_leave");
 
     let _ = clients[2].close(None).await;
-    tokio::time::sleep(Duration::from_millis(500)).await;
-
-    let leave_count_0 = drain_for_type(&mut clients[0], "presence_leave", 3000).await;
-    checks.check(
-        &format!("Client 0 received presence_leave (got {})", leave_count_0),
-        leave_count_0 >= 1,
-    );
+    for (i, client) in clients.iter_mut().enumerate().take(2) {
+        let left = events_of(client, "presence_leave", 1, within).await;
+        let got = users(&left);
+        checks.check(
+            &format!("Client {i} heard the leave of {} (got {got:?})", user(2)),
+            got == [user(2)],
+        );
+    }
 
     // =========================================================================
     // Phase 6: Update presence data for client 1
@@ -260,13 +216,19 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
         .send(Message::Text(update_msg.to_string().into()))
         .await
         .ok();
-    tokio::time::sleep(Duration::from_millis(300)).await;
 
-    let update_count_0 = drain_for_type(&mut clients[0], "presence_update", 3000).await;
-    checks.check(
-        &format!("Client 0 received presence_update (got {})", update_count_0),
-        update_count_0 >= 1,
-    );
+    for (i, client) in clients.iter_mut().enumerate().take(2) {
+        let updates = events_of(client, "presence_update", 1, within).await;
+        let got = users(&updates);
+        let away = updates.iter().all(|p| p["data"]["status"] == "away");
+        checks.check(
+            &format!(
+                "Client {i} heard {} go away (got {got:?}, away: {away})",
+                user(1)
+            ),
+            got == [user(1)] && away,
+        );
+    }
 
     // =========================================================================
     // Phase 7: Clean up
@@ -281,14 +243,7 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
     // =========================================================================
     // Summary
     // =========================================================================
-    let total = checks.passed + checks.failed;
-    say!("\n  Result: {}/{} checks passed", checks.passed, total);
-    if checks.failed > 0 {
-        say!("  FAILED");
-        crate::report::failed();
-    } else {
-        say!("  PASSED");
-    }
+    checks.finish();
 
     Vec::new()
 }

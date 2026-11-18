@@ -1,96 +1,15 @@
+use super::{collect, reply, Checks};
 use crate::config::Cli;
-use crate::protocol::{self, parse_wse_message, WsStream};
+use crate::protocol::{self, WsStream};
 use crate::report::TierResult;
 use crate::stats;
-use futures_util::{SinkExt, StreamExt};
+use futures_util::SinkExt;
 use std::time::Duration;
 use tokio_tungstenite::tungstenite::protocol::Message;
 
 const PUBLISH_COUNT: u64 = 200;
 
-struct CheckResult {
-    passed: u32,
-    failed: u32,
-}
-
-impl CheckResult {
-    fn new() -> Self {
-        Self {
-            passed: 0,
-            failed: 0,
-        }
-    }
-
-    fn check(&mut self, name: &str, condition: bool) {
-        if condition {
-            self.passed += 1;
-            say!("    [PASS] {}", name);
-        } else {
-            self.failed += 1;
-            // Said in the run's exit code, however the test ends.
-            crate::report::failed();
-            say!("    [FAIL] {}", name);
-        }
-    }
-}
-
-/// Drain messages, counting by channel. Returns (battle_all_count, battle_half_count).
-async fn drain_battle_by_channel(ws: &mut WsStream, deadline_ms: u64) -> (u64, u64) {
-    let deadline = tokio::time::Instant::now() + Duration::from_millis(deadline_ms);
-    let mut all_count = 0u64;
-    let mut half_count = 0u64;
-    loop {
-        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-        if remaining.is_zero() {
-            break;
-        }
-        match tokio::time::timeout(remaining, ws.next()).await {
-            Ok(Some(Ok(msg))) => {
-                if let Some(parsed) = parse_wse_message(&msg) {
-                    if parsed.get("t").and_then(|t| t.as_str()) == Some("battle") {
-                        let ch = parsed
-                            .get("p")
-                            .and_then(|p| p.get("ch"))
-                            .and_then(|c| c.as_str())
-                            .unwrap_or("");
-                        match ch {
-                            "battle_all" => all_count += 1,
-                            "battle_half" => half_count += 1,
-                            _ => {}
-                        }
-                    }
-                }
-            }
-            _ => break,
-        }
-    }
-    (all_count, half_count)
-}
-
-/// Drain messages looking for a specific type.
-async fn drain_for_type(
-    ws: &mut WsStream,
-    msg_type: &str,
-    deadline_ms: u64,
-) -> Option<serde_json::Value> {
-    let deadline = tokio::time::Instant::now() + Duration::from_millis(deadline_ms);
-    loop {
-        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-        if remaining.is_zero() {
-            return None;
-        }
-        match tokio::time::timeout(remaining, ws.next()).await {
-            Ok(Some(Ok(msg))) => {
-                if let Some(parsed) = parse_wse_message(&msg) {
-                    if parsed.get("t").and_then(|t| t.as_str()) == Some(msg_type) {
-                        return Some(parsed);
-                    }
-                }
-            }
-            _ => return None,
-        }
-    }
-}
+const WITHIN: Duration = Duration::from_secs(5);
 
 /// Battle Test: Topic ACL (Access Control Lists)
 ///
@@ -104,7 +23,7 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
         "Tests topic access control with allow/deny glob patterns.",
     );
 
-    let mut checks = CheckResult::new();
+    let mut checks = Checks::default();
 
     // =========================================================================
     // Phase 1: Connect 4 clients with different ACL rules
@@ -159,7 +78,8 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
         .send(Message::Text(acl_a.to_string().into()))
         .await
         .ok();
-    let _ = drain_for_type(&mut clients[0], "acl_set", 3000).await;
+    let set = reply(&mut clients[0], "acl_set", WITHIN).await;
+    checks.check("Client A's ACL was set", set.is_some());
 
     // Client B: allow=["battle_*"] (glob pattern)
     let acl_b = serde_json::json!({
@@ -170,7 +90,8 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
         .send(Message::Text(acl_b.to_string().into()))
         .await
         .ok();
-    let _ = drain_for_type(&mut clients[1], "acl_set", 3000).await;
+    let set = reply(&mut clients[1], "acl_set", WITHIN).await;
+    checks.check("Client B's ACL was set", set.is_some());
 
     // Client C: deny=["battle_half"]
     let acl_c = serde_json::json!({
@@ -181,7 +102,8 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
         .send(Message::Text(acl_c.to_string().into()))
         .await
         .ok();
-    let _ = drain_for_type(&mut clients[2], "acl_set", 3000).await;
+    let set = reply(&mut clients[2], "acl_set", WITHIN).await;
+    checks.check("Client C's ACL was set", set.is_some());
 
     // Client D: no ACL (unrestricted)
     say!("    ACL rules set on clients A, B, C (D = unrestricted)");
@@ -204,7 +126,16 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
             .await
             .ok();
     }
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    // The server takes a connection's commands in order: once it has
+    // answered the next one, the subscription is in place.
+    let mut settled = 0;
+    for client in clients.iter_mut() {
+        settled += usize::from(protocol::query_health(client, 5).await.is_some());
+    }
+    checks.check(
+        &format!("The server took all 4 subscriptions (answered {settled})"),
+        settled == 4,
+    );
 
     // =========================================================================
     // Phase 4: Publish messages to both topics
@@ -246,7 +177,12 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
         .send(Message::Text(pub_all.to_string().into()))
         .await
         .ok();
-    let _ = drain_for_type(&mut publisher, "publish_ack", 5000).await;
+    let ack = reply(&mut publisher, "publish_ack", WITHIN).await;
+    let count = ack.as_ref().and_then(|p| p["count"].as_u64());
+    checks.check(
+        &format!("Published {PUBLISH_COUNT} to battle_all (ack: {count:?})"),
+        count == Some(PUBLISH_COUNT),
+    );
 
     // Publish to battle_half
     let pub_half = serde_json::json!({
@@ -261,27 +197,26 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
         .send(Message::Text(pub_half.to_string().into()))
         .await
         .ok();
-    let _ = drain_for_type(&mut publisher, "publish_ack", 5000).await;
+    let ack = reply(&mut publisher, "publish_ack", WITHIN).await;
+    let count = ack.as_ref().and_then(|p| p["count"].as_u64());
+    checks.check(
+        &format!("Published {PUBLISH_COUNT} to battle_half (ack: {count:?})"),
+        count == Some(PUBLISH_COUNT),
+    );
 
     // =========================================================================
     // Phase 5: Collect messages from all clients
     // =========================================================================
-    say!("\n  Phase 5: Collect messages (5s deadline)");
+    say!("\n  Phase 5: Collect messages");
 
-    let mut results: Vec<(u64, u64)> = Vec::new();
-    for client in clients.iter_mut() {
-        let (all_c, half_c) = drain_battle_by_channel(client, 5000).await;
-        results.push((all_c, half_c));
-    }
-
-    for (i, (all_c, half_c)) in results.iter().enumerate() {
-        say!(
-            "    Client {} ({}): battle_all={}, battle_half={}",
-            i,
-            labels[i],
-            all_c,
-            half_c
-        );
+    // What each client may get of the 200 on each topic. The unrestricted
+    // ones are read first: once they have every message, what reached the
+    // restricted ones has reached them too.
+    let n = PUBLISH_COUNT;
+    let want = [(n, 0), (n, n), (n, 0), (n, n)];
+    let mut results = [(0u64, 0u64); 4];
+    for i in [3, 1, 0, 2] {
+        results[i] = collect(&mut clients[i], want[i], WITHIN).await;
     }
 
     // =========================================================================
@@ -289,49 +224,22 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
     // =========================================================================
     say!("\n  Phase 6: Verify ACL enforcement");
 
-    // Client A: allow=["battle_all"] -> receives battle_all only
-    let (a_all, a_half) = results[0];
-    checks.check(
-        &format!("Client A (allow exact): battle_all={} > 0", a_all),
-        a_all > 0,
-    );
-    checks.check(
-        &format!("Client A (allow exact): battle_half={} == 0", a_half),
-        a_half == 0,
-    );
-
-    // Client B: allow=["battle_*"] -> receives both (glob matches both)
-    let (b_all, b_half) = results[1];
-    checks.check(
-        &format!("Client B (allow glob): battle_all={} > 0", b_all),
-        b_all > 0,
-    );
-    checks.check(
-        &format!("Client B (allow glob): battle_half={} > 0", b_half),
-        b_half > 0,
-    );
-
-    // Client C: deny=["battle_half"] -> receives battle_all, NOT battle_half
-    let (c_all, c_half) = results[2];
-    checks.check(
-        &format!("Client C (deny half): battle_all={} > 0", c_all),
-        c_all > 0,
-    );
-    checks.check(
-        &format!("Client C (deny half): battle_half={} == 0", c_half),
-        c_half == 0,
-    );
-
-    // Client D: no ACL -> receives both
-    let (d_all, d_half) = results[3];
-    checks.check(
-        &format!("Client D (no ACL): battle_all={} > 0", d_all),
-        d_all > 0,
-    );
-    checks.check(
-        &format!("Client D (no ACL): battle_half={} > 0", d_half),
-        d_half > 0,
-    );
+    let rules = [
+        "A (allow battle_all)",
+        "B (allow battle_*)",
+        "C (deny battle_half)",
+        "D (no ACL)",
+    ];
+    for (i, rule) in rules.iter().enumerate() {
+        let (all, half) = results[i];
+        let (want_all, want_half) = want[i];
+        checks.check(
+            &format!(
+                "Client {rule}: battle_all={all} (want {want_all}), battle_half={half} (want {want_half})"
+            ),
+            results[i] == want[i],
+        );
+    }
 
     // =========================================================================
     // Clean up
@@ -341,14 +249,7 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
     protocol::close_all(clients).await;
     say!("    All clients disconnected");
 
-    let total = checks.passed + checks.failed;
-    say!("\n  Result: {}/{} checks passed", checks.passed, total);
-    if checks.failed > 0 {
-        say!("  FAILED");
-        crate::report::failed();
-    } else {
-        say!("  PASSED");
-    }
+    checks.finish();
 
     Vec::new()
 }

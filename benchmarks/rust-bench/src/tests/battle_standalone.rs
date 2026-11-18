@@ -1,3 +1,4 @@
+use super::Checks;
 use crate::config::Cli;
 use crate::protocol::{self, WsStream};
 use crate::report::TierResult;
@@ -39,32 +40,6 @@ impl ChannelCounts {
     }
 }
 
-struct CheckResult {
-    passed: u32,
-    failed: u32,
-}
-
-impl CheckResult {
-    fn new() -> Self {
-        Self {
-            passed: 0,
-            failed: 0,
-        }
-    }
-
-    fn check(&mut self, name: &str, condition: bool) {
-        if condition {
-            self.passed += 1;
-            say!("    [PASS] {}", name);
-        } else {
-            self.failed += 1;
-            // Said in the run's exit code, however the test ends.
-            crate::report::failed();
-            say!("    [FAIL] {}", name);
-        }
-    }
-}
-
 /// Battle Test: Standalone Feature Verification
 ///
 /// Tests broadcast_all, topic delivery, topic isolation, glob pattern matching,
@@ -80,7 +55,7 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
 
     let token = crate::jwt::generate_bench_token(cli.secret.as_bytes(), "bench-user");
     let duration = Duration::from_secs(cli.duration);
-    let mut checks = CheckResult::new();
+    let mut checks = Checks::default();
 
     // =========================================================================
     // Phase 1: Connect
@@ -331,17 +306,7 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
     // =========================================================================
     // Summary
     // =========================================================================
-    say!(
-        "\n  Result: {}/{} checks passed",
-        checks.passed,
-        checks.passed + checks.failed
-    );
-    if checks.failed > 0 {
-        say!("  FAILED");
-        crate::report::failed();
-    } else {
-        say!("  PASSED");
-    }
+    checks.finish();
 
     Vec::new()
 }

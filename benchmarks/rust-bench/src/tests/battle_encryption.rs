@@ -1,3 +1,4 @@
+use super::{Checks, EXTRA};
 use crate::config::Cli;
 use crate::protocol::{self, parse_wse_message, WsStream};
 use crate::report::TierResult;
@@ -16,32 +17,6 @@ use tokio_tungstenite::tungstenite::protocol::Message;
 
 // RFC 5869: zero-salt + context info. Must match all WSE components.
 const HKDF_INFO: &[u8] = b"wse-encryption/aes-gcm-key";
-
-struct CheckResult {
-    passed: u32,
-    failed: u32,
-}
-
-impl CheckResult {
-    fn new() -> Self {
-        Self {
-            passed: 0,
-            failed: 0,
-        }
-    }
-
-    fn check(&mut self, name: &str, condition: bool) {
-        if condition {
-            self.passed += 1;
-            say!("    [PASS] {}", name);
-        } else {
-            self.failed += 1;
-            // Said in the run's exit code, however the test ends.
-            crate::report::failed();
-            say!("    [FAIL] {}", name);
-        }
-    }
-}
 
 /// Connect to the server but don't send client_hello yet (for custom handshake).
 async fn connect_raw(
@@ -119,60 +94,108 @@ fn decrypt(cipher: &Aes256Gcm, data: &[u8]) -> Result<Vec<u8>, String> {
         .map_err(|e| format!("decrypt failed: {}", e))
 }
 
-/// Drain messages from a WsStream, looking for a specific type.
-/// Handles both plaintext and encrypted frames.
-async fn drain_for_type_encrypted(
+/// The plaintext `server_hello` that answers a `client_hello`: its payload.
+async fn server_hello(ws: &mut WsStream) -> Option<serde_json::Value> {
+    super::reply(ws, "server_hello", Duration::from_secs(5)).await
+}
+
+/// The session key a `server_hello` gives with `secret`: None without a
+/// valid server key.
+fn session_key(secret: EphemeralSecret, hello: &serde_json::Value) -> Option<Aes256Gcm> {
+    let b64 = base64::engine::general_purpose::STANDARD;
+    let server_key = b64.decode(hello["encryption_public_key"].as_str()?).ok()?;
+    let server_key = PublicKey::from_sec1_bytes(&server_key).ok()?;
+    let shared = secret.diffie_hellman(&server_key);
+    Some(derive_cipher(shared.raw_secret_bytes().as_slice()))
+}
+
+/// `json` sealed with the session key: an `E:` binary frame.
+fn sealed(cipher: &Aes256Gcm, json: &str) -> Message {
+    let encrypted = encrypt(cipher, json.as_bytes());
+    let mut frame = Vec::with_capacity(2 + encrypted.len());
+    frame.extend_from_slice(b"E:");
+    frame.extend_from_slice(&encrypted);
+    Message::Binary(frame.into())
+}
+
+/// A sealed frame opened with the session key, as JSON; None for anything
+/// that is not one.
+fn open(cipher: &Aes256Gcm, msg: &Message) -> Option<serde_json::Value> {
+    let Message::Binary(data) = msg else {
+        return None;
+    };
+    let plaintext = decrypt(cipher, data.strip_prefix(b"E:")?).ok()?;
+    let text = std::str::from_utf8(&plaintext).ok()?;
+    let json = text
+        .strip_prefix("WSE")
+        .or_else(|| text.strip_prefix('S'))
+        .or_else(|| text.strip_prefix('U'))
+        .unwrap_or(text);
+    serde_json::from_str(json).ok()
+}
+
+/// What an encrypted connection got: the battle messages and the `reply`
+/// payload that came sealed, and how many data frames came any other way.
+struct Got {
+    battle: u64,
+    reply: Option<serde_json::Value>,
+    unsealed: u64,
+}
+
+/// Reads `ws` until a sealed `reply` and `want` sealed battle messages have
+/// come, or `within` passes, and then [`EXTRA`] more.
+async fn read_sealed(
     ws: &mut WsStream,
-    msg_type: &str,
-    cipher: Option<&Aes256Gcm>,
-    deadline_ms: u64,
-) -> Option<serde_json::Value> {
-    let deadline = tokio::time::Instant::now() + Duration::from_millis(deadline_ms);
+    cipher: &Aes256Gcm,
+    reply: &str,
+    want: u64,
+    within: Duration,
+) -> Got {
+    let mut got = Got {
+        battle: 0,
+        reply: None,
+        unsealed: 0,
+    };
+    let mut until = tokio::time::Instant::now() + within;
+    let mut done = false;
     loop {
-        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-        if remaining.is_zero() {
-            return None;
+        let left = until.saturating_duration_since(tokio::time::Instant::now());
+        if left.is_zero() {
+            break;
         }
-        match tokio::time::timeout(remaining, ws.next()).await {
-            Ok(Some(Ok(msg))) => {
-                // Try normal parse first
-                if let Some(parsed) = parse_wse_message(&msg) {
-                    if parsed.get("t").and_then(|t| t.as_str()) == Some(msg_type) {
-                        return Some(parsed);
-                    }
-                }
-                // Try decrypting E: binary frames
-                if let Some(cipher) = cipher {
-                    if let Message::Binary(data) = &msg {
-                        if data.starts_with(b"E:") {
-                            if let Ok(plaintext) = decrypt(cipher, &data[2..]) {
-                                if let Ok(text) = std::str::from_utf8(&plaintext) {
-                                    // Strip WSE/S/U prefix and parse
-                                    let json_str = if text.starts_with("WSE{") {
-                                        &text[3..]
-                                    } else if text.starts_with("U{") || text.starts_with("S{") {
-                                        &text[1..]
-                                    } else {
-                                        text
-                                    };
-                                    if let Ok(parsed) =
-                                        serde_json::from_str::<serde_json::Value>(json_str)
-                                    {
-                                        if parsed.get("t").and_then(|t| t.as_str())
-                                            == Some(msg_type)
-                                        {
-                                            return Some(parsed);
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
+        let Ok(Some(Ok(msg))) = tokio::time::timeout(left, ws.next()).await else {
+            break;
+        };
+        if !matches!(msg, Message::Text(_) | Message::Binary(_)) {
+            continue;
+        }
+        match open(cipher, &msg) {
+            Some(parsed) if parsed["t"] == "battle" => got.battle += 1,
+            Some(mut parsed) if parsed["t"] == reply && got.reply.is_none() => {
+                got.reply = Some(parsed["p"].take());
             }
-            _ => return None,
+            Some(_) => {}
+            None => got.unsealed += 1,
+        }
+        if !done && got.reply.is_some() && got.battle >= want {
+            done = true;
+            until = tokio::time::Instant::now() + EXTRA;
         }
     }
+    got
+}
+
+fn client_hello(public_key_b64: &str) -> Message {
+    let hello = serde_json::json!({
+        "t": "client_hello",
+        "p": {
+            "client_version": "wse-bench/0.2.0",
+            "protocol_version": 1,
+            "features": {"encryption": true},
+            "encryption_public_key": public_key_b64
+        }
+    });
+    Message::Text(format!("WSE{hello}").into())
 }
 
 /// Battle Test: E2E Encryption
@@ -187,8 +210,9 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
         "Tests ECDH key exchange, AES-GCM encrypted messaging, mixed connections.",
     );
 
-    let mut checks = CheckResult::new();
+    let mut checks = Checks::default();
     let b64 = base64::engine::general_purpose::STANDARD;
+    let within = Duration::from_secs(5);
 
     let token = crate::jwt::generate_bench_token(cli.secret.as_bytes(), "enc-test-user");
 
@@ -198,9 +222,7 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
     say!("\n  Test 1: ECDH key exchange handshake");
 
     let client_secret = EphemeralSecret::generate();
-    let client_pubkey = PublicKey::from(&client_secret);
-    let client_pubkey_bytes = client_pubkey.to_sec1_bytes();
-    let client_pubkey_b64 = b64.encode(&client_pubkey_bytes);
+    let client_pubkey_bytes = PublicKey::from(&client_secret).to_sec1_bytes();
 
     checks.check(
         "Client public key is 65 bytes (uncompressed SEC1)",
@@ -214,57 +236,34 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
             return vec![];
         }
     };
-
-    // Send client_hello with encryption
-    let hello = serde_json::json!({
-        "t": "client_hello",
-        "p": {
-            "client_version": "wse-bench/0.2.0",
-            "protocol_version": 1,
-            "features": {
-                "encryption": true
-            },
-            "encryption_public_key": client_pubkey_b64
-        }
-    });
-    ws.send(Message::Text(format!("WSE{}", hello).into()))
+    ws.send(client_hello(&b64.encode(&client_pubkey_bytes)))
         .await
-        .unwrap();
+        .ok();
 
-    // Read server_hello
-    let server_hello = drain_for_type_encrypted(&mut ws, "server_hello", None, 5000).await;
-    let server_hello = server_hello.expect("server_hello not received");
-
-    let payload = server_hello.get("p").unwrap();
-    let features = payload.get("features").unwrap();
-
+    let Some(hello) = server_hello(&mut ws).await else {
+        checks.check("server_hello received", false);
+        checks.finish();
+        return vec![];
+    };
     checks.check(
         "server_hello has features.encryption = true",
-        features.get("encryption").and_then(|v| v.as_bool()) == Some(true),
+        hello["features"]["encryption"] == true,
     );
-
-    let server_pubkey_b64 = payload
-        .get("encryption_public_key")
-        .and_then(|v| v.as_str());
+    let server_key = hello["encryption_public_key"]
+        .as_str()
+        .and_then(|key| b64.decode(key).ok());
     checks.check(
-        "server_hello has encryption_public_key field",
-        server_pubkey_b64.is_some(),
+        &format!(
+            "Server public key is 65 bytes (uncompressed SEC1) (got {:?})",
+            server_key.as_ref().map(Vec::len)
+        ),
+        server_key.as_ref().is_some_and(|key| key.len() == 65),
     );
-
-    // Derive shared AES key
-    let server_pubkey_b64 = server_pubkey_b64.unwrap();
-    let server_pubkey_bytes = b64.decode(server_pubkey_b64).unwrap();
-
-    checks.check(
-        "Server public key is 65 bytes (uncompressed SEC1)",
-        server_pubkey_bytes.len() == 65,
-    );
-
-    let server_pubkey =
-        PublicKey::from_sec1_bytes(&server_pubkey_bytes).expect("invalid server public key");
-    let shared_secret = client_secret.diffie_hellman(&server_pubkey);
-    let cipher = derive_cipher(shared_secret.raw_secret_bytes().as_slice());
-
+    let Some(cipher) = session_key(client_secret, &hello) else {
+        checks.check("Session key derived from the server's key", false);
+        checks.finish();
+        return vec![];
+    };
     say!("    Shared secret derived, AES-GCM-256 cipher ready");
 
     // =========================================================================
@@ -272,24 +271,24 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
     // =========================================================================
     say!("\n  Test 2: Encrypted message round-trip");
 
-    // Send an encrypted battle_cmd health query
-    let health_cmd = r#"{"t":"battle_cmd","p":{"action":"health"}}"#;
-    let encrypted = encrypt(&cipher, health_cmd.as_bytes());
-    let mut e_frame = Vec::with_capacity(2 + encrypted.len());
-    e_frame.extend_from_slice(b"E:");
-    e_frame.extend_from_slice(&encrypted);
-    ws.send(Message::Binary(e_frame.into())).await.unwrap();
-
-    // Should get a health_response back (encrypted)
-    let response = drain_for_type_encrypted(&mut ws, "health_response", Some(&cipher), 5000).await;
+    ws.send(sealed(
+        &cipher,
+        r#"{"t":"battle_cmd","p":{"action":"health"}}"#,
+    ))
+    .await
+    .ok();
+    // The answer counts only sealed with the session key: one in the clear
+    // is the round trip failing.
+    let got = read_sealed(&mut ws, &cipher, "health_response", 0, within).await;
     checks.check(
-        "Received health_response after encrypted request",
-        response.is_some(),
+        &format!(
+            "Sealed health_response to a sealed request (unsealed frames: {})",
+            got.unsealed
+        ),
+        got.reply.is_some() && got.unsealed == 0,
     );
 
-    // Close encrypted connection
     let _ = ws.close(None).await;
-    tokio::time::sleep(Duration::from_millis(200)).await;
 
     // =========================================================================
     // Test 3: Unencrypted connection still works (opt-out)
@@ -308,11 +307,11 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
         Ok(ws) => ws,
         Err(e) => {
             fail!("    [FAIL] Could not connect unencrypted: {}", e);
+            checks.finish();
             return vec![];
         }
     };
 
-    // Query health via plaintext
     let health = protocol::query_health(&mut ws_plain, 5).await;
     checks.check(
         "Unencrypted connection works (health response received)",
@@ -320,7 +319,6 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
     );
 
     let _ = ws_plain.close(None).await;
-    tokio::time::sleep(Duration::from_millis(200)).await;
 
     // =========================================================================
     // Test 4: Invalid encryption key rejection
@@ -331,139 +329,93 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
         Ok(ws) => ws,
         Err(e) => {
             fail!("    [FAIL] Could not connect: {}", e);
+            checks.finish();
             return vec![];
         }
     };
-
-    // Send client_hello with malformed public key
-    let bad_hello = serde_json::json!({
-        "t": "client_hello",
-        "p": {
-            "client_version": "wse-bench/0.2.0",
-            "protocol_version": 1,
-            "features": {
-                "encryption": true
-            },
-            "encryption_public_key": b64.encode(b"not-a-valid-ec-point-only-36-bytes!!!")
-        }
-    });
     ws_bad
-        .send(Message::Text(format!("WSE{}", bad_hello).into()))
+        .send(client_hello(
+            &b64.encode(b"not-a-valid-ec-point-only-36-bytes!!!"),
+        ))
         .await
-        .unwrap();
+        .ok();
 
-    let bad_server_hello = drain_for_type_encrypted(&mut ws_bad, "server_hello", None, 5000).await;
-
-    if let Some(ref hello) = bad_server_hello {
-        let p = hello.get("p").unwrap();
-        let enc_enabled = p
-            .get("features")
-            .and_then(|f| f.get("encryption"))
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
-        checks.check(
-            "Invalid key: server_hello has encryption=false",
-            !enc_enabled,
-        );
-        let has_pubkey = p.get("encryption_public_key").is_some();
-        checks.check(
-            "Invalid key: no encryption_public_key in response",
-            !has_pubkey,
-        );
-    } else {
-        checks.check("Invalid key: server_hello received", false);
-        checks.check("Invalid key: encryption disabled", false);
+    match server_hello(&mut ws_bad).await {
+        Some(hello) => {
+            checks.check(
+                "Invalid key: server_hello has encryption=false",
+                hello["features"]["encryption"] != true,
+            );
+            checks.check(
+                "Invalid key: no encryption_public_key in response",
+                hello.get("encryption_public_key").is_none(),
+            );
+        }
+        None => {
+            checks.check("Invalid key: server_hello received", false);
+        }
     }
 
     let _ = ws_bad.close(None).await;
-    tokio::time::sleep(Duration::from_millis(200)).await;
 
     // =========================================================================
-    // Test 5: send_event encryption (server -> encrypted client)
+    // Test 5: Broadcasts to an encrypted connection
     // =========================================================================
-    say!("\n  Test 5: send_event to encrypted connection");
+    say!("\n  Test 5: Broadcasts to an encrypted connection");
 
-    // Connect with encryption again
-    let client_secret2 = EphemeralSecret::generate();
-    let client_pubkey2 = PublicKey::from(&client_secret2);
-    let client_pubkey2_b64 = b64.encode(client_pubkey2.to_sec1_bytes());
-
+    let secret = EphemeralSecret::generate();
+    let public_key = b64.encode(PublicKey::from(&secret).to_sec1_bytes());
     let mut ws_enc = match connect_raw(&cli.host, cli.port, &token).await {
         Ok(ws) => ws,
         Err(e) => {
             fail!("    [FAIL] Could not connect: {}", e);
+            checks.finish();
             return vec![];
         }
     };
+    ws_enc.send(client_hello(&public_key)).await.ok();
+    let cipher = match server_hello(&mut ws_enc).await {
+        Some(hello) => session_key(secret, &hello),
+        None => None,
+    };
+    let Some(cipher) = cipher else {
+        checks.check("Second encrypted session set up", false);
+        checks.finish();
+        return vec![];
+    };
 
-    let hello2 = serde_json::json!({
-        "t": "client_hello",
-        "p": {
-            "client_version": "wse-bench/0.2.0",
-            "protocol_version": 1,
-            "features": { "encryption": true },
-            "encryption_public_key": client_pubkey2_b64
-        }
-    });
+    // Subscribed by a sealed command, then the server publishes to the
+    // topic: every message has to reach the connection sealed.
+    const PUBLISHED: u64 = 20;
     ws_enc
-        .send(Message::Text(format!("WSE{}", hello2).into()))
+        .send(sealed(
+            &cipher,
+            r#"{"t":"battle_cmd","p":{"action":"subscribe","topics":["battle_all"]}}"#,
+        ))
         .await
-        .unwrap();
-
-    let sh2 = drain_for_type_encrypted(&mut ws_enc, "server_hello", None, 5000).await;
-    let sh2 = sh2.expect("server_hello not received");
-    let sp2 = sh2.get("p").unwrap();
-    let spk2 = sp2
-        .get("encryption_public_key")
-        .and_then(|v| v.as_str())
-        .unwrap();
-    let spk2_bytes = b64.decode(spk2).unwrap();
-    let server_pk2 = PublicKey::from_sec1_bytes(&spk2_bytes).unwrap();
-    let shared2 = client_secret2.diffie_hellman(&server_pk2);
-    let cipher2 = derive_cipher(shared2.raw_secret_bytes().as_slice());
-
-    // Subscribe to a topic via encrypted channel
-    let sub_cmd = r#"{"t":"battle_cmd","p":{"action":"subscribe","topics":["battle_all"]}}"#;
-    let enc_sub = encrypt(&cipher2, sub_cmd.as_bytes());
-    let mut e_sub = Vec::with_capacity(2 + enc_sub.len());
-    e_sub.extend_from_slice(b"E:");
-    e_sub.extend_from_slice(&enc_sub);
-    ws_enc.send(Message::Binary(e_sub.into())).await.unwrap();
-
-    checks.check("Encrypted subscribe command sent", true);
-
-    // Verify encrypted connection still works after subscribe by querying health
-    let health_cmd2 = r#"{"t":"battle_cmd","p":{"action":"health"}}"#;
-    let enc_health2 = encrypt(&cipher2, health_cmd2.as_bytes());
-    let mut e_health2 = Vec::with_capacity(2 + enc_health2.len());
-    e_health2.extend_from_slice(b"E:");
-    e_health2.extend_from_slice(&enc_health2);
+        .ok();
     ws_enc
-        .send(Message::Binary(e_health2.into()))
+        .send(sealed(
+            &cipher,
+            &format!(
+                r#"{{"t":"battle_cmd","p":{{"action":"publish_messages","topic":"battle_all","count":{PUBLISHED}}}}}"#
+            ),
+        ))
         .await
-        .unwrap();
-
-    let health_resp2 =
-        drain_for_type_encrypted(&mut ws_enc, "health_response", Some(&cipher2), 5000).await;
+        .ok();
+    let got = read_sealed(&mut ws_enc, &cipher, "publish_ack", PUBLISHED, within).await;
+    let acked = got.reply.as_ref().and_then(|p| p["count"].as_u64());
     checks.check(
-        "Encrypted health response after subscribe",
-        health_resp2.is_some(),
+        &format!(
+            "Received all {PUBLISHED} broadcasts sealed (sealed: {}, ack: {acked:?}, unsealed frames: {})",
+            got.battle, got.unsealed
+        ),
+        got.battle == PUBLISHED && acked == Some(PUBLISHED) && got.unsealed == 0,
     );
 
     let _ = ws_enc.close(None).await;
 
-    // =========================================================================
-    // Summary
-    // =========================================================================
-    // Summary
-    let total = checks.passed + checks.failed;
-    say!("\n  Result: {}/{} checks passed", checks.passed, total);
-    if checks.failed > 0 {
-        say!("  FAILED");
-        crate::report::failed();
-    } else {
-        say!("  PASSED");
-    }
+    checks.finish();
 
     Vec::new()
 }
