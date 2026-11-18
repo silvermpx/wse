@@ -1206,6 +1206,10 @@ mod file {
     /// process.
     #[cfg(any(target_os = "linux", target_os = "android"))]
     mod linux {
+        // The same abstract namespace; Android's standard library names it apart.
+        #[cfg(target_os = "android")]
+        use std::os::android::net::SocketAddrExt;
+        #[cfg(target_os = "linux")]
         use std::os::linux::net::SocketAddrExt;
         use std::os::unix::net::{SocketAddr, UnixListener};
         use std::path::Path;

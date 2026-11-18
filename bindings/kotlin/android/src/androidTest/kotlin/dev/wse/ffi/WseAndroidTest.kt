@@ -19,6 +19,14 @@ class WseAndroidTest {
     private val url: String =
         InstrumentationRegistry.getArguments().getString("wseUrl") ?: "ws://10.0.2.2:5007/wse"
 
+    /** The next item of the type asked for. */
+    private suspend inline fun <reified T : WseItem> next(events: WseEvents): T {
+        while (true) {
+            val item = events.next() ?: error("the events ended before a ${T::class.simpleName}")
+            if (item is T) return item
+        }
+    }
+
     /** The next message of `kind`. */
     private suspend fun message(events: WseEvents, kind: String): WseMessage {
         while (true) {
@@ -169,5 +177,38 @@ class WseAndroidTest {
         val client = connectClient(WseConfig(url = url, insecure = true))
         assertFailsWith<WseException.Encode> { client.trySend("x", "not json") }
         client.disconnect(1_000u)
+    }
+
+    /**
+     * The outbox in a file of the app's own, its locks taken in the app's
+     * sandbox: what is sent with no connection is in the file, another client
+     * of the file keeps its own in memory, and it goes once the connection is back.
+     */
+    @Test
+    fun anOutboxInTheAppsFilesIsTheClientsAlone(): Unit = runBlocking {
+        val context = InstrumentationRegistry.getInstrumentation().targetContext
+        val file = java.io.File(context.cacheDir, "wse-outbox-test")
+        java.io.File(context.cacheDir, "wse-outbox-test.lock").delete()
+        file.delete()
+        val config = WseConfig(url = url, insecure = true, offline = WseOffline(path = file.path))
+        val client = connectClient(config)
+        val events = client.events()
+        client.pause("test")
+        while (client.status() == WseStatus.CONNECTED) delay(20)
+        client.send("echo", """{"n":1}""")
+        assertEquals(1u, client.kept())
+        // In the file only when it opened, both its locks taken.
+        waitFor(10_000) { file.length() > 0 }
+
+        val other = connectClient(config)
+        val refused = withTimeout(10_000) { next<WseItem.StorageFailed>(other.events()) }
+        assertEquals("open", refused.operation)
+        assertTrue("another client's" in refused.message, refused.message)
+        other.disconnect(1_000u)
+
+        client.resume("test")
+        assertEquals("""{"n":1}""", message(events, "echoed").json)
+        client.disconnect(1_000u)
+        file.delete()
     }
 }
