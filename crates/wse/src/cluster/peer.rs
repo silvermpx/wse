@@ -392,15 +392,31 @@ pub(super) async fn peer_reader<R: AsyncReadExt + Unpin>(
     }
 }
 
+/// An address as a place, however it is spelled: an IPv4 address and its
+/// IPv4-mapped IPv6 form (as a dual-stack listener sees it) are one, an IPv6
+/// address is written one way, a host name is one whatever its case (or a
+/// trailing dot), and the port stays part of it.
+pub(super) fn same_place(addr: &str) -> String {
+    if let Ok(at) = addr.parse::<std::net::SocketAddr>() {
+        return std::net::SocketAddr::new(at.ip().to_canonical(), at.port()).to_string();
+    }
+    match addr.rsplit_once(':') {
+        Some((host, port)) => {
+            let host = host.strip_suffix('.').unwrap_or(host);
+            format!("{}:{port}", host.to_ascii_lowercase())
+        }
+        None => addr.to_ascii_lowercase(),
+    }
+}
+
 /// The instance met at `slot`, the address a node is reached at. Another
 /// instance there than the one met last means that one is gone: unless it
 /// said SHUTDOWN, or caught up since its last link ended, what it published
 /// after what was heard of it is gone too, and a client here whose last
 /// message came before is not told it missed nothing.
 pub(super) fn met_at(ctx: &ClusterContext, slot: &str, instance: &str) {
-    let before = ctx
-        .incarnations
-        .insert(slot.to_owned(), instance.to_owned());
+    let slot = same_place(slot);
+    let before = ctx.incarnations.insert(slot.clone(), instance.to_owned());
     let Some(before) = before.filter(|before| before != instance) else {
         return;
     };

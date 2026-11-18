@@ -10,6 +10,7 @@ import base64
 import datetime
 import ipaddress
 import json
+import socket
 import time
 from types import SimpleNamespace
 
@@ -958,47 +959,102 @@ def test_a_node_back_anew_that_dials_in_itself_is_never_taken_to_have_lost_nothi
         assert answer["recovered"] is False or 2 in numbers, answer
 
 
-def test_a_node_dialed_by_another_name_than_it_gives_is_known_when_it_comes_back_anew(nodes):
-    """The relay dials the origin by a name (localhost) while the origin
-    says it is reached at its address: the node that comes up there and
-    dials in itself, before the relay reaches it again, is still another
-    node, gone with what it published while the link was down."""
+def _back_anew_dialing_in(nodes, *, dialed, before, after, relay=None):
+    """The relay dials the origin, through a proxy, at `dialed`; the origin
+    gives where it is reached as `before` says (its cluster options, of the
+    proxy). Its link goes, it publishes meanwhile, it goes without SHUTDOWN,
+    and the node that comes up in its place, giving `after`, dials the relay
+    itself while the relay's own dials are refused. What the relay's client
+    whose last message came before is told, by both forms of its position."""
     websockets = pytest.importorskip("websockets")
     origin = nodes(recovery=True)
-    relay = nodes(recovery=True)
+    relay_node = nodes(recovery=True)
 
     async def scenario():
         route = Blink(origin)
         await route.start()
         try:
-            origin.join(cluster_secret=SECRET, cluster_addr=route.addr)
-            relay.join(SimpleNamespace(addr=f"localhost:{route.port}"))
-            await until(lambda: origin.peers == 1 and relay.peers == 1)
-            async with websockets.connect(f"ws://127.0.0.1:{relay.port}/wse") as live:
-                await subscribe_next_client(relay, ["news", "barrier"])
+            origin.join(cluster_secret=SECRET, **before(route))
+            relay_node.join(
+                SimpleNamespace(addr=f"{dialed}:{route.port}"),
+                cluster_secret=SECRET,
+                **(relay or {}),
+            )
+            await until(lambda: origin.peers == 1 and relay_node.peers == 1)
+            async with websockets.connect(f"ws://127.0.0.1:{relay_node.port}/wse") as live:
+                await subscribe_next_client(relay_node, ["news", "barrier"])
                 await asyncio.sleep(0.35)  # the SUB reaches the origin
                 origin.server.broadcast("news", json.dumps({"t": "news", "p": {"n": 1}}))
                 (anchor,) = await messages_of_type(live, "news", 1)
                 route.cut()
-                await until(lambda: origin.peers == 0 and relay.peers == 0)
+                await until(lambda: origin.peers == 0 and relay_node.peers == 0)
                 origin.server.broadcast("news", json.dumps({"t": "news", "p": {"n": 2}}))
                 await asyncio.sleep(0.2)
                 origin.stop()
                 anew = nodes(recovery=True)
                 anew.cluster_port = origin.cluster_port
                 route.target = anew
-                # The relay's own dials stay refused: it meets the new node
-                # only as that one dials in.
-                anew.join(relay, cluster_secret=SECRET, cluster_addr=route.addr)
-                await until(lambda: anew.peers == 1 and relay.peers == 1, timeout=20.0)
+                anew.join(relay_node, cluster_secret=SECRET, **after(route))
+                await until(lambda: anew.peers == 1 and relay_node.peers == 1, timeout=20.0)
                 await asyncio.sleep(0.4)
                 anew.server.broadcast("barrier", json.dumps({"t": "barrier", "p": {"n": 3}}))
                 await messages_of_type(live, "barrier", 1)
-            return await _recovered_both_ways(relay, anchor, websockets)
+            return await _recovered_both_ways(relay_node, anchor, websockets)
         finally:
             route.close()
 
-    for answer, numbers in asyncio.run(scenario()):
+    return asyncio.run(scenario())
+
+
+def test_a_node_dialed_by_another_name_than_it_gives_is_known_when_it_comes_back_anew(nodes):
+    """The relay dials the origin by a name (localhost) while the origin
+    says it is reached at its address: the node that comes up there and
+    dials in itself, before the relay reaches it again, is still another
+    node, gone with what it published while the link was down."""
+    proxy = lambda route: {"cluster_addr": route.addr}  # noqa: E731
+    for answer, numbers in _back_anew_dialing_in(
+        nodes, dialed="localhost", before=proxy, after=proxy
+    ):
+        assert answer["recovered"] is False or 2 in numbers, answer
+
+
+def _dual_stack():
+    try:
+        with socket.socket(socket.AF_INET6) as probe:
+            probe.bind(("::", 0))
+        return True
+    except OSError:
+        return False
+
+
+def test_a_node_met_by_its_ipv4_address_is_the_same_where_a_dual_stack_listener_sees_it_mapped(
+    nodes,
+):
+    """The relay listens on IPv4 and IPv6 at once, and the origin gives no
+    address, only its port: the relay met it at 127.0.0.1, and takes the
+    node that dials in from there anew (::ffff:127.0.0.1 to its listener)
+    for one in the same place."""
+    if not _dual_stack():
+        pytest.skip("no IPv6 here")
+    port_only = lambda route: {}  # noqa: E731
+    results = _back_anew_dialing_in(
+        nodes, dialed="127.0.0.1", before=port_only, after=port_only, relay={"cluster_host": "::"}
+    )
+    for answer, numbers in results:
+        assert answer["recovered"] is False or 2 in numbers, answer
+
+
+def test_a_node_whose_name_comes_back_in_other_letters_is_the_same_place(nodes):
+    """The origin gives localhost, and the node in its place LOCALHOST: a
+    host name is one whatever its case, so the relay takes the second for
+    another node where the first was."""
+    results = _back_anew_dialing_in(
+        nodes,
+        dialed="127.0.0.1",
+        before=lambda route: {"cluster_addr": f"localhost:{route.port}"},
+        after=lambda route: {"cluster_addr": f"LOCALHOST:{route.port}"},
+    )
+    for answer, numbers in results:
         assert answer["recovered"] is False or 2 in numbers, answer
 
 

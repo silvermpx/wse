@@ -237,7 +237,9 @@ server every client is checked against.
   node's own stream, or through a pattern, is no longer told it missed
   nothing then. A node dialed by another name than the address it gives
   (`localhost` for `127.0.0.1`) is known by both, so the one that comes up
-  there and dials in first is known for another node too.
+  there and dials in first is known for another node too; and an address is
+  one place however it is spelled: an IPv4 address and its IPv4-mapped IPv6
+  form (as a dual-stack listener sees it), a host name in any case.
 - Cluster: a node that stops no longer loses what it published just before
   the stop. Its run leaves the cluster once it takes no more publishes,
   after every one it took, and waits (two seconds at most) for each link to

@@ -265,6 +265,21 @@ fn a_hello_says_where_its_node_is_reached_and_one_before_says_nothing() {
     );
 }
 
+/// One place, however its address is spelled: a node met there is judged
+/// against the one met there before.
+#[test]
+fn an_address_is_one_place_however_it_is_spelled() {
+    let place = super::peer::same_place;
+    assert_eq!(place("[::ffff:127.0.0.1]:7000"), "127.0.0.1:7000");
+    assert_eq!(place("127.0.0.1:7000"), "127.0.0.1:7000");
+    assert_eq!(place("[0:0:0:0:0:0:0:1]:7000"), "[::1]:7000");
+    assert_eq!(place("LOCALHOST:7000"), "localhost:7000");
+    assert_eq!(place("Node-A.Internal.:7000"), "node-a.internal:7000");
+    // The port is part of the place.
+    assert_ne!(place("localhost:7000"), place("localhost:7001"));
+    assert_ne!(place("[::ffff:127.0.0.1]:7000"), place("127.0.0.1:7001"));
+}
+
 /// Where a node that dialed in is reached: the address it names, or the
 /// port it names on the address its link came from.
 #[test]
