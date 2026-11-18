@@ -18,6 +18,27 @@ class TestSyncClientInit:
         assert client.send("open_valve", {}, live=True) is SendResult.SENT
         assert seen["live"] is True
 
+    def test_send_and_send_with_retry_pass_a_correlation_id_through(self):
+        client = SyncWSEClient("ws://localhost:5006/wse")
+        seen = {}
+
+        class Async:
+            async def send(self, *args, **kwargs):
+                seen["send"] = kwargs
+                return SendResult.SENT
+
+            async def send_with_retry(self, *args, **kwargs):
+                seen["retry"] = kwargs
+                return SendResult.SENT
+
+        client._run = lambda make, timeout, default: asyncio.run(make(Async()))
+        assert client.send("ask", {}, correlation_id="req-1") is SendResult.SENT
+        assert seen["send"]["correlation_id"] == "req-1"
+        assert (
+            client.send_with_retry("ask", {}, correlation_id="req-2") is SendResult.SENT
+        )
+        assert seen["retry"]["correlation_id"] == "req-2"
+
     def test_defaults(self):
         client = SyncWSEClient("ws://localhost:5006/wse")
         assert client.state == ConnectionState.DISCONNECTED
@@ -212,6 +233,18 @@ class TestSyncLifecycle:
             threading.Timer(0.2, client.close).start()
             client.run_forever()  # returns, does not raise
             assert not client.is_connected
+
+    def test_paused_lists_the_reasons(self):
+        st = ServerThread()
+        with st as srv:
+            client = SyncWSEClient(srv.url, reconnect=FAST)
+            assert client.paused == []
+            client.connect(timeout=5)
+            client.pause("background")
+            assert client.paused == ["background"]
+            client.resume("background")
+            assert client.paused == []
+            client.close()
 
     def test_stats_are_read_on_the_loop(self):
         """Get_stats() from another thread ran the limiter / breaker

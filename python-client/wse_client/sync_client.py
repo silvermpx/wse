@@ -373,6 +373,7 @@ class SyncWSEClient:
         payload: dict[str, Any] | None = None,
         *,
         priority: int = 5,
+        correlation_id: str | None = None,
         signed: bool = False,
         nonce: str | None = None,
         live: bool = False,
@@ -388,6 +389,7 @@ class SyncWSEClient:
                 type,
                 payload,
                 priority=priority,
+                correlation_id=correlation_id,
                 signed=signed,
                 nonce=nonce,
                 live=live,
@@ -431,12 +433,17 @@ class SyncWSEClient:
         payload: dict[str, Any] | None = None,
         *,
         priority: int = 5,
+        correlation_id: str | None = None,
         max_retries: int = 5,
     ) -> SendResult:
         """Send with exponential backoff retry."""
         return self._run(
             lambda c: c.send_with_retry(
-                type, payload, priority=priority, max_retries=max_retries
+                type,
+                payload,
+                priority=priority,
+                correlation_id=correlation_id,
+                max_retries=max_retries,
             ),
             timeout=30.0,
             default=SendResult.FAILED,
@@ -471,6 +478,14 @@ class SyncWSEClient:
     def resume(self, reason: str) -> None:
         """Clear *reason*; once none is left the client connects again."""
         self._run(lambda c: c.resume(reason), timeout=15.0, default=None)
+
+    @property
+    def paused(self) -> list[str]:
+        """The reasons the client is paused for; none: it is not."""
+        client = self._session_client()
+        if client is None:
+            return []
+        return self._call_on_loop(lambda: client.paused, timeout=5.0, default=[])
 
     def change_endpoint(self, new_url: str) -> None:
         """Change endpoint and reconnect."""
