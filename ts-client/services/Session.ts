@@ -243,7 +243,7 @@ export function outboxStoreFor(ctx: ClientContext, offline: OfflineConfig): Outb
   if (!offline.enabled) return null;
   if (offline.store) return offline.store;
   const database = ctx.storage.offlineDatabase;
-  return offline.persistToStorage && database ? indexedDbOutbox(database) : null;
+  return offline.persistToStorage && database ? indexedDbOutbox(database, ctx.storage.offlineLegacy ?? undefined) : null;
 }
 
 export function ensureOutbox(ctx: ClientContext, offline: OfflineConfig): Outbox | null {

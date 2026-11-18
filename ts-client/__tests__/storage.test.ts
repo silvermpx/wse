@@ -247,6 +247,55 @@ describe('the durable outbox', () => {
     await vi.waitFor(() => expect(orders(ws)).toHaveLength(1));
     expect(orders(ws)[0]).toMatchObject({ s: 1, id: 'from-3.1', p: { n: 1 } });
   });
+
+  const names = async () => (await indexedDB.databases()).map((d) => d.name);
+
+  it('takes over, once, the queue 3.1 kept for a consumer whose name holds a `:`', async () => {
+    // 3.2 gives this scope a database of its own; 3.1 named it plainly.
+    const legacy = `wse:shop:alice:checkout:desktop@${ENDPOINT}`;
+    const before = new Set(await names());
+    try {
+      const old = new OfflineQueue({ ...CONFIG, dbName: legacy });
+      await old.initialize();
+      expect(await old.enqueue({ t: 'order', p: { n: 1 }, id: 'from-3.1' } as any, undefined, 'user-1')).toBe(true);
+      old.destroy();
+
+      const c = client({ consumer: 'checkout:desktop' });
+      await vi.waitFor(() => expect(c.kept()).toBe(1));
+      // Its database went: what it held is taken once.
+      await vi.waitFor(async () => expect(await names()).not.toContain(legacy));
+      c.retain();
+      await vi.waitFor(() => expect(FakeWebSocket.instances).toHaveLength(1));
+      const ws = FakeWebSocket.last();
+      answering(ws, 'user-1');
+      await vi.waitFor(() => expect(orders(ws)).toHaveLength(1));
+      expect(orders(ws)[0]).toMatchObject({ s: 1, id: 'from-3.1', p: { n: 1 } });
+    } finally {
+      for (const name of await names()) if (name && !before.has(name)) await dropDb(name);
+    }
+  });
+
+  it('leaves the queue 3.1 kept under a name another realm’s scope reads too (an `@`), and says so', async () => {
+    const legacy = `wse:shop:alice:desk@top@${ENDPOINT}`;
+    const before = new Set(await names());
+    try {
+      const old = new OfflineQueue({ ...CONFIG, dbName: legacy });
+      await old.initialize();
+      expect(await old.enqueue({ t: 'order', p: { n: 1 }, id: 'from-3.1' } as any, undefined, 'user-1')).toBe(true);
+      old.destroy();
+
+      const c = client({ consumer: 'desk@top' });
+      const errors: any[] = [];
+      c.on('wseStorageError', (detail) => errors.push(detail));
+      await vi.waitFor(() => expect(errors).toMatchObject([{ operation: 'legacy' }]));
+      expect(errors[0].message).toContain(legacy);
+      expect(c.state.getSnapshot().storage).toBe('durable');
+      expect(c.kept()).toBe(0);
+      expect(await names()).toContain(legacy);
+    } finally {
+      for (const name of await names()) if (name && !before.has(name)) await dropDb(name);
+    }
+  });
 });
 
 describe('a storage that fails', () => {

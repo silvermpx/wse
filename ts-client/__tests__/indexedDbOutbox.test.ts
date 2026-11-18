@@ -112,3 +112,54 @@ describe('the queue of 3.1, in IndexedDB', () => {
     box.close();
   });
 });
+
+describe('the queue of 3.1 under a name this version gives another scope', () => {
+  /** A database at this version with one producer and its message, marked as moving or not. */
+  async function current(name: string, moving: boolean): Promise<void> {
+    const opening = indexedDB.open(name, 3);
+    opening.onupgradeneeded = () => {
+      const db = opening.result;
+      db.createObjectStore('producers', { keyPath: 'producer' });
+      db.createObjectStore('outbox', { keyPath: ['producer', 's'] });
+      if (moving) db.createObjectStore('moving');
+    };
+    const db = await new Promise<IDBDatabase>((resolve, reject) => {
+      opening.onsuccess = () => resolve(opening.result);
+      opening.onerror = () => reject(opening.error);
+    });
+    const tx = db.transaction(['producers', 'outbox'], 'readwrite');
+    tx.objectStore('producers').put({ producer: 'p-31', next: 2, written: 0, node: null, user: null });
+    const json = JSON.stringify({ t: 'order', p: {}, id: 'from-3.1' });
+    const at = Date.now();
+    tx.objectStore('outbox').put({ producer: 'p-31', s: 1, id: 'from-3.1', at, until: at + 3_600_000, owned: false, json });
+    await new Promise<void>((resolve, reject) => {
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => reject(tx.error);
+    });
+    db.close();
+  }
+
+  const names = async () => (await indexedDB.databases()).map((d) => d.name);
+
+  it('finishes a move cut short, the messages once', async () => {
+    installFakeLocks();
+    const legacy = `legacy-moving-${Math.random()}`;
+    await current(legacy, true);
+    const box = new Outbox(limits, { store: indexedDbOutbox(`scope-${Math.random()}`, { name: legacy, otherRealm: false }) });
+    await box.opened;
+    expect(box.size).toBe(1);
+    expect(await names()).not.toContain(legacy);
+    box.close();
+  });
+
+  it('leaves one a scope of this version opened as its own', async () => {
+    installFakeLocks();
+    const legacy = `legacy-owned-${Math.random()}`;
+    await current(legacy, false);
+    const box = new Outbox(limits, { store: indexedDbOutbox(`scope-${Math.random()}`, { name: legacy, otherRealm: false }) });
+    await box.opened;
+    expect(box.size).toBe(0);
+    expect(await names()).toContain(legacy);
+    box.close();
+  });
+});

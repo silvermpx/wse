@@ -9,6 +9,7 @@
 // stores, the window's events and the `wse_` keys of localStorage.
 
 import type { Outbox, TaggedOutcome } from '../services/Outbox.js';
+import type { LegacyDatabase } from '../services/IndexedDbOutbox.js';
 import { createStore, type StoreApi } from './store.js';
 import { createWSEState, type WSEStore } from './state/wseState.js';
 import { createQueueState, type MessageQueueStore } from './state/queueState.js';
@@ -36,6 +37,8 @@ export interface ClientStorage {
   clear(): void;
   /** The IndexedDB database of the offline queue; null: no persistent queue. */
   readonly offlineDatabase: string | null;
+  /** The database 3.1 kept that queue in, when this version names it otherwise. */
+  readonly offlineLegacy?: LegacyDatabase | null;
 }
 
 /** An event of a client: `wseGap`, `wseMessage`, `wseEncryptionFailed`, ... */
@@ -218,7 +221,12 @@ export type StorageErrorListener = (operation: StorageOperation, error: unknown)
  * `clear` removes only that and its database; without one, every key of
  * `base`.
  */
-export function scopedStorage(base: ClientStorage, database: string | null, scope?: string): ClientStorage {
+export function scopedStorage(
+  base: ClientStorage,
+  database: string | null,
+  scope?: string,
+  legacy: LegacyDatabase | null = null,
+): ClientStorage {
   const keyOf = scope === undefined ? (key: string) => key : (key: string) => `${scope}/${key}`;
   return {
     get: (key) => base.get(keyOf(key)),
@@ -230,6 +238,7 @@ export function scopedStorage(base: ClientStorage, database: string | null, scop
       if (database) deleteDatabase(database);
     },
     offlineDatabase: database,
+    offlineLegacy: legacy,
   };
 }
 

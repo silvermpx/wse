@@ -37,6 +37,8 @@ const OUTBOX = 'outbox';
 /** 3.1's queue and its lease. */
 const LEGACY = 'messages';
 const LEGACY_LEASE = 'lease';
+/** The mark of a 3.1 database whose messages move into another scope's, until it goes. */
+const MOVING = 'moving';
 /** How long 3.1's queue kept a message without a time of its own. */
 const LEGACY_MAX_AGE = 3_600_000;
 
@@ -175,6 +177,14 @@ function migrate(db: IDBDatabase, tx: IDBTransaction): void {
   };
 }
 
+/** The stores of this version, 3.1's queue moved into them. */
+function upgrade(db: IDBDatabase, tx: IDBTransaction): void {
+  if (!db.objectStoreNames.contains(PRODUCERS)) db.createObjectStore(PRODUCERS, { keyPath: 'producer' });
+  if (!db.objectStoreNames.contains(OUTBOX)) db.createObjectStore(OUTBOX, { keyPath: ['producer', 's'] });
+  if (db.objectStoreNames.contains(LEGACY)) migrate(db, tx);
+  else if (db.objectStoreNames.contains(LEGACY_LEASE)) db.deleteObjectStore(LEGACY_LEASE);
+}
+
 function openDatabase(name: string, report: Report): Promise<IDBDatabase> {
   return new Promise((resolve, reject) => {
     const request = indexedDB.open(name, VERSION);
@@ -182,14 +192,102 @@ function openDatabase(name: string, report: Report): Promise<IDBDatabase> {
     // A page of 3.1 holds the database open: the upgrade waits for it.
     request.onblocked = () => report('blocked', new Error('another page holds the database in an older version'));
     request.onsuccess = () => resolve(request.result);
-    request.onupgradeneeded = () => {
-      const db = request.result;
+    request.onupgradeneeded = () => upgrade(request.result, request.transaction!);
+  });
+}
+
+/** The database 3.1 kept a scope's outbox in, when this version names the scope's otherwise. */
+export interface LegacyDatabase {
+  name: string;
+  /** Its name reads as a scope of another realm too (an `@` in it). */
+  otherRealm: boolean;
+}
+
+/**
+ * 3.1's database `name` upgraded and marked as moving, or one marked so
+ * already (a move cut short); null when it is gone or a scope of this
+ * version opened it as its own.
+ */
+function openMoving(name: string, report: Report): Promise<IDBDatabase | null> {
+  return new Promise((resolve, reject) => {
+    const request = indexedDB.open(name, VERSION);
+    let gone = false;
+    request.onerror = () => (gone ? resolve(null) : reject(request.error));
+    request.onblocked = () => report('blocked', new Error('another page holds the database in an older version'));
+    request.onupgradeneeded = (event) => {
       const tx = request.transaction!;
-      if (!db.objectStoreNames.contains(PRODUCERS)) db.createObjectStore(PRODUCERS, { keyPath: 'producer' });
-      if (!db.objectStoreNames.contains(OUTBOX)) db.createObjectStore(OUTBOX, { keyPath: ['producer', 's'] });
-      if (db.objectStoreNames.contains(LEGACY)) migrate(db, tx);
-      else if (db.objectStoreNames.contains(LEGACY_LEASE)) db.deleteObjectStore(LEGACY_LEASE);
+      // Deleted meanwhile: made anew by this open, it is not made at all.
+      if (event.oldVersion === 0) {
+        gone = true;
+        tx.abort();
+        return;
+      }
+      upgrade(request.result, tx);
+      request.result.createObjectStore(MOVING);
     };
+    request.onsuccess = () => {
+      const db = request.result;
+      if (db.objectStoreNames.contains(MOVING)) return resolve(db);
+      db.close();
+      resolve(null);
+    };
+  });
+}
+
+/** Every producer of `from` and what waits in it, put into `to` at once. */
+async function copyInto(from: IDBDatabase, to: IDBDatabase): Promise<void> {
+  const read = from.transaction([PRODUCERS, OUTBOX], 'readonly');
+  const [metas, rows] = await Promise.all([
+    done(read.objectStore(PRODUCERS).getAll()) as Promise<Meta[]>,
+    done(read.objectStore(OUTBOX).getAll()) as Promise<Row[]>,
+  ]);
+  const tx = to.transaction([PRODUCERS, OUTBOX], 'readwrite');
+  for (const meta of metas) tx.objectStore(PRODUCERS).put(meta);
+  for (const row of rows) tx.objectStore(OUTBOX).put(row);
+  await committed(tx);
+}
+
+/** Deletes `name`; one another page holds goes once that page closes it. */
+function deleteWhenFree(name: string): Promise<void> {
+  return new Promise((resolve) => {
+    const request = indexedDB.deleteDatabase(name);
+    request.onsuccess = () => resolve();
+    request.onerror = () => resolve();
+    request.onblocked = () => resolve();
+  });
+}
+
+/**
+ * 3.1's database of this scope (`legacy`), whose name this version gives
+ * another scope: taken over into `db` when that name reads as this scope's
+ * realm alone, once (its messages under their producers, a repeat put on
+ * the same keys and taken by the server once), and it goes; with an `@` in
+ * it, one of another realm may be its scope: left, and said. One a scope of
+ * this version opened as its own is that scope's.
+ */
+async function takeLegacy(db: IDBDatabase, legacy: LegacyDatabase, report: Report): Promise<void> {
+  if (typeof indexedDB.databases !== 'function') return;
+  const listed = (await indexedDB.databases()).find((d) => d.name === legacy.name);
+  if (!listed) return;
+  if (legacy.otherRealm) {
+    if ((listed.version ?? 0) < VERSION) {
+      report(
+        'legacy',
+        new Error(`3.1 kept messages in ${legacy.name}, a name a scope of another realm reads too: they are not taken over`),
+      );
+    }
+    return;
+  }
+  const locks = (globalThis.navigator as Navigator & { locks: LockManager }).locks;
+  await locks.request(`wse-outbox-legacy:${legacy.name}`, async () => {
+    const old = await openMoving(legacy.name, report);
+    if (!old) return;
+    try {
+      await copyInto(old, db);
+    } finally {
+      old.close();
+    }
+    await deleteWhenFree(legacy.name);
   });
 }
 
@@ -423,7 +521,7 @@ class IdbLog implements OutboxLog {
  * without IndexedDB, it is a `wseStorageError` event and the outbox stays
  * in memory.
  */
-export function indexedDbOutbox(name: string): OutboxStore {
+export function indexedDbOutbox(name: string, legacy?: LegacyDatabase): OutboxStore {
   /** The producer this store had last: taken again first when the page is back. */
   let mine: string | null = null;
   return {
@@ -434,6 +532,8 @@ export function indexedDbOutbox(name: string): OutboxStore {
       }
       const db = await openDatabase(name, report);
       try {
+        // What 3.1 kept of this scope under a name of its own.
+        if (legacy) await takeLegacy(db, legacy, report).catch((error) => report('legacy', error));
         const metas = (await done(db.transaction([PRODUCERS], 'readonly').objectStore(PRODUCERS).getAll())) as Meta[];
         if (mine) metas.sort((a, b) => Number(b.producer === mine) - Number(a.producer === mine));
         for (const listed of metas) {

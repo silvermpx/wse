@@ -10,6 +10,7 @@
 // through their adapters (wse-client/react, /vue, /svelte).
 
 import { OUTBOX_TAG, refuseHeld, reportOutcomes, type TaggedOutcome } from '../services/Outbox.js';
+import type { LegacyDatabase } from '../services/IndexedDbOutbox.js';
 import {
   ConnectionState,
   MessagePriority,
@@ -230,6 +231,16 @@ function outboxDatabase(base: string, consumer: string, realm: string): string {
 }
 
 /**
+ * The database 3.1 kept a scope's outbox in, when this version names the
+ * scope's otherwise (outboxDatabase): its 3.1 name, which reads as another
+ * scope too, of another realm when the name holds an `@`.
+ */
+function legacyOutboxDatabase(base: string, consumer: string, realm: string): LegacyDatabase | null {
+  if (!base.includes('@') && !/[:@]/.test(consumer)) return null;
+  return { name: `${base}:${consumer}@${realm}`, otherRealm: base.includes('@') || consumer.includes('@') };
+}
+
+/**
  * Each client's own hand, for a bridge owner in this package: its outbox
  * flushed now (a window's topics came continuous).
  */
@@ -282,7 +293,9 @@ export function createWSEClient(options: WSEClientOptions = {}): WSEClient {
   const offlineDatabase = consumer && base.offlineDatabase ? outboxDatabase(base.offlineDatabase, consumer, realm ?? '') : null;
   // What it keeps is its consumer's in its realm: another realm (staging
   // beside production) or consumer in the same namespace keeps its own.
-  const storage = scopedStorage(base, offlineDatabase, scopeOf(consumer, realm));
+  const legacy =
+    consumer && base.offlineDatabase ? legacyOutboxDatabase(base.offlineDatabase, consumer, realm ?? '') : null;
+  const storage = scopedStorage(base, offlineDatabase, scopeOf(consumer, realm), legacy);
   const ctx: ClientContext = createClientContext({
     emit,
     storage,
