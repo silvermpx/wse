@@ -1,3 +1,4 @@
+import { fileURLToPath } from 'node:url';
 import { defineConfig } from 'vitest/config';
 
 // The Solid adapter's tests run on the builds Solid ships for a browser in
@@ -23,6 +24,12 @@ export default defineConfig({
     projects: [
       {
         extends: true,
+        // The examples import the package by its name.
+        resolve: {
+          alias: [
+            { find: /^wse-client\/react$/, replacement: fileURLToPath(new URL('./ts-client/react/index.ts', import.meta.url)) },
+          ],
+        },
         test: {
           name: 'client',
           include: ['ts-client/**/*.test.ts', 'ts-client/**/*.test.tsx'],

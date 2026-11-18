@@ -1,80 +1,112 @@
 /**
- * React client for WSE.
+ * React client for WSE: a dashboard of prices and notifications, and a chat
+ * room, in German and English.
  *
- * Connects to a WSE server, subscribes to topics,
- * displays real-time events in a dashboard.
+ *     npm install wse-client react
  *
- *     npm install wse-client
+ * One client for the page, its connection held while a component that needs
+ * it is mounted:
  *
- * Usage in your React app:
+ *     import { createWSEClient } from 'wse-client/core';
+ *     import { WSEProvider } from 'wse-client/react';
+ *     import { Dashboard, ChatRoom } from './client_react';
  *
- *     import { Dashboard } from './client_react';
- *     // ... render <Dashboard /> in your app
+ *     const client = createWSEClient({ endpoints: ['ws://localhost:5007/wse'] });
+ *
+ *     <WSEProvider client={client}>
+ *       <Dashboard lang="de" />
+ *       <ChatRoom channelId="general" lang="de" />
+ *     </WSEProvider>
+ *
+ * The server authenticates a browser by its cookie (`jwt_cookie_name`):
+ * a page's WebSocket cannot carry an Authorization header.
  */
 
-import { useEffect, useState, useCallback } from 'react';
-import { useWSE } from 'wse-client';
+import { useCallback, useState } from 'react';
+import { useWSEClient, useWSEMessage, useWSEState, useWSETopics } from 'wse-client/react';
 
-// -- Basic usage: one hook, real-time data ------------------------------------
+// -- The page's words, in German and English ----------------------------------
 
-export function Dashboard() {
-  const {
-    connectionHealth,
-    activeTopics,
-    stats,
-    subscribe,
-    unsubscribe,
-  } = useWSE(
-    'your-jwt-token',             // auth token
-    ['prices', 'notifications'],  // initial topics
-    {
-      endpoints: ['ws://localhost:5007/wse'],
-    }
-  );
+export type Lang = 'de' | 'en';
+
+const WORDS = {
+  de: {
+    dashboard: 'WSE-Übersicht',
+    status: 'Verbindung',
+    connected: 'verbunden',
+    connecting: 'verbindet',
+    disconnected: 'getrennt',
+    topics: 'Themen',
+    none: 'keine',
+    prices: 'Kurse',
+    notifications: 'Mitteilungen',
+    chat: 'Chat',
+    placeholder: 'Nachricht schreiben …',
+    send: 'Senden',
+  },
+  en: {
+    dashboard: 'WSE dashboard',
+    status: 'Connection',
+    connected: 'connected',
+    connecting: 'connecting',
+    disconnected: 'disconnected',
+    topics: 'Topics',
+    none: 'none',
+    prices: 'Prices',
+    notifications: 'Notifications',
+    chat: 'Chat',
+    placeholder: 'Write a message …',
+    send: 'Send',
+  },
+} as const;
+
+/** How the client's state reads on the page. */
+function connection(ready: boolean, state: string, lang: Lang): string {
+  const words = WORDS[lang];
+  if (ready) return words.connected;
+  return state === 'connecting' || state === 'reconnecting' || state === 'pending'
+    ? words.connecting
+    : words.disconnected;
+}
+
+// -- A dashboard: topics held while mounted, messages by type -----------------
+
+export function Dashboard({ lang = 'en' }: { lang?: Lang }) {
+  const words = WORDS[lang];
+  const state = useWSEState();
+  useWSETopics(['prices', 'notifications']);
 
   const [prices, setPrices] = useState<Record<string, number>>({});
   const [notifications, setNotifications] = useState<string[]>([]);
 
-  // listen for price updates
-  useEffect(() => {
-    const handler = (e: Event) => {
-      const { symbol, price } = (e as CustomEvent).detail;
-      setPrices(prev => ({ ...prev, [symbol]: price }));
-    };
-    window.addEventListener('price_update', handler);
-    return () => window.removeEventListener('price_update', handler);
-  }, []);
-
-  // listen for notifications
-  useEffect(() => {
-    const handler = (e: Event) => {
-      const { text } = (e as CustomEvent).detail;
-      setNotifications(prev => [text, ...prev].slice(0, 50));
-    };
-    window.addEventListener('notification', handler);
-    return () => window.removeEventListener('notification', handler);
-  }, []);
+  useWSEMessage('price_update', (message) => {
+    const { symbol, price } = message.p as { symbol: string; price: number };
+    setPrices((previous) => ({ ...previous, [symbol]: price }));
+  });
+  useWSEMessage('notification', (message) => {
+    const { text } = message.p as { text: string };
+    setNotifications((previous) => [text, ...previous].slice(0, 50));
+  });
 
   return (
     <div>
-      <h2>WSE Dashboard</h2>
-
-      <div>
-        <strong>Status:</strong> {connectionHealth}
+      <h2>{words.dashboard}</h2>
+      <p>
+        <strong>{words.status}:</strong> {connection(state.ready, state.connection, lang)}
         {' | '}
-        <strong>Latency:</strong> {stats.averageLatency.toFixed(1)}ms
-        {' | '}
-        <strong>Topics:</strong> {activeTopics.join(', ')}
-      </div>
+        <strong>{words.topics}:</strong> {state.topics.length > 0 ? state.topics.join(', ') : words.none}
+      </p>
 
-      <h3>Prices</h3>
+      <h3>{words.prices}</h3>
       <ul>
         {Object.entries(prices).map(([symbol, price]) => (
-          <li key={symbol}>{symbol}: ${price.toFixed(2)}</li>
+          <li key={symbol}>
+            {symbol}: {price.toLocaleString(lang, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+          </li>
         ))}
       </ul>
 
-      <h3>Notifications</h3>
+      <h3>{words.notifications}</h3>
       <ul>
         {notifications.map((text, i) => (
           <li key={i}>{text}</li>
@@ -84,56 +116,49 @@ export function Dashboard() {
   );
 }
 
-// -- Dynamic subscriptions ----------------------------------------------------
+// -- A chat room: its topic follows the channel -------------------------------
 
-export function ChatRoom({ channelId }: { channelId: string }) {
-  const { subscribe, unsubscribe, sendMessage } = useWSE(
-    'your-jwt-token',
-    [],  // no initial topics -- subscribe dynamically
-    { endpoints: ['ws://localhost:5007/wse'] }
-  );
+export function ChatRoom({ channelId, lang = 'en' }: { channelId: string; lang?: Lang }) {
+  const words = WORDS[lang];
+  const client = useWSEClient();
+  // Held while mounted; another channel, another topic.
+  useWSETopics([`chat:${channelId}`]);
 
   const [messages, setMessages] = useState<Array<{ author: string; text: string }>>([]);
   const [input, setInput] = useState('');
 
-  // subscribe to the channel topic when channelId changes
-  useEffect(() => {
-    const topic = `chat:${channelId}`;
-    subscribe([topic]);
-    return () => unsubscribe([topic]);
-  }, [channelId, subscribe, unsubscribe]);
-
-  // listen for chat messages
-  useEffect(() => {
-    const handler = (e: Event) => {
-      const msg = (e as CustomEvent).detail;
-      setMessages(prev => [...prev, msg]);
-    };
-    window.addEventListener('message_sent', handler);
-    return () => window.removeEventListener('message_sent', handler);
-  }, []);
+  useWSEMessage('chat_message', (message) => {
+    if (message.tp !== `chat:${channelId}`) return;
+    const { author, text } = message.p as { author: string; text: string };
+    setMessages((previous) => [...previous, { author, text }]);
+  });
 
   const send = useCallback(() => {
-    if (!input.trim()) return;
-    sendMessage('chat_message', { text: input, channel: channelId });
+    const text = input.trim();
+    if (!text) return;
+    client.send('chat_message', { text, channel: channelId });
     setInput('');
-  }, [input, channelId, sendMessage]);
+  }, [client, input, channelId]);
 
   return (
     <div>
-      <h3>Chat: #{channelId}</h3>
+      <h3>
+        {words.chat}: #{channelId}
+      </h3>
       <div style={{ height: 300, overflow: 'auto' }}>
-        {messages.map((msg, i) => (
-          <div key={i}><strong>{msg.author}:</strong> {msg.text}</div>
+        {messages.map((message, i) => (
+          <div key={i}>
+            <strong>{message.author}:</strong> {message.text}
+          </div>
         ))}
       </div>
       <input
         value={input}
-        onChange={e => setInput(e.target.value)}
-        onKeyDown={e => e.key === 'Enter' && send()}
-        placeholder="Type a message..."
+        onChange={(e) => setInput(e.target.value)}
+        onKeyDown={(e) => e.key === 'Enter' && send()}
+        placeholder={words.placeholder}
       />
-      <button onClick={send}>Send</button>
+      <button onClick={send}>{words.send}</button>
     </div>
   );
 }
