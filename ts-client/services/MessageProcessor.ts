@@ -2256,9 +2256,11 @@ export class MessageProcessor {
     const kept = outbox?.handed(message);
     if (kept === null) return false;
     if (kept) {
-      // Its time ran out while it was sealed: it goes as expired.
+      // Its time ran out while it was sealed: it goes as expired, and what
+      // was handed after it goes again, in order.
       if (kept.until < Date.now()) {
         outbox!.ranOut(message);
+        this.scheduleFlush(0);
         return false;
       }
       if (!kept.requires || this.continuous(kept.requires)) return true;

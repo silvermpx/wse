@@ -60,22 +60,24 @@ function client(options: Parameters<typeof createWSEClient>[0]): WSEClient {
   return made;
 }
 
-/** The newest socket, opened as `user`'s with its encryption key exchanged. */
-async function open(c: WSEClient, user: string) {
+/**
+ * The newest socket, opened as `user`'s with its encryption key exchanged;
+ * `acks`: by a server that answers the outbox.
+ */
+async function open(c: WSEClient, user: string, acks = false) {
   const ws = FakeWebSocket.last();
   ws.serverOpen();
-  ws.serverSend(serverReadyMessage({ user_id: user }));
+  const features = { encryption: true, recovery: true, ...(acks ? { acks: true } : {}) };
+  ws.serverSend(serverReadyMessage({ user_id: user, ...(acks ? { features } : {}) }));
   await vi.waitFor(() => expect(ws.messagesOfType('client_hello')).toHaveLength(1));
   const server = await serverKeyExchange(ws.messagesOfType('client_hello')[0].p.encryption_public_key);
-  ws.serverSend(
-    serverHelloMessage({ features: { encryption: true, recovery: true }, encryption_public_key: server.publicKeyB64 }),
-  );
+  ws.serverSend(serverHelloMessage({ features, encryption_public_key: server.publicKeyB64 }));
   await vi.waitFor(() => expect(c.state.getSnapshot().ready).toBe(true));
-  const orders = async () => {
-    const all = await Promise.all(ws.binaryFrames().map(async (frame) => JSON.parse(await server.decrypt(frame))));
-    return all.filter((m) => m.t === 'order').map((m) => m.p);
-  };
-  return { ws, orders };
+  if (acks) ws.serverSend({ c: 'WSE', t: 'outbox', p: { acked: 0, node: 'n1' }, v: 1 });
+  const sent = async () =>
+    Promise.all(ws.binaryFrames().map(async (frame) => JSON.parse(await server.decrypt(frame))));
+  const orders = async () => (await sent()).filter((m) => m.t === 'order').map((m) => m.p);
+  return { ws, orders, sent };
 }
 
 function subscribed(ws: FakeWebSocket) {
@@ -325,6 +327,54 @@ it('never writes a kept send whose time ran out while it was sealed, and says it
     expect(await socket.orders()).toEqual([]);
     expect(delivered).toEqual([]);
     expect(c.kept()).toBe(0);
+  } finally {
+    release();
+    spy.mockRestore();
+  }
+});
+
+it('to a server that answers, never writes a kept send whose time ran out while it was sealed, and sends the next', async () => {
+  let release!: () => void;
+  let started = false;
+  const gate = new Promise<void>((resolve) => (release = resolve));
+  const original = SecurityManager.prototype.encryptForTransport;
+  const spy = vi
+    .spyOn(SecurityManager.prototype, 'encryptForTransport')
+    .mockImplementation(async function (this: SecurityManager, data: string) {
+      const sealed = await original.call(this, data);
+      if (data.includes('order-expiry')) {
+        started = true;
+        await gate;
+      }
+      return sealed;
+    });
+  const c = client({ offline: { enabled: true } });
+  const delivered: string[] = [];
+  const refused: unknown[] = [];
+  c.on('wseDelivered', (d) => delivered.push(...d.ids));
+  c.on('wseNotDelivered', (d) => refused.push(d));
+  try {
+    c.retain();
+    await vi.waitFor(() => expect(FakeWebSocket.instances).toHaveLength(1));
+    const socket = await open(c, 'u', true);
+    c.send('order', { item: 'water' }, { id: 'first', ttl: 30_000 });
+    await vi.waitFor(async () => expect(await socket.orders()).toEqual([{ item: 'water' }]));
+    socket.ws.serverSend({ c: 'WSE', t: 'ack', p: { s: 1 }, v: 1 });
+    await vi.waitFor(() => expect(delivered).toEqual(['first']));
+    c.send('order', { item: 'milk' }, { id: 'order-expiry', ttl: 100 });
+    await vi.waitFor(() => expect(started).toBe(true));
+    c.send('order', { item: 'bread' }, { id: 'next', ttl: 30_000 });
+    // Sealing takes longer than the first may wait.
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    release();
+    await vi.waitFor(() => expect(refused).toEqual([{ reason: 'expired', ids: ['order-expiry'] }]));
+    await vi.waitFor(async () => expect(await socket.orders()).toEqual([{ item: 'water' }, { item: 'bread' }]));
+    const next = (await socket.sent()).find((m) => m.id === 'next');
+    expect(next.s).toBe(3);
+    socket.ws.serverSend({ c: 'WSE', t: 'ack', p: { s: 3 }, v: 1 });
+    await vi.waitFor(() => expect(delivered).toEqual(['first', 'next']));
+    expect(c.kept()).toBe(0);
+    expect(refused).toHaveLength(1);
   } finally {
     release();
     spy.mockRestore();

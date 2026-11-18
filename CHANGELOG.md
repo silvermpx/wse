@@ -132,6 +132,9 @@ server every client is checked against.
   named for a page where there is none keeps memory and says so
   (`wseStorageError`); a saved checkpoint reads as the Rust and Python
   clients read it.
+- TypeScript: an end-to-end encrypted send whose time ran out while it was
+  sealed, to a server that answers the outbox, is said expired, and the
+  sends after it go; they all waited for the next connection.
 - Python: a connection for another user starts the topics over and drops
   the last user's queue; `SyncWSEClient` takes `cookie_name`.
 - Rust client (and Swift, Kotlin, Dart): a connection that died while the

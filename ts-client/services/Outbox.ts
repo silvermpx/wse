@@ -804,7 +804,8 @@ export class Outbox {
       if (!took) break;
       this.cursor++;
       if (numbered) {
-        if (record.s > this.written) this.written = record.s;
+        // Written now; one written later is once it is ([wroteLater]).
+        if (took === true && record.s > this.written) this.written = record.s;
       } else if (took === true) {
         // A server that does not answer took what was written.
         this.records[this.cursor - 1] = undefined as unknown as Kept;
@@ -825,11 +826,17 @@ export class Outbox {
   /**
    * A message the writer took for later is on the socket now (its encryption
    * is done): a server that does not answer took it, and those handed before
-   * it. The writer writes them in the order they were handed.
+   * it; one that answers may have it from now on. The writer writes them in
+   * the order they were handed.
    */
   wroteLater(message: WSMessage): Outcomes {
     const outcomes = noOutcomes();
-    if (!this.plain || this.answered) return outcomes;
+    if (this.answered) {
+      const record = this.taken.get(message);
+      if (record && record.s > this.written) this.written = record.s;
+      return outcomes;
+    }
+    if (!this.plain) return outcomes;
     let at = -1;
     for (let i = this.head; i < this.cursor; i++) {
       if (this.records[i]?.message === message) {
