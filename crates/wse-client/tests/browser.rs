@@ -362,6 +362,52 @@ async fn paused(client: &wse_client::Client) {
     }
 }
 
+/// The database `name` opened at `version` by an older page, which never
+/// lets it go for an upgrade; the returned function closes it.
+async fn held_open(name: &str, version: u32) -> js_sys::Function {
+    let open = js_sys::Function::new_with_args(
+        "name, version",
+        r#"
+        return new Promise((resolve, reject) => {
+          const open = indexedDB.open(name, version);
+          open.onerror = () => reject(open.error);
+          open.onsuccess = () => {
+            const db = open.result;
+            resolve(() => db.close());
+          };
+        });
+        "#,
+    );
+    let promise: js_sys::Promise = open
+        .call2(&wasm_bindgen::JsValue::NULL, &name.into(), &version.into())
+        .unwrap()
+        .into();
+    wasm_bindgen_futures::JsFuture::from(promise)
+        .await
+        .unwrap()
+        .into()
+}
+
+#[wasm_bindgen_test]
+async fn a_close_does_not_wait_for_a_database_an_older_page_holds() {
+    browser_storage();
+    let name = "wse-test-outbox-held";
+    let release = held_open(name, 1).await;
+    let mut config = Config::new(given(URL, "WSE_TEST_URL"));
+    config.offline = Some(Offline::in_indexed_db(name));
+    let (client, _events) = wse_client::start(config).await.unwrap();
+    // Its upgrade waits for the older page: the close does not.
+    within(2, client.close()).await;
+    release.call0(&wasm_bindgen::JsValue::NULL).unwrap();
+    // Once the older page went, the database opens, and is let go.
+    let (again, _events) = {
+        let mut config = Config::new(given(URL, "WSE_TEST_URL"));
+        config.offline = Some(Offline::in_indexed_db(name));
+        wse_client::start(config).await.unwrap()
+    };
+    within(5, again.close()).await;
+}
+
 #[wasm_bindgen_test]
 async fn what_waits_in_indexed_db_goes_with_the_next_client_once() {
     browser_storage();

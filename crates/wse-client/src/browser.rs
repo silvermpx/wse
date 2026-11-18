@@ -260,44 +260,69 @@ impl<H: Handler> Driver<H> {
 
     pub(crate) async fn run(mut self, mut first: First) {
         // The outbox's database opens in its own time: what it holds waits
-        // for the first connection, and what is sent meanwhile after it.
+        // for the first connection, and what is sent meanwhile after it. A
+        // close meanwhile does not wait for it (an older page may hold its
+        // upgrade); what else the application asks meanwhile is done once
+        // it is open.
+        let mut asked = Vec::new();
+        let mut closed = false;
         if let Some(outbox) = &mut self.session.outbox {
-            outbox.open_store().await;
-        }
-        let end = loop {
-            if !self.paused.is_empty() {
-                self.status.send_replace(Status::Paused);
-                self.session.handler.event(Event::Paused(Paused {
-                    reasons: self.paused.iter().cloned().collect(),
-                }));
-                if !self.wait_paused().await {
-                    break None;
+            let opening = outbox.open_store();
+            let mut opening = std::pin::pin!(opening);
+            loop {
+                tokio::select! {
+                    () = &mut opening => break,
+                    control = self.control.recv() => match control {
+                        None | Some(Control::Close) => {
+                            closed = true;
+                            break;
+                        }
+                        Some(control) => asked.push(control),
+                    },
                 }
-                // Back from a pause: at once, the counts start over.
-                self.policy.connected();
             }
-            let lost = match self.open().await {
-                None => Lost::Shutdown,
-                Some(Ok(socket)) => self.serve(socket, &mut first).await,
-                Some(Err(Some(error))) => Lost::Failed(error),
-                Some(Err(None)) => Lost::Paused,
-            };
-            self.session.close();
-            if matches!(lost, Lost::Paused) {
-                continue;
-            }
-            // What the application sent and the lost connection did not
-            // write goes out on the next one, once the server takes it.
-            match self.policy.after(lost, &self.config, &mut first) {
-                Next::Stop(end) => break end,
-                Next::Retry(disconnected) => {
-                    let retry_in = disconnected.retry_in;
-                    self.status.send_replace(Status::Reconnecting);
-                    self.session
-                        .handler
-                        .event(Event::Disconnected(disconnected));
-                    if !self.wait(retry_in).await {
+        }
+        for control in asked {
+            self.asked(control);
+        }
+        let end = if closed {
+            None
+        } else {
+            loop {
+                if !self.paused.is_empty() {
+                    self.status.send_replace(Status::Paused);
+                    self.session.handler.event(Event::Paused(Paused {
+                        reasons: self.paused.iter().cloned().collect(),
+                    }));
+                    if !self.wait_paused().await {
                         break None;
+                    }
+                    // Back from a pause: at once, the counts start over.
+                    self.policy.connected();
+                }
+                let lost = match self.open().await {
+                    None => Lost::Shutdown,
+                    Some(Ok(socket)) => self.serve(socket, &mut first).await,
+                    Some(Err(Some(error))) => Lost::Failed(error),
+                    Some(Err(None)) => Lost::Paused,
+                };
+                self.session.close();
+                if matches!(lost, Lost::Paused) {
+                    continue;
+                }
+                // What the application sent and the lost connection did not
+                // write goes out on the next one, once the server takes it.
+                match self.policy.after(lost, &self.config, &mut first) {
+                    Next::Stop(end) => break end,
+                    Next::Retry(disconnected) => {
+                        let retry_in = disconnected.retry_in;
+                        self.status.send_replace(Status::Reconnecting);
+                        self.session
+                            .handler
+                            .event(Event::Disconnected(disconnected));
+                        if !self.wait(retry_in).await {
+                            break None;
+                        }
                     }
                 }
             }
@@ -318,6 +343,23 @@ impl<H: Handler> Driver<H> {
             .store(false, std::sync::atomic::Ordering::Release);
         self.session.handler.event(Event::Closed(end.clone()));
         self.status.send_replace(Status::Closed(end));
+    }
+
+    /// What the application asked while the outbox's database opened.
+    fn asked(&mut self, control: Control) {
+        match control {
+            Control::Close | Control::Reconnect => {}
+            Control::Pause(reason) => {
+                self.paused.insert(reason);
+            }
+            Control::Resume(reason) => {
+                self.paused.remove(&reason);
+            }
+            Control::Subscribe(topics) => self.session.subscribe(topics),
+            Control::Unsubscribe(topics) => self.session.unsubscribe(topics),
+            Control::Drain => self.session.handler.drain(),
+            Control::Clear => self.session.catch_up_clears(),
+        }
     }
 
     /// Opens a socket; `None` when the application closed the client

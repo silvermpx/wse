@@ -22,8 +22,8 @@ use wasm_bindgen::closure::Closure;
 use wasm_bindgen::{JsCast, JsValue};
 use wasm_bindgen_futures::JsFuture;
 use web_sys::{
-    IdbDatabase, IdbFactory, IdbKeyRange, IdbObjectStoreParameters, IdbRequest, IdbTransaction,
-    IdbTransactionMode,
+    IdbDatabase, IdbFactory, IdbKeyRange, IdbObjectStoreParameters, IdbOpenDbRequest, IdbRequest,
+    IdbTransaction, IdbTransactionMode,
 };
 
 use super::{LineRef, Read, Record, Report, Wake, new_id, numbered, unnumbered};
@@ -255,6 +255,48 @@ fn record_of(row: &JsValue) -> Option<Record> {
     })
 }
 
+/// The stores of this version, made on the database's upgrade.
+fn create_stores(request: &IdbOpenDbRequest) {
+    let Ok(db) = request.result().and_then(JsCast::dyn_into::<IdbDatabase>) else {
+        return;
+    };
+    let stores = db.object_store_names();
+    if !stores.contains(PRODUCERS) {
+        let parameters = IdbObjectStoreParameters::new();
+        parameters.set_key_path(&JsValue::from_str("producer"));
+        let _ = db.create_object_store_with_optional_parameters(PRODUCERS, &parameters);
+    }
+    if !stores.contains(OUTBOX) {
+        let parameters = IdbObjectStoreParameters::new();
+        parameters.set_key_path(&Array::of2(&"producer".into(), &"s".into()));
+        let _ = db.create_object_store_with_optional_parameters(OUTBOX, &parameters);
+    }
+}
+
+/// An open given up while it waits (the client closed first, while an
+/// older page held the database's upgrade): whenever it opens later, its
+/// stores are made and the database is let go at once.
+struct GivenUp(Option<IdbOpenDbRequest>);
+
+impl Drop for GivenUp {
+    fn drop(&mut self) {
+        let Some(request) = self.0.take() else {
+            return;
+        };
+        let upgrading = request.clone();
+        let upgrade = Closure::once_into_js(move |_: web_sys::Event| create_stores(&upgrading));
+        request.set_onupgradeneeded(Some(upgrade.unchecked_ref()));
+        let opened = request.clone();
+        let close = Closure::once_into_js(move |_: web_sys::Event| {
+            if let Ok(db) = opened.result().and_then(JsCast::dyn_into::<IdbDatabase>) {
+                db.close();
+            }
+        });
+        request.set_onsuccess(Some(close.unchecked_ref()));
+        request.set_onerror(None);
+    }
+}
+
 async fn open_database(name: &str) -> Result<IdbDatabase, String> {
     let factory: IdbFactory = global("indexedDB")
         .and_then(|v| v.dyn_into().ok())
@@ -264,25 +306,12 @@ async fn open_database(name: &str) -> Result<IdbDatabase, String> {
         .map_err(|e| describe(&e))?;
     let upgrade = {
         let request = request.clone();
-        Closure::<dyn FnMut(web_sys::Event)>::new(move |_| {
-            let Ok(db) = request.result().and_then(JsCast::dyn_into::<IdbDatabase>) else {
-                return;
-            };
-            let stores = db.object_store_names();
-            if !stores.contains(PRODUCERS) {
-                let parameters = IdbObjectStoreParameters::new();
-                parameters.set_key_path(&JsValue::from_str("producer"));
-                let _ = db.create_object_store_with_optional_parameters(PRODUCERS, &parameters);
-            }
-            if !stores.contains(OUTBOX) {
-                let parameters = IdbObjectStoreParameters::new();
-                parameters.set_key_path(&Array::of2(&"producer".into(), &"s".into()));
-                let _ = db.create_object_store_with_optional_parameters(OUTBOX, &parameters);
-            }
-        })
+        Closure::<dyn FnMut(web_sys::Event)>::new(move |_| create_stores(&request))
     };
     request.set_onupgradeneeded(Some(upgrade.as_ref().unchecked_ref()));
+    let mut given_up = GivenUp(Some(request.clone()));
     let opened = result(&request).await;
+    given_up.0 = None;
     // Opened, or not: no upgrade comes any more.
     request.set_onupgradeneeded(None);
     drop(upgrade);
