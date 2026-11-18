@@ -228,7 +228,9 @@ server every client is checked against.
   (its HELLO says where it is reached), and while the link of the one gone
   still looks up; a client whose last message of a topic came from this
   node's own stream, or through a pattern, is no longer told it missed
-  nothing then.
+  nothing then. A node dialed by another name than the address it gives
+  (`localhost` for `127.0.0.1`) is known by both, so the one that comes up
+  there and dials in first is known for another node too.
 - Cluster: a node that stops no longer loses what it published just before
   the stop. Its run leaves the cluster once it takes no more publishes,
   after every one it took, and waits (two seconds at most) for each link to

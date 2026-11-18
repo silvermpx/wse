@@ -11,6 +11,7 @@ import datetime
 import ipaddress
 import json
 import time
+from types import SimpleNamespace
 
 import pytest
 
@@ -581,7 +582,9 @@ def _recovered_both_ways(relay, anchor, websockets):
                 answer = relay.server.subscribe_with_recovery(
                     conn_id, ["news"], recover=True, positions={"news": past}
                 )["topics"]["news"]
-                got = await messages_of_type(back, "news", answer["count"]) if answer["count"] else []
+                got = (
+                    await messages_of_type(back, "news", answer["count"]) if answer["count"] else []
+                )
                 told.append((answer, [m["p"]["n"] for m in got]))
         return told
 
@@ -628,7 +631,9 @@ async def _after_an_outage(origin, relay, during, websockets, *, origin_reads=("
         raise
 
 
-def test_a_stream_begun_while_a_link_was_down_and_longer_than_its_history_is_never_said_recovered(nodes):
+def test_a_stream_begun_while_a_link_was_down_and_longer_than_its_history_is_never_said_recovered(
+    nodes,
+):
     """Seventeen messages, of a stream the other node never heard of, into a
     history of sixteen: the other node's clients get the sixteen kept, and
     one whose last message came before them is not told it missed nothing."""
@@ -701,7 +706,11 @@ def test_a_message_published_locally_between_two_for_the_cluster_leaves_no_hole(
             origin.server.broadcast_local("news", json.dumps({"t": "news", "p": {"n": 1}}))
             origin.server.broadcast("news", json.dumps({"t": "news", "p": {"n": 2}}))
             got = await messages_of_type(live, "news", 1)
-        return anchor, [m["p"]["n"] for m in got], await _recovered_both_ways(relay, anchor, websockets)
+        return (
+            anchor,
+            [m["p"]["n"] for m in got],
+            await _recovered_both_ways(relay, anchor, websockets),
+        )
 
     anchor, got, told = asyncio.run(scenario())
     assert got == [2]
@@ -949,7 +958,53 @@ def test_a_node_back_anew_that_dials_in_itself_is_never_taken_to_have_lost_nothi
         assert answer["recovered"] is False or 2 in numbers, answer
 
 
-def test_a_node_back_anew_while_its_last_link_still_looks_up_is_never_taken_to_have_lost_nothing(nodes):
+def test_a_node_dialed_by_another_name_than_it_gives_is_known_when_it_comes_back_anew(nodes):
+    """The relay dials the origin by a name (localhost) while the origin
+    says it is reached at its address: the node that comes up there and
+    dials in itself, before the relay reaches it again, is still another
+    node, gone with what it published while the link was down."""
+    websockets = pytest.importorskip("websockets")
+    origin = nodes(recovery=True)
+    relay = nodes(recovery=True)
+
+    async def scenario():
+        route = Blink(origin)
+        await route.start()
+        try:
+            origin.join(cluster_secret=SECRET, cluster_addr=route.addr)
+            relay.join(SimpleNamespace(addr=f"localhost:{route.port}"))
+            await until(lambda: origin.peers == 1 and relay.peers == 1)
+            async with websockets.connect(f"ws://127.0.0.1:{relay.port}/wse") as live:
+                await subscribe_next_client(relay, ["news", "barrier"])
+                await asyncio.sleep(0.35)  # the SUB reaches the origin
+                origin.server.broadcast("news", json.dumps({"t": "news", "p": {"n": 1}}))
+                (anchor,) = await messages_of_type(live, "news", 1)
+                route.cut()
+                await until(lambda: origin.peers == 0 and relay.peers == 0)
+                origin.server.broadcast("news", json.dumps({"t": "news", "p": {"n": 2}}))
+                await asyncio.sleep(0.2)
+                origin.stop()
+                anew = nodes(recovery=True)
+                anew.cluster_port = origin.cluster_port
+                route.target = anew
+                # The relay's own dials stay refused: it meets the new node
+                # only as that one dials in.
+                anew.join(relay, cluster_secret=SECRET, cluster_addr=route.addr)
+                await until(lambda: anew.peers == 1 and relay.peers == 1, timeout=20.0)
+                await asyncio.sleep(0.4)
+                anew.server.broadcast("barrier", json.dumps({"t": "barrier", "p": {"n": 3}}))
+                await messages_of_type(live, "barrier", 1)
+            return await _recovered_both_ways(relay, anchor, websockets)
+        finally:
+            route.close()
+
+    for answer, numbers in asyncio.run(scenario()):
+        assert answer["recovered"] is False or 2 in numbers, answer
+
+
+def test_a_node_back_anew_while_its_last_link_still_looks_up_is_never_taken_to_have_lost_nothing(
+    nodes,
+):
     """The origin goes while the other node still holds its link, its end
     never come through, and the node that comes up at its address dials in:
     the other node takes it that the one it had went without SHUTDOWN."""

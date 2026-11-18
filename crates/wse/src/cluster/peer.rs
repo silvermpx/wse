@@ -13,6 +13,7 @@ use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
+use super::inbound::reached_slot;
 use super::protocol::{encode_lost, write_framed};
 use super::{
     CAP_ARRIVAL, CAP_RESUME, CAP_RESUME_TOPICS, ClusterCommand, ClusterContext, ClusterFrame,
@@ -932,6 +933,7 @@ async fn run_peer_session<R, W>(
     mut reader: R,
     mut writer: W,
     ids: (&str, &str),
+    remote: Option<std::net::SocketAddr>,
     ctx: &ClusterContext,
     peer_reg_tx: &mpsc::UnboundedSender<PeerRegistration>,
     global_cancel: &CancellationToken,
@@ -968,14 +970,19 @@ where
             }
         };
 
-    let (peer_instance_id, peer_version, peer_caps) = match peer_hello {
+    let (peer_instance_id, peer_version, peer_caps, reached_at) = match peer_hello {
         Some(ClusterFrame::Hello {
             instance_id: peer_id,
             protocol_version,
             capabilities,
-            ..
+            reached_at,
         }) => match negotiate_version(PROTOCOL_VERSION, protocol_version) {
-            Some(v) => (peer_id, v, negotiate_capabilities(local_caps, capabilities)),
+            Some(v) => (
+                peer_id,
+                v,
+                negotiate_capabilities(local_caps, capabilities),
+                reached_at,
+            ),
             None => {
                 tracing::warn!(
                     "[WSE-Cluster] Version mismatch with {peer_addr}: local={PROTOCOL_VERSION}, remote={protocol_version}"
@@ -990,6 +997,15 @@ where
     };
 
     met_at(ctx, peer_addr, &peer_instance_id);
+    // Where the peer says it is reached may be spelled otherwise than the
+    // address dialed (a name for it, the address behind a name): the node
+    // met there is the same one, and a node that dials in from there later
+    // is judged against it.
+    if let Some(slot) = remote.and_then(|remote| reached_slot(reached_at.as_deref(), remote))
+        && slot != peer_addr
+    {
+        met_at(ctx, &slot, &peer_instance_id);
+    }
 
     let peer_cancel = global_cancel.child_token();
     let session_gen = PEER_SESSION_GENERATION.fetch_add(1, Ordering::AcqRel);
@@ -1217,6 +1233,8 @@ async fn peer_connection_task(
             }
         };
         unreachable = 0;
+        // The address the name dialed led to.
+        let remote = stream.peer_addr().ok();
 
         // TCP_NODELAY + keepalive + larger buffers for throughput
         let _ = stream.set_nodelay(true);
@@ -1249,6 +1267,7 @@ async fn peer_connection_task(
                         reader,
                         writer,
                         (&peer_addr, &instance_id),
+                        remote,
                         &ctx,
                         &peer_reg_tx,
                         &global_cancel,
@@ -1270,6 +1289,7 @@ async fn peer_connection_task(
                 reader,
                 writer,
                 (&peer_addr, &instance_id),
+                remote,
                 &ctx,
                 &peer_reg_tx,
                 &global_cancel,
