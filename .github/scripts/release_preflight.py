@@ -526,6 +526,45 @@ def _mobile_files(version: str) -> dict[str, str]:
 
 _MOBILE_PREFIXES = ("WseFFIC-", "wse-client-android-", "wse_client-dart-", "wse_dart-")
 
+# The wse-server wheels a release holds (release.yml's wheel matrix): an abi3
+# wheel for each platform, as its file name says the platform, and the
+# free-threaded 3.14t and 3.15t wheels where there is a CPython of them.
+SERVER_WHEELS: dict[str, tuple[tuple[str, ...], bool]] = {
+    "Linux x86_64 (glibc)": (("manylinux", "x86_64"), True),
+    "Linux aarch64 (glibc)": (("manylinux", "aarch64"), True),
+    "Linux x86_64 (musl)": (("musllinux", "x86_64"), False),
+    "Linux aarch64 (musl)": (("musllinux", "aarch64"), False),
+    "macOS x86_64": (("macosx", "x86_64"), True),
+    "macOS arm64": (("macosx", "arm64"), True),
+    "Windows x64": (("win_amd64",), True),
+    "Windows arm64": (("win_arm64",), True),
+}
+FREE_THREADED = ("cp314t", "cp315t")
+
+
+def missing_server_wheels(names: list[str]) -> list[str]:
+    """The wse-server wheels of SERVER_WHEELS that ``names`` lack."""
+    wheels = [n for n in names if n.startswith("wse_server-") and n.endswith(".whl")]
+    missing = []
+    for platform, (fragments, free_threaded) in SERVER_WHEELS.items():
+        mine = [w for w in wheels if all(f in w for f in fragments)]
+        if not any("-abi3-" in w for w in mine):
+            missing.append(f"{platform} abi3")
+        if free_threaded:
+            for tag in FREE_THREADED:
+                if not any(f"-{tag}-" in w for w in mine):
+                    missing.append(f"{platform} {tag}")
+    return missing
+
+
+def _maven_companion(name: str, base: str) -> bool:
+    """A file Maven Central takes beside the jar ``base``.jar: its POM,
+    sources and javadoc jars, their signatures and checksums."""
+    if not name.startswith(base):
+        return False
+    rest = re.sub(r"(\.asc)?(\.(md5|sha1|sha256|sha512))?$", "", name[len(base) :])
+    return rest in (".jar", ".pom", ".module", "-sources.jar", "-javadoc.jar")
+
 
 def cmd_artifacts(args: argparse.Namespace) -> int:
     expected = normalize(args.version)
@@ -537,10 +576,25 @@ def cmd_artifacts(args: argparse.Namespace) -> int:
         ("npm:wse-client", ".tgz"): "npm tarball",
     }
     mobile = _mobile_files(args.npm_version)
-    counts = dict.fromkeys([*kinds.values(), *mobile.values()], 0)
+    jvm = f"wse-client-jvm-{args.npm_version}"
+    counts = dict.fromkeys([*kinds.values(), *mobile.values(), "JVM library"], 0)
     errors = 0
     files = sorted(p for d in args.dirs for p in Path(d).rglob("*") if p.is_file())
     for path in files:
+        if path.name == f"{jvm}.jar":
+            counts["JVM library"] += 1
+            print(f"  {'ok':<9}  {path}")
+            continue
+        if _maven_companion(path.name, jvm):
+            print(f"  {'ok':<9}  {path}")
+            continue
+        if path.name.startswith("wse-client-jvm-"):
+            errors += 1
+            print(f"  {'MISMATCH':<9}  {path}")
+            gh_error(
+                str(path), None, f"{path.name} is not a JVM release file of {args.npm_version}"
+            )
+            continue
         if path.name in mobile:
             counts[mobile[path.name]] += 1
             print(f"  {'ok':<9}  {path}")
@@ -584,6 +638,14 @@ def cmd_artifacts(args: argparse.Namespace) -> int:
             gh_error(
                 ".github/workflows/release.yml", None, f"no {kind} among the release artifacts"
             )
+    # Every platform's wheels: one of them missing is no release.
+    for wheel in missing_server_wheels([p.name for p in files]):
+        errors += 1
+        gh_error(
+            ".github/workflows/release.yml",
+            None,
+            f"no wse-server wheel for {wheel} among the release artifacts",
+        )
     return 1 if errors else 0
 
 
