@@ -21,7 +21,7 @@ On the wire every frame follows a 4-byte big-endian length (u32), the length of 
 
 | Offset | Size | Field | Description |
 |--------|------|-------|-------------|
-| 0 | 1 | type | Message type (0x01 - 0x10) |
+| 0 | 1 | type | Message type (0x01 - 0x11) |
 | 1 | 1 | flags | Per type: MSG bit 0 compressed (zstd), bit 1 recovery trailer, bit 2 replayed; RESYNC bit 0 continuation; RESUME bit 0 last; PresenceFull bits 0-2 sync round; otherwise 0 |
 | 2 | 2 | topic_len | Topic field length (little-endian u16) |
 | 4 | 4 | payload_len | Payload field length (little-endian u32) |
@@ -218,6 +218,8 @@ When CAP_RESUME is negotiated, each node sends its request right after HELLO and
 
 So a link that drops and comes back loses nothing the origin still holds: the receiving node's subscribers get the missed messages in order, followed by the live ones, and its recovery buffers have no hole, a stream the origin began while the link was down included. A message shed on a full link is filled in the same way the next time the link comes up.
 
+After those messages the node sends a LOST frame for each topic the request names, by itself or by a pattern, of which it published a message that it no longer holds, or never could, since the oldest of the peer's interests in it began (and up to 3 seconds before): see [LOST](#lost-0x11---messages-no-node-holds).
+
 ### PRODUCER_QUERY (0x0F) and PRODUCER_STATE (0x10) - A Client's Outbox Moves
 
 ```
@@ -239,6 +241,15 @@ per refusal: [8 bytes: first (LE u64)] [8 bytes: last (LE u64)]
 ```
 
 A client that reconnects to another node names the node it was on and the highest message it wrote there without an answer ([the client's outbox](PROTOCOL.md#the-clients-outbox)). When the new node links to that node with CAP_PRODUCERS, it asks once: the asked node hands the producer over (its connections still reading for it take nothing more, and close with 4409) and answers the highest message it decided, with the refusals behind it its client may not have heard of and what it could not tell: refusals let go because it held 1024 runs of them, and a message whose handler never ended. The new node confirms the rest up to that number, refuses a repeat of a refused one again, tells the client of the refusals in its `outbox` answer, and takes only what came after; what the asked node could not tell, it cannot either: the client sends it again and the application gets it marked as a possible repeat, as it does without an answer within 2 seconds. A node keeps what it could not tell with the producer, not with the connection: up to the highest message the client wrote when that node could not be asked, the first time each of those comes, on any later connection and on any node the producer moves to after, it is marked.
+
+### LOST (0x11) - Messages No Node Holds
+
+```
+[header: type=0x11, topic_len=N]
+[N bytes: topic or pattern]
+```
+
+Sent after the catch-up that follows a RESUME with topics (CAP_RESUME_TOPICS): the sender published messages of this topic that no node holds, while the link was down or before, and the receiving node has no way to tell which of its clients missed them. A client of the receiving node whose last message of the topic came before the frame is told it was not recovered and resyncs; one whose last message came after it is recovered as usual. A pattern counts for each topic the receiving node has that it matches; the sender names one when it ran out of room to remember the topics themselves (100,000 of them). A message relayed live with no position, because its origin had no room to keep it, means the same for its topic.
 
 ## Interest-Based Routing
 

@@ -152,8 +152,16 @@ const RESUME_TIMEOUT: Duration = Duration::from_secs(5);
 /// buffers hold within their memory budget.
 const MAX_RESUME_POINTS: usize = 1 << 20;
 
-/// Dispatch tuple: (topic, payload, optional origin recovery position).
-type DispatchItem = (String, Bytes, Option<(u32, u64)>);
+/// What a peer's reader hands its dispatch task, in the order it read it.
+enum DispatchItem {
+    /// A message of a topic, relayed or replayed: with its origin's
+    /// recovery position when it has one.
+    Message(String, Bytes, Option<(u32, u64)>),
+    /// Messages of a topic (or of each topic a pattern matches) were
+    /// published on the peer that no node holds: after what was replayed
+    /// before it.
+    Lost(String),
+}
 
 // Minimum payload size for compression to be worthwhile (bytes).
 // Below this threshold, zstd overhead exceeds savings.

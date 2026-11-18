@@ -1595,6 +1595,16 @@ async fn test_cluster_queue_group_dispatch() {
     }
 }
 
+#[test]
+fn lost_frame_round_trips() {
+    let mut buf = BytesMut::new();
+    assert!(super::protocol::encode_lost(&mut buf, "prices:*"));
+    let frame = decode_frame(buf);
+    assert!(matches!(frame, Some(ClusterFrame::Lost { ref topic }) if topic == "prices:*"));
+    let long = "t".repeat(u16::MAX as usize + 1);
+    assert!(!super::protocol::encode_lost(&mut BytesMut::new(), &long));
+}
+
 // Regression: the inbound MSG dispatch channel is BOUNDED at
 // PEER_DISPATCH_QUEUE_CAP and sheds via try_send when full, so a fast peer
 // cannot grow an unbounded backlog -> OOM. peer_reader relies on exactly this
@@ -1606,15 +1616,23 @@ async fn dispatch_channel_is_bounded_and_sheds_when_full() {
     // Fill to capacity with no consumer draining.
     for _ in 0..PEER_DISPATCH_QUEUE_CAP {
         assert!(
-            tx.try_send(("t".to_string(), Bytes::from_static(b"p"), None))
-                .is_ok(),
+            tx.try_send(DispatchItem::Message(
+                "t".to_string(),
+                Bytes::from_static(b"p"),
+                None
+            ))
+            .is_ok(),
             "sends up to the cap must succeed"
         );
     }
     // The next send must shed (Err), never block or grow the queue.
     assert!(
-        tx.try_send(("t".to_string(), Bytes::from_static(b"p"), None))
-            .is_err(),
+        tx.try_send(DispatchItem::Message(
+            "t".to_string(),
+            Bytes::from_static(b"p"),
+            None
+        ))
+        .is_err(),
         "send past the bound must fail (shed), proving the queue is bounded"
     );
 }

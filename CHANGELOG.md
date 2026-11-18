@@ -150,7 +150,10 @@ server every client is checked against.
 - Cluster: a stream a node began while its link to another was down
   reaches the other node's subscribers once the link is back
   (`CAP_RESUME_TOPICS`); the catch-up covered only the streams the other
-  node held a message of.
+  node held a message of. A message its origin could not keep while the
+  link was down is told to the other node after the catch-up (LOST): a
+  recovery from before it there says `recovered: false`, where it said it
+  missed nothing.
 - Swift, Kotlin and Dart: once the client is closed, the events end with
   what the close said (the messages it will not deliver, the close itself);
   a reader waiting at the close no longer gets its end before them.

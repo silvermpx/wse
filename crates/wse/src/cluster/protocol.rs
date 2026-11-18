@@ -34,6 +34,8 @@ pub(crate) enum MsgType {
     ProducerQuery = 0x0F,
     /// The answer to a PRODUCER_QUERY.
     ProducerState = 0x10,
+    /// Messages of a topic were published that no node holds.
+    Lost = 0x11,
 }
 
 impl MsgType {
@@ -55,6 +57,7 @@ impl MsgType {
             0x0E => Some(Self::Resume),
             0x0F => Some(Self::ProducerQuery),
             0x10 => Some(Self::ProducerState),
+            0x11 => Some(Self::Lost),
             _ => None,
         }
     }
@@ -314,6 +317,23 @@ pub(crate) fn encode_sub(buf: &mut BytesMut, topic: &str) -> bool {
     }
     buf.reserve(8 + topic_bytes.len());
     buf.put_u8(MsgType::Sub as u8);
+    buf.put_u8(0); // flags
+    buf.put_u16_le(topic_bytes.len() as u16);
+    buf.put_u32_le(0); // no payload
+    buf.put_slice(topic_bytes);
+    true
+}
+
+/// Encode a LOST frame: messages of `topic` (a name, or a pattern of them)
+/// were published here that no node holds. False if the topic exceeds 64KB.
+/// Format: [header: type=0x11, topic_len=N] [N bytes: topic]
+pub(crate) fn encode_lost(buf: &mut BytesMut, topic: &str) -> bool {
+    let topic_bytes = topic.as_bytes();
+    if topic_bytes.len() > u16::MAX as usize {
+        return false;
+    }
+    buf.reserve(8 + topic_bytes.len());
+    buf.put_u8(MsgType::Lost as u8);
     buf.put_u8(0); // flags
     buf.put_u16_le(topic_bytes.len() as u16);
     buf.put_u32_le(0); // no payload
@@ -711,6 +731,11 @@ pub(crate) enum ClusterFrame {
         id: u64,
         decided: Option<Decided>,
     },
+    /// Messages of a topic (or of each topic a pattern matches) were
+    /// published on the peer that no node holds.
+    Lost {
+        topic: String,
+    },
     Unknown {
         msg_type: u8,
     },
@@ -847,6 +872,13 @@ pub(crate) fn decode_frame(mut data: BytesMut) -> Option<ClusterFrame> {
             }
             let topic = String::from_utf8(data.split_to(topic_len).to_vec()).ok()?;
             Some(ClusterFrame::Sub { topic })
+        }
+        Some(MsgType::Lost) => {
+            if data.remaining() < topic_len {
+                return None;
+            }
+            let topic = String::from_utf8(data.split_to(topic_len).to_vec()).ok()?;
+            Some(ClusterFrame::Lost { topic })
         }
         Some(MsgType::Unsub) => {
             if data.remaining() < topic_len {

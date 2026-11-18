@@ -13,7 +13,7 @@ use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use super::protocol::write_framed;
+use super::protocol::{encode_lost, write_framed};
 use super::{
     CAP_RESUME, CAP_RESUME_TOPICS, ClusterCommand, ClusterContext, ClusterFrame, ClusterMetrics,
     ClusterTlsConfig, DispatchItem, HEARTBEAT_INTERVAL_SECS, HEARTBEAT_TIMEOUT_SECS,
@@ -145,7 +145,10 @@ pub(super) async fn peer_reader<R: AsyncReadExt + Unpin>(
                 // falls behind, so a fast peer cannot grow an unbounded backlog -> OOM.
                 // Shed MSGs stay recoverable via the recovery buffer; the reader remains
                 // responsive to control/heartbeat frames on the same loop.
-                if dispatch_tx.try_send((topic, payload, recovery)).is_err() {
+                if dispatch_tx
+                    .try_send(DispatchItem::Message(topic, payload, recovery))
+                    .is_err()
+                {
                     ctx.metrics.messages_dropped.fetch_add(1, Ordering::Relaxed);
                 }
             }
@@ -157,7 +160,15 @@ pub(super) async fn peer_reader<R: AsyncReadExt + Unpin>(
                 last_activity.store(epoch_ms(), Ordering::Relaxed);
                 // What this node missed while the link was down: delivered,
                 // so it waits for room instead of being shed.
-                if !to_manager(&dispatch_tx, (topic, payload, Some(position)), &cancel).await {
+                let replayed = DispatchItem::Message(topic, payload, Some(position));
+                if !to_manager(&dispatch_tx, replayed, &cancel).await {
+                    break;
+                }
+            }
+            Some(ClusterFrame::Lost { topic }) => {
+                last_activity.store(epoch_ms(), Ordering::Relaxed);
+                // In order with the messages replayed before it.
+                if !to_manager(&dispatch_tx, DispatchItem::Lost(topic), &cancel).await {
                     break;
                 }
             }
@@ -375,7 +386,16 @@ pub(super) async fn peer_dispatch_task(
         let mut total_delivered = 0u64;
         let mut total_dropped = 0u64;
 
-        for (topic, payload, rec) in batch.drain(..) {
+        for item in batch.drain(..) {
+            let (topic, payload, rec) = match item {
+                DispatchItem::Message(topic, payload, rec) => (topic, payload, rec),
+                DispatchItem::Lost(topic) => {
+                    if let Some(rm) = &ctx.recovery {
+                        rm.lost(&topic);
+                    }
+                    continue;
+                }
+            };
             // Store the unframed payload in the foreign recovery buffer
             // (cross-node recovery), the form the local buffer stores too.
             // One this node has already (a peer catching it up sends from
@@ -656,6 +676,23 @@ where
         };
         for (offset, data) in messages {
             replay.push(writer, topic, (epoch, offset), &data).await?;
+        }
+    }
+    // Of each topic the peer has, by its name or a pattern, what was not kept
+    // here since its interest began, a topic with no history here included:
+    // after what was replayed, so a client of the peer whose last message
+    // came before it is not told it missed nothing.
+    let mut lost: Vec<String> = wanted
+        .topics
+        .iter()
+        .flat_map(|(topic, age)| rm.lost_lately(topic, Duration::from_millis(*age)))
+        .collect();
+    lost.sort_unstable();
+    lost.dedup();
+    for name in &lost {
+        replay.frame.clear();
+        if encode_lost(&mut replay.frame, name) {
+            write_framed(&mut replay.out, &replay.frame);
         }
     }
     write_progressing(writer, &replay.out).await?;

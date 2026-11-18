@@ -413,6 +413,67 @@ def test_a_stream_a_pattern_matches_begun_while_a_link_was_down_arrives_after_it
     assert new == [0, 1], "the new stream from its first message, in order"
 
 
+def test_a_message_no_node_kept_while_a_link_was_down_is_never_said_recovered(nodes):
+    """While the link between the nodes is down the origin, with no room
+    left for history, publishes to a topic the other node has: once the link
+    is back, a client of that node whose last message came before it is told
+    it was not recovered, never that it missed nothing."""
+    websockets = pytest.importorskip("websockets")
+    origin = nodes(recovery=True, recovery_memory_budget=1)
+    relay = nodes(recovery=True)
+    origin.join()
+
+    def message(topic, n):
+        return json.dumps({"t": topic, "p": {"n": n}})
+
+    async def scenario():
+        blink = Blink(origin)
+        await blink.start()
+        try:
+            relay.join(blink)
+            await until(lambda: origin.peers == 1 and relay.peers == 1)
+            relay_url = f"ws://127.0.0.1:{relay.port}/wse"
+            origin_url = f"ws://127.0.0.1:{origin.port}/wse"
+            async with (
+                websockets.connect(relay_url) as live,
+                websockets.connect(origin_url) as source,
+            ):
+                await subscribe_next_client(relay, ["news", "barrier"])
+                await subscribe_next_client(origin, ["news", "other"])
+                await asyncio.sleep(0.35)  # the SUB reaches the origin
+                relay.server.broadcast_local("news", message("news", 1))
+                (anchor,) = await messages_of_type(live, "news", 1)
+                blink.cut()
+                await until(lambda: origin.peers == 0 and relay.peers == 0)
+                # The origin's budget is used up: what it publishes has no position.
+                origin.server.broadcast_local("other", message("other", 0))
+                await messages_of_type(source, "other", 1)
+                origin.server.broadcast("news", message("news", 2))
+                (unkept,) = await messages_of_type(source, "news", 1)
+                assert unkept["p"]["n"] == 2 and "o" not in unkept
+                blink.open = True
+                await until(lambda: origin.peers == 1 and relay.peers == 1, timeout=20.0)
+                await asyncio.sleep(0.5)
+                # The nodes talk again: what the origin publishes arrives.
+                origin.server.broadcast("barrier", message("barrier", 3))
+                await messages_of_type(live, "barrier", 1)
+            answers = []
+            for streams in ({}, {"streams": {anchor["e"]: anchor["o"]}}):
+                async with websockets.connect(f"ws://127.0.0.1:{relay.port}/wse"):
+                    conn_id = await next_connect(relay)
+                    past = {"epoch": anchor["e"], "offset": anchor["o"], **streams}
+                    answer = relay.server.subscribe_with_recovery(
+                        conn_id, ["news"], recover=True, positions={"news": past}
+                    )
+                    answers.append(answer["topics"]["news"])
+        finally:
+            blink.close()
+        return answers
+
+    for answer in asyncio.run(scenario()):
+        assert answer["recovered"] is False, answer
+
+
 def test_a_message_its_origin_had_no_room_to_keep_is_never_said_recovered(nodes):
     """The origin of a message had no room left for its history and sent it
     on with no position: a client of the other node whose last message of the

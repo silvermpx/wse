@@ -64,6 +64,10 @@ const MAX_MARKS: usize = 86_400;
 /// a mark's interval, and the time its request took to come.
 const LATELY_MARGIN: Duration = Duration::from_secs(3);
 
+/// Most topics with no buffer left whose removed history is kept, for the
+/// peers that may ask after a lost link; past them, any topic counts as one.
+const MAX_UNKEPT_TOPICS: usize = 100_000;
+
 /// Largest per-topic message limit: 2^16 = 65536 messages.
 pub(crate) const MAX_BUFFER_SIZE_BITS: u32 = 16;
 
@@ -575,11 +579,16 @@ pub(crate) struct RecoveryManager {
     /// node holds of its own streams: what it published since a moment is
     /// found by it.
     marks: parking_lot::Mutex<VecDeque<(Instant, u64)>>,
-    /// Per topic with buffers left, the latest arrival among the messages of
-    /// its buffers removed (expired, or over the budget): a client whose last
-    /// message came before it may have missed them, in a stream it never
-    /// heard from.
-    removed_through: DashMap<String, u64>,
+    /// Per topic, the latest arrival among the messages of it this node no
+    /// longer holds (expired, or over the budget), and when: a client whose
+    /// last message came before it may have missed them, in a stream it never
+    /// heard from. Kept while the topic has buffers, and for the history's
+    /// lifetime after: a peer that comes back after a lost link is told of
+    /// what was not kept meanwhile.
+    removed_through: DashMap<String, (u64, Instant)>,
+    /// The latest arrival not kept of a topic that found no room among
+    /// `MAX_UNKEPT_TOPICS`, and when: it counts for every topic.
+    removed_any: parking_lot::Mutex<Option<(u64, Instant)>>,
     config: RecoveryConfig,
     total_bytes: AtomicUsize,
 }
@@ -594,6 +603,7 @@ impl RecoveryManager {
             interest_since: DashMap::new(),
             marks: parking_lot::Mutex::new(VecDeque::new()),
             removed_through: DashMap::new(),
+            removed_any: parking_lot::Mutex::new(None),
             config,
             total_bytes: AtomicUsize::new(0),
         }
@@ -855,7 +865,7 @@ impl RecoveryManager {
         };
         // A history of the topic removed, or a message not kept, from after
         // the client's last message: what it missed there is gone.
-        if let Some(removed) = self.removed_through.get(topic).map(|r| *r)
+        if let Some(removed) = self.removed_after(topic)
             && anchor_seq.is_none_or(|seq| removed > seq)
         {
             return not_recovered;
@@ -978,7 +988,7 @@ impl RecoveryManager {
                 .get(&format!("{topic}\0{}", anchor.0))
                 .and_then(|fbuf| fbuf.seq_at(anchor.1)),
         };
-        if let Some(removed) = self.removed_through.get(topic).map(|r| *r)
+        if let Some(removed) = self.removed_after(topic)
             && anchor_seq.is_none_or(|seq| removed > seq)
         {
             return not_recovered;
@@ -1249,20 +1259,86 @@ impl RecoveryManager {
             }
         }
 
-        // A topic with no buffer left recovers nothing: what was removed of
-        // it no longer matters.
+        // A topic with no buffer left recovers nothing here: what was removed
+        // of it matters to a peer that asks after a lost link, within the
+        // history's lifetime.
         let gone: Vec<String> = self
             .removed_through
             .iter()
-            .map(|entry| entry.key().clone())
-            .filter(|topic| {
-                !self.buffers.contains_key(topic) && !self.foreign_epochs.contains_key(topic)
+            .filter(|entry| {
+                let topic = entry.key();
+                entry.value().1.elapsed() > ttl
+                    && !self.buffers.contains_key(topic)
+                    && !self.foreign_epochs.contains_key(topic)
             })
+            .map(|entry| entry.key().clone())
             .collect();
         for topic in gone {
             self.removed_through.remove(&topic);
         }
+        let mut any = self.removed_any.lock();
+        if any.is_some_and(|(_, at)| at.elapsed() > ttl) {
+            *any = None;
+        }
+        drop(any);
         self.trim_marks();
+    }
+
+    /// The latest arrival of `topic` this node no longer holds, the one of
+    /// any topic among it.
+    fn removed_after(&self, topic: &str) -> Option<u64> {
+        let own = self.removed_through.get(topic).map(|r| r.0);
+        let any = self.removed_any.lock().map(|(seq, _)| seq);
+        own.max(any)
+    }
+
+    /// The topics a peer that has `topic` (a name, or a pattern of them)
+    /// since `age` ago must hear were not kept here meanwhile: none, the
+    /// topic, each topic the pattern matches, or the pattern itself for one
+    /// that counts for every topic.
+    pub(crate) fn lost_lately(&self, topic: &str, age: Duration) -> Vec<String> {
+        let since = Instant::now().checked_sub(age.saturating_add(LATELY_MARGIN));
+        let lately = |at: Instant| since.is_none_or(|since| at >= since);
+        if self.removed_any.lock().is_some_and(|(_, at)| lately(at)) {
+            return vec![topic.to_owned()];
+        }
+        if crate::server::is_pattern(topic) {
+            return self
+                .removed_through
+                .iter()
+                .filter(|entry| lately(entry.value().1))
+                .filter(|entry| crate::server::glob_match(topic, entry.key()))
+                .map(|entry| entry.key().clone())
+                .collect();
+        }
+        match self.removed_through.get(topic) {
+            Some(entry) if lately(entry.1) => vec![topic.to_owned()],
+            _ => Vec::new(),
+        }
+    }
+
+    /// A peer said messages of `topic` (or, a pattern, of each topic here it
+    /// matches) were published that no node holds.
+    pub(crate) fn lost(&self, topic: &str) {
+        if !crate::server::is_pattern(topic) {
+            self.not_kept(topic);
+            return;
+        }
+        let mut matched: Vec<String> = self
+            .buffers
+            .iter()
+            .map(|entry| entry.key().clone())
+            .chain(self.foreign_epochs.iter().map(|entry| entry.key().clone()))
+            .chain(self.interest_since.iter().map(|entry| entry.key().clone()))
+            .filter(|name| {
+                !crate::server::is_pattern(name) && crate::server::glob_match(topic, name)
+            })
+            .collect();
+        matched.sort_unstable();
+        matched.dedup();
+        for name in &matched {
+            self.not_kept(name);
+        }
     }
 
     /// Messages of `topic` up to arrival `seq` are not held here (a buffer
@@ -1271,12 +1347,22 @@ impl RecoveryManager {
         if seq == 0 {
             return;
         }
+        let now = Instant::now();
         if let Some(mut through) = self.removed_through.get_mut(topic) {
-            *through = (*through).max(seq);
+            *through = (through.0.max(seq), now);
             return;
         }
-        let mut through = self.removed_through.entry(topic.to_owned()).or_insert(0);
-        *through = (*through).max(seq);
+        // No room for another topic's: it counts for every topic.
+        if self.removed_through.len() >= MAX_UNKEPT_TOPICS {
+            let mut any = self.removed_any.lock();
+            *any = Some((any.map_or(seq, |(was, _)| was.max(seq)), now));
+            return;
+        }
+        let mut through = self
+            .removed_through
+            .entry(topic.to_owned())
+            .or_insert((0, now));
+        *through = (through.0.max(seq), now);
     }
 
     /// A message of `topic` came, relayed with no position: the node it was
@@ -2244,6 +2330,61 @@ mod tests {
         // A client whose last message came after it missed nothing.
         mgr.push("room", make_data("l1"));
         assert!(!not_recovered(&mgr.recover("room", local, 1)));
+    }
+
+    #[test]
+    fn a_peer_hears_what_was_not_kept_since_its_interest_began() {
+        let mgr = RecoveryManager::new(RecoveryConfig::default());
+        mgr.not_kept("news");
+        mgr.not_kept("prices:a");
+        let minute = Duration::from_secs(60);
+        assert_eq!(mgr.lost_lately("news", minute), ["news"]);
+        assert_eq!(mgr.lost_lately("prices:*", minute), ["prices:a"]);
+        assert!(mgr.lost_lately("other", minute).is_empty());
+        // Not kept before the interest began (and its margin): nothing to say.
+        let long_ago = Instant::now()
+            .checked_sub(Duration::from_secs(600))
+            .unwrap();
+        mgr.removed_through.get_mut("news").unwrap().1 = long_ago;
+        assert!(mgr.lost_lately("news", minute).is_empty());
+    }
+
+    #[test]
+    fn a_topic_not_kept_with_no_room_to_name_it_counts_for_every_topic() {
+        let mgr = RecoveryManager::new(RecoveryConfig::default());
+        for n in 0..MAX_UNKEPT_TOPICS {
+            mgr.removed_through
+                .insert(format!("t{n}"), (1, Instant::now()));
+        }
+        mgr.push("room", make_data("l0"));
+        let (local, _) = mgr.get_position("room").unwrap();
+        mgr.not_kept("unnamed");
+        assert!(!mgr.removed_through.contains_key("unnamed"));
+        // Each topic a client asks of, and each a peer has.
+        assert!(not_recovered(&mgr.recover("room", local, 0)));
+        let minute = Duration::from_secs(60);
+        assert_eq!(mgr.lost_lately("other", minute), ["other"]);
+        assert_eq!(mgr.lost_lately("prices:*", minute), ["prices:*"]);
+    }
+
+    #[test]
+    fn a_peer_saying_a_pattern_lost_marks_each_topic_here_it_matches() {
+        let mgr = RecoveryManager::new(RecoveryConfig::default());
+        mgr.push("prices:a", make_data("a0"));
+        mgr.push_foreign("prices:b", make_data("b0"), 0xf, 0);
+        mgr.interest_began("prices:c");
+        mgr.push("other", make_data("o0"));
+        let (local, _) = mgr.get_position("prices:a").unwrap();
+        let (other, _) = mgr.get_position("other").unwrap();
+        mgr.lost("prices:*");
+        assert!(not_recovered(&mgr.recover("prices:a", local, 0)));
+        assert!(not_recovered(&mgr.recover("prices:b", 0xf, 0)));
+        assert!(mgr.removed_through.contains_key("prices:c"));
+        assert!(!mgr.removed_through.contains_key("prices:*"));
+        assert!(!not_recovered(&mgr.recover("other", other, 0)));
+        // A topic it names: that one.
+        mgr.lost("other");
+        assert!(not_recovered(&mgr.recover("other", other, 0)));
     }
 
     #[test]
