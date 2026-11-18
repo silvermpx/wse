@@ -752,6 +752,12 @@ def cmd_artifacts(args: argparse.Namespace) -> int:
             continue
         if at_home(kind, path, base) and kind == "wse-server wheels":
             homed.append(path.name)
+        # The client is pure Python: one wheel, for every Python 3 and platform.
+        if kind == "wse-client wheel" and _wheel_tags(path.name) != ("py3", "none", "any"):
+            errors += 1
+            gh_error(
+                str(path), None, f"{path.name} is not the client's one wheel for all (py3-none-any)"
+            )
         if dist.startswith("npm:"):
             ok = version == args.npm_version
         else:

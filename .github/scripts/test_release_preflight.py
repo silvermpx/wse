@@ -189,6 +189,18 @@ class Artifacts(unittest.TestCase):
         self.assertIn("no wse-server wheel for macOS arm64 cp314t", out)
         self.assertIn("cp315-cp314t", out)
 
+    def test_a_client_wheel_for_one_platform_alone_is_no_release(self) -> None:
+        # The client is pure Python: one wheel for every platform.
+        names = [
+            n.replace(
+                "wse_client-3.2.0-py3-none-any.whl", "wse_client-3.2.0-cp312-cp312-linux_x86_64.whl"
+            )
+            for n in release_files()
+        ]
+        code, out = check_artifacts(names)
+        self.assertEqual(code, 1)
+        self.assertIn("py3-none-any", out)
+
     def test_a_file_of_another_version_fails(self) -> None:
         code, out = check_artifacts(
             [*release_files(), "python-client-dist/wse_client-3.1.0.tar.gz"]
