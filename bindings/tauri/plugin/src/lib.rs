@@ -53,6 +53,9 @@ use wse_client::{Config, Error};
 #[derive(Default)]
 pub struct Wse {
     inner: Mutex<Inner>,
+    /// One start at a time: the last connection lets its outbox's file go
+    /// before the next one opens it.
+    starting: tauri::async_runtime::Mutex<()>,
 }
 
 #[derive(Default)]
@@ -90,22 +93,25 @@ impl Wse {
     /// Starts the application's connection, for the windows' pages to
     /// attach to; it connects while a page (or the application,
     /// [`Owner::retain`]) shares it. A connection started before (the last
-    /// user's) closes, and its pages are let go.
+    /// user's) closes first, and its pages are let go: its outbox's file is
+    /// the new one's.
     pub async fn start(&self, config: Config) -> Result<Owner, Error> {
         self.start_with(config, Options::default()).await
     }
 
     /// [`start`](Self::start) with the bridge's options.
     pub async fn start_with(&self, config: Config, options: Options) -> Result<Owner, Error> {
-        let owner = Owner::start(config, options).await?;
+        let _starting = self.starting.lock().await;
         let last = {
             let mut inner = self.lock();
             inner.attached.clear();
-            inner.owner.replace(owner.clone())
+            inner.owner.take()
         };
         if let Some(last) = last {
             last.close().await;
         }
+        let owner = Owner::start(config, options).await?;
+        self.lock().owner = Some(owner.clone());
         Ok(owner)
     }
 
@@ -423,6 +429,28 @@ mod tests {
         assert_eq!(owner.attached(), 0);
         wse.close().await;
         server.stop().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_connection_started_again_takes_the_last_ones_outbox_file() {
+        let (server, mut config) = server().await;
+        let dir = std::env::temp_dir().join(format!("wse-tauri-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        config.offline = Some(wse_client::Offline::in_file(dir.join("queue")));
+        server.stop().await;
+        let wse = Wse::default();
+        wse.start(config.clone()).await.unwrap();
+        // Started again on the same file, with no server: what it keeps is
+        // in the file, for the next one.
+        let next = wse.start(config.clone()).await.unwrap();
+        next.client()
+            .try_send_with("order", &json!({}), &wse_client::SendOptions::default())
+            .unwrap();
+        assert_eq!(next.client().kept(), 1);
+        let third = wse.start(config).await.unwrap();
+        assert_eq!(third.client().kept(), 1, "the order outlived the owner");
+        wse.close().await;
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
