@@ -250,7 +250,7 @@ fn ai_attribution(body: &str) -> Vec<String> {
     static RE: OnceLock<Regex> = OnceLock::new();
     let re = RE.get_or_init(|| {
         Regex::new(
-            r"(?im)^\s*co-authored-by:.*\b(?:claude|anthropic|copilot|chatgpt|openai|gemini)\b.*$|^.*generated (?:with|by) \[?(?:claude|chatgpt|copilot|gemini).*$",
+            r"(?im)^\s*co-authored-by:.*\b(?:claude|anthropic|codex|copilot|chatgpt|openai|gemini)\b.*$|^.*generated (?:with|by) \[?(?:claude|codex|chatgpt|copilot|gemini|openai).*$",
         )
         .expect("a fixed pattern")
     });
@@ -386,5 +386,7 @@ mod tests {
         assert_eq!(ai_attribution(body).len(), 2);
         let human = "fix: a thing\n\nCo-authored-by: Jane Doe <jane@example.com>\nThe Claude Shannon bound\n";
         assert!(ai_attribution(human).is_empty());
+        let codex = "fix: a thing\n\nCo-authored-by: Codex <codex@openai.com>\nGenerated with [Codex](https://openai.com/codex)\n";
+        assert_eq!(ai_attribution(codex).len(), 2);
     }
 }
