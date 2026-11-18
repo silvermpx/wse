@@ -72,6 +72,41 @@ async fn flood() -> u16 {
     port
 }
 
+/// A server that lets every connection in and sends it each of `messages`
+/// every 50 ms.
+async fn sends(messages: &'static [&'static str]) -> u16 {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        while let Ok((stream, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                let Ok(ws) = tokio_tungstenite::accept_async(stream).await else {
+                    return;
+                };
+                let (mut tx, mut rx) = ws.split();
+                if tx
+                    .send(Message::text(r#"{"t":"server_ready"}"#))
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+                tokio::spawn(async move { while rx.next().await.is_some() {} });
+                let mut tick = tokio::time::interval(Duration::from_millis(50));
+                loop {
+                    tick.tick().await;
+                    for message in messages {
+                        if tx.send(Message::text(*message)).await.is_err() {
+                            return;
+                        }
+                    }
+                }
+            });
+        }
+    });
+    port
+}
+
 /// The bench's run of `test` against `port`, with `args`: whether it
 /// exited 0, and what it said.
 async fn run(test: &'static str, port: u16, args: &'static [&'static str]) -> (bool, String) {
@@ -233,4 +268,29 @@ async fn a_flood_that_answers_nothing_ends_the_run_in_time() {
         Some(false),
         "None: still reading the flood after 60 s; Some(true): no pong and exited 0"
     );
+}
+
+/// battle-load subscribes to battle_all: another channel's messages are not
+/// its deliveries but a routing fault, with its own or without them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn load_counts_only_the_channel_it_subscribed_to() {
+    const ALL: &str = r#"{"t":"battle","p":{"ch":"all"}}"#;
+    const OWN: &str = r#"{"t":"battle","p":{"ch":"battle_all"}}"#;
+    const OTHER: &str = r#"{"t":"battle","p":{"ch":"battle_half"}}"#;
+    let cases: [(&'static [&'static str], bool); 3] = [
+        (&[ALL, OTHER], false),
+        (&[ALL, OWN, OTHER], false),
+        (&[ALL, OWN], true),
+    ];
+    let runs = cases.map(|(messages, passes)| {
+        tokio::spawn(async move {
+            let port = sends(messages).await;
+            let args = &["--tiers", "2", "--duration", "1"];
+            (messages, passes, run("battle-load", port, args).await)
+        })
+    });
+    for done in runs {
+        let (messages, passes, (ok, said)) = done.await.unwrap();
+        assert_eq!(ok, passes, "{messages:?}: {said}");
+    }
 }

@@ -1,31 +1,50 @@
-use super::{next_before, prometheus, topic_count, Checks};
+use super::{next_before, Checks};
 use crate::config::Cli;
-use crate::protocol::{self, parse_wse_message, query_health, WsStream};
+use crate::protocol::{self, query_health};
 use crate::report::TierResult;
 use crate::stats;
 use futures_util::SinkExt;
 use std::time::Duration;
 use tokio_tungstenite::tungstenite::protocol::Message;
 
-/// What Server B has taken off the cluster link: the wire bytes and the
-/// battle_all messages they carried.
-async fn cluster_in(ws: &mut WsStream) -> Option<(u64, u64)> {
-    let bytes = query_health(ws, 5).await?["cluster_bytes_received"].as_u64()?;
-    let messages = topic_count(&prometheus(ws).await?, "battle_all");
+/// What Server B has taken off the cluster link: the wire bytes, and the
+/// messages they carried as its one subscriber took them, delivered or
+/// dropped as too slow. What Server B publishes itself counts in neither.
+/// Read from its metrics endpoint: a WebSocket of a node that publishes
+/// itself is flooded.
+async fn link_in(cli: &Cli, port: u16) -> Option<(u64, u64)> {
+    let metrics = protocol::metrics_text(&cli.host, cli.metrics_port_for(port)).await?;
+    let bytes = protocol::counter(&metrics, "wse_cluster_bytes_received_total")?;
+    let messages = protocol::counter(&metrics, "wse_cluster_messages_delivered_total")?
+        + protocol::counter(&metrics, "wse_cluster_messages_dropped_total")?;
     Some((bytes, messages))
+}
+
+/// The port of the server that published a battle message, as the battle
+/// server names it (`"from":<port>`); read without parsing the whole
+/// message, as the subscriber takes a flood.
+fn origin(msg: &Message) -> Option<u16> {
+    let Message::Text(text) = msg else {
+        return None;
+    };
+    let at = text.find("\"from\":")? + 7;
+    let digits = text[at..].bytes().take_while(u8::is_ascii_digit).count();
+    text[at..at + digits].parse().ok()
 }
 
 /// Battle Test: Inter-Peer zstd Compression
 ///
 /// Measures what the cluster link carries per message on Server B: the wire
-/// bytes it took off the link over the battle_all messages that came in on
-/// it, against the size of those messages as its subscriber gets them. The
-/// 1 KiB messages of `--message-size 1024` are padded, so zstd takes them to
-/// a fraction of their size; uncompressed, a message costs more than itself.
+/// bytes it took off the link over the messages that came in on it, against
+/// the size of Server A's messages as Server B's subscriber gets them. Each
+/// message names the server that published it, so one published on Server B
+/// itself is never taken for one that crossed the link. The 1 KiB messages
+/// of `--message-size 1024` are padded, so zstd takes them to a fraction of
+/// their size; uncompressed, a message costs more than itself.
 ///
-/// Uses two connections to Server B:
-///   - A subscriber connection that counts received messages (spawned task)
-///   - A separate health-only connection for the counters
+/// Server B's counters come from its metrics endpoint (port + 1000, as the
+/// battle server serves it, or --metrics-port); its subscriber counts on a
+/// task of its own.
 ///
 /// Requires: 2 cluster servers with --message-size 1024
 ///   python benchmarks/bench_battle_server.py --mode cluster --port 5006 --peers 127.0.0.1:5007 --message-size 1024
@@ -109,6 +128,8 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
         say!("    WARNING: No health response from Server B");
         checks.check("Cluster connected (Server B)", false);
     }
+    // The counters come from the metrics endpoint from here on.
+    protocol::close_all(vec![ws_health]).await;
 
     // =========================================================================
     // Phase 2: Subscribe, and wait for Server A's messages to arrive
@@ -125,21 +146,24 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     let mut flowing = false;
     while let Some(msg) = next_before(&mut ws_sub, deadline).await {
-        if parse_wse_message(&msg).is_some_and(|p| p["t"] == "battle") {
+        if origin(&msg) == Some(cli.port) {
             flowing = true;
             break;
         }
     }
     let before = if flowing {
-        cluster_in(&mut ws_health).await
+        link_in(cli, port2).await
     } else {
         None
     };
     if !checks.check(
-        &format!("Messages from Server A arrive, counters read ({before:?})"),
+        &format!(
+            "Messages from Server A (:{}) arrive, counters read ({before:?})",
+            cli.port
+        ),
         before.is_some(),
     ) {
-        protocol::close_all(vec![ws_health, ws_sub]).await;
+        protocol::close_all(vec![ws_sub]).await;
         checks.finish();
         return Vec::new();
     }
@@ -151,35 +175,41 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
     say!("\n  Phase 3: Count messages for {}s", duration.as_secs());
 
     // The subscriber is read on its own task: its flood never waits for the
-    // counter queries.
+    // counter queries. Only Server A's messages are measured.
+    let from_a = cli.port;
     let count_handle = tokio::spawn(async move {
         let deadline = tokio::time::Instant::now() + duration;
-        let (mut received, mut size) = (0u64, 0u64);
+        let (mut received, mut size, mut elsewhere) = (0u64, 0u64, 0u64);
         while let Some(msg) = next_before(&mut ws_sub, deadline).await {
-            if let Message::Text(text) = &msg {
+            if origin(&msg) == Some(from_a) {
                 received += 1;
-                size += text.len() as u64;
+                size += msg.len() as u64;
+            } else {
+                elsewhere += 1;
             }
         }
-        (ws_sub, received, size)
+        (ws_sub, received, size, elsewhere)
     });
-    let (ws_sub, received, size) = match count_handle.await {
+    let (ws_sub, received, size, elsewhere) = match count_handle.await {
         Ok(counted) => counted,
         Err(e) => {
             fail!("    [FAIL] The subscriber's reader failed: {}", e);
-            protocol::close_all(vec![ws_health]).await;
             checks.finish();
             return Vec::new();
         }
     };
-    say!("    Subscriber received {} messages", received);
+    say!(
+        "    Subscriber received {} messages from Server A, {} from elsewhere",
+        received,
+        elsewhere
+    );
 
     // =========================================================================
     // Phase 4: Verify compression on the wire
     // =========================================================================
     say!("\n  Phase 4: Verify compression on the wire");
 
-    let after = cluster_in(&mut ws_health).await;
+    let after = link_in(cli, port2).await;
     checks.check(&format!("Counters read again ({after:?})"), after.is_some());
     let (bytes_after, messages_after) = after.unwrap_or((bytes_before, messages_before));
     let wire = bytes_after.saturating_sub(bytes_before);
@@ -194,16 +224,16 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
     );
 
     checks.check(
-        &format!("Messages came over the link (got {carried})"),
-        carried > 0,
+        &format!("The link carried messages (got {carried} in {wire} bytes)"),
+        carried > 0 && wire > 0,
     );
     checks.check(
-        &format!("Subscriber received messages (got {received})"),
+        &format!("Subscriber received Server A's messages (got {received})"),
         received > 0,
     );
     // The measure holds only for messages zstd has something to take off.
     checks.check(
-        &format!("The messages are the 1 KiB ones (got {message_size} bytes each)"),
+        &format!("Server A's messages are the 1 KiB ones (got {message_size} bytes each)"),
         message_size >= 1000,
     );
     checks.check(
@@ -214,7 +244,7 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
     );
 
     // Cleanup
-    protocol::close_all(vec![ws_health, ws_sub]).await;
+    protocol::close_all(vec![ws_sub]).await;
 
     checks.finish();
 

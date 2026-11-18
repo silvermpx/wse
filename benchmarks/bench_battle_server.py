@@ -9,6 +9,10 @@ The server publishes in round-robin to:
   3. topic "battle_half" (channel="battle_half")
   4. topic "battle.glob_test" (channel="battle.glob_test")
 
+Every message names the server that published it by its port ("from"), so a
+client of another node can tell a message that came over the cluster from
+one published where it is.
+
 Clients subscribe via messages: {"t":"battle_cmd","p":{"action":"subscribe","topics":[...]}}
 Clients query health via:      {"t":"battle_cmd","p":{"action":"health"}}
 
@@ -133,7 +137,7 @@ def start_metrics_server(server, port: int):
     return httpd
 
 
-def drain_loop(server, stop_event: threading.Event):
+def drain_loop(server, origin: int, stop_event: threading.Event):
     """Process inbound events. Handle subscribe and health commands from clients."""
     while not stop_event.is_set():
         try:
@@ -222,7 +226,7 @@ def drain_loop(server, stop_event: threading.Event):
                                 import json as _json
                                 for i in range(count):
                                     ts_us = int(time.time() * 1_000_000)
-                                    msg = f'{{"t":"battle","p":{{"ch":"{topic}","seq":{i},"ts_us":{ts_us}}}}}'
+                                    msg = f'{{"t":"battle","p":{{"ch":"{topic}","from":{origin},"seq":{i},"ts_us":{ts_us}}}}}'
                                     server.broadcast(topic, msg)
                                 ack = _json.dumps({
                                     "c": "WSE",
@@ -303,7 +307,7 @@ def drain_loop(server, stop_event: threading.Event):
             time.sleep(0.1)
 
 
-def publish_loop(server, mode: str, message_size: int, stop_event: threading.Event):
+def publish_loop(server, mode: str, message_size: int, origin: int, stop_event: threading.Event):
     """Broadcast to all channels in round-robin."""
     seq = 0
     published = 0
@@ -329,11 +333,11 @@ def publish_loop(server, mode: str, message_size: int, stop_event: threading.Eve
 
         try:
             if cycle == 0:
-                msg = f'{{"t":"battle","p":{{"ch":"all","seq":{seq},"ts_us":{ts_us}{padding}}}}}'
+                msg = f'{{"t":"battle","p":{{"ch":"all","from":{origin},"seq":{seq},"ts_us":{ts_us}{padding}}}}}'
                 server.broadcast_all(msg)
             else:
                 topic = TOPICS[cycle - 1]
-                msg = f'{{"t":"battle","p":{{"ch":"{topic}","seq":{seq},"ts_us":{ts_us}{padding}}}}}'
+                msg = f'{{"t":"battle","p":{{"ch":"{topic}","from":{origin},"seq":{seq},"ts_us":{ts_us}{padding}}}}}'
                 server.broadcast(topic, msg)
                 # Yield GIL for drain_loop to process subscribe events
                 if seq % 100 == 0:
@@ -488,12 +492,14 @@ def main():
     signal.signal(signal.SIGINT, handle_signal)
     signal.signal(signal.SIGTERM, handle_signal)
 
-    drain_thread = threading.Thread(target=drain_loop, args=(server, stop), daemon=True)
+    drain_thread = threading.Thread(target=drain_loop, args=(server, args.port, stop), daemon=True)
     drain_thread.start()
 
     if not args.no_publish:
         pub_thread = threading.Thread(
-            target=publish_loop, args=(server, args.mode, args.message_size, stop), daemon=True
+            target=publish_loop,
+            args=(server, args.mode, args.message_size, args.port, stop),
+            daemon=True,
         )
         pub_thread.start()
     else:

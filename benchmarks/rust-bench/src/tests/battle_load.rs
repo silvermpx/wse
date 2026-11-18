@@ -18,6 +18,8 @@ struct LoadCounters {
     bytes: AtomicU64,
     broadcast_all: AtomicU64,
     topic: AtomicU64,
+    /// Messages of a channel no subscriber asked for.
+    other: AtomicU64,
     gaps: AtomicU64,
 }
 
@@ -28,6 +30,7 @@ impl LoadCounters {
             bytes: AtomicU64::new(0),
             broadcast_all: AtomicU64::new(0),
             topic: AtomicU64::new(0),
+            other: AtomicU64::new(0),
             gaps: AtomicU64::new(0),
         }
     }
@@ -133,6 +136,7 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
         let bytes = counters.bytes.load(Ordering::Relaxed);
         let ba_count = counters.broadcast_all.load(Ordering::Relaxed);
         let topic_count = counters.topic.load(Ordering::Relaxed);
+        let other = counters.other.load(Ordering::Relaxed);
         let gaps = counters.gaps.load(Ordering::Relaxed);
 
         let del_per_sec = received as f64 / elapsed;
@@ -143,9 +147,9 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
         };
 
         // Correctness checks: every subscriber lasted the run and got both
-        // kinds of messages.
+        // kinds of messages, and none of a topic it did not subscribe to.
         let ba_ok = ba_count > 0;
-        let topic_ok = topic_count > 0;
+        let topic_ok = topic_count > 0 && other == 0;
         if !ba_ok || !topic_ok {
             crate::report::failed();
         }
@@ -170,7 +174,12 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
         say!(
             "    topic msgs:     {} {}",
             topic_count,
-            if topic_ok { "[OK]" } else { "[FAIL]" }
+            if topic_count > 0 { "[OK]" } else { "[FAIL]" }
+        );
+        say!(
+            "    other topics:   {} {}",
+            other,
+            if other == 0 { "[OK]" } else { "[FAIL]" }
         );
         if unique_gaps > 0 {
             say!("    Seq gaps:       ~{} unique", unique_gaps);
@@ -210,6 +219,7 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
                 "deliveries_per_sec": del_per_sec,
                 "broadcast_all_ok": ba_ok,
                 "topic_ok": topic_ok,
+                "other_topics": other,
                 "seq_gaps": unique_gaps,
             }),
         });
@@ -283,6 +293,7 @@ async fn load_receive_loop(
     let mut local_bytes = 0u64;
     let mut local_ba = 0u64;
     let mut local_topic = 0u64;
+    let mut local_other = 0u64;
     let mut local_gaps = 0u64;
     let mut local_hist = LatencyHistogram::new();
     let mut last_seq_by_ch: HashMap<String, i64> = HashMap::new();
@@ -313,8 +324,11 @@ async fn load_receive_loop(
 
                     match ch_name {
                         "all" => local_ba += 1,
+                        // The one topic it subscribed to.
+                        "battle_all" => local_topic += 1,
                         "unknown" => {}
-                        _ => local_topic += 1,
+                        // A topic it never asked for reached it.
+                        _ => local_other += 1,
                     }
 
                     // Latency
@@ -361,6 +375,7 @@ async fn load_receive_loop(
         .broadcast_all
         .fetch_add(local_ba, Ordering::Relaxed);
     counters.topic.fetch_add(local_topic, Ordering::Relaxed);
+    counters.other.fetch_add(local_other, Ordering::Relaxed);
     if local_gaps > 0 {
         counters.gaps.fetch_add(local_gaps, Ordering::Relaxed);
     }

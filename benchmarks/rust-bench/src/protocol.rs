@@ -362,10 +362,10 @@ pub async fn query_health(ws: &mut WsStream, timeout_secs: u64) -> Option<serde_
     }
 }
 
-/// Query slow_consumer_drops_total from the server's Prometheus metrics HTTP endpoint.
-/// Returns the counter value, or None without a metrics port, if the endpoint
-/// is unreachable or the metric not found.
-pub async fn query_slow_consumer_drops(host: &str, metrics_port: Option<u16>) -> Option<u64> {
+/// The server's Prometheus text, from its metrics HTTP endpoint: None
+/// without a metrics port, or when the endpoint does not answer. Read over
+/// its own connection, it is never behind a WebSocket's flood.
+pub async fn metrics_text(host: &str, metrics_port: Option<u16>) -> Option<String> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let metrics_port = metrics_port?;
 
@@ -389,14 +389,23 @@ pub async fn query_slow_consumer_drops(host: &str, metrics_port: Option<u16>) ->
     .await
     .ok()?
     .ok()?;
+    String::from_utf8(body).ok()
+}
 
-    let text = String::from_utf8_lossy(&body);
-    for line in text.lines() {
-        if let Some(rest) = line.strip_prefix("wse_slow_consumer_drops_total ") {
-            return rest.trim().parse::<u64>().ok();
-        }
-    }
-    None
+/// The value of the unlabelled series `name` in Prometheus text.
+pub fn counter(metrics: &str, name: &str) -> Option<u64> {
+    metrics
+        .lines()
+        .find_map(|line| line.strip_prefix(name)?.strip_prefix(' '))
+        .and_then(|value| value.trim().parse().ok())
+}
+
+/// The server's slow_consumer_drops_total, from its metrics HTTP endpoint.
+pub async fn query_slow_consumer_drops(host: &str, metrics_port: Option<u16>) -> Option<u64> {
+    counter(
+        &metrics_text(host, metrics_port).await?,
+        "wse_slow_consumer_drops_total",
+    )
 }
 
 /// Close all connections gracefully.
