@@ -57,6 +57,19 @@ pub(super) fn message_category(msg_type: &str) -> &'static str {
     }
 }
 
+/// Where the value of the member `key` starts, when the JSON text at `at`
+/// is that member's name: `"key"`, a colon, and any whitespace around it.
+fn value_of(bytes: &[u8], at: usize, key: &[u8]) -> Option<usize> {
+    let rest = bytes.get(at + 1..)?;
+    let rest = rest.strip_prefix(key)?.strip_prefix(b"\"")?;
+    let ws = |b: &u8| matches!(b, b' ' | b'\t' | b'\n' | b'\r');
+    let before = rest.iter().take_while(|b| ws(b)).count();
+    let rest = rest[before..].strip_prefix(b":")?;
+    let after = rest.iter().take_while(|b| ws(b)).count();
+    let start = bytes.len() - rest.len() + after;
+    (start < bytes.len()).then_some(start)
+}
+
 /// Inject `"c"` field at the start of a JSON object from Python publishers.
 /// Depth-aware scan: only matches `"t"` and `"c"` keys at the top-level object (depth 1),
 /// ignoring occurrences inside nested objects or string values.
@@ -98,12 +111,16 @@ pub(super) fn inject_category(data: &str) -> String {
                 i += 1;
             }
             // Top-level "c": key -- category already present
-            b'"' if depth == 1 && bytes[i..].starts_with(b"\"c\":") => {
+            b'"' if depth == 1 && value_of(bytes, i, b"c").is_some() => {
                 return data.to_string();
             }
-            // Top-level "t":"value" -- extract event type
-            b'"' if depth == 1 && t_val_range.is_none() && bytes[i..].starts_with(b"\"t\":\"") => {
-                let val_start = i + 5;
+            // Top-level "t":"value" -- extract event type (any whitespace
+            // around the colon, as `json.dumps` puts it)
+            b'"' if depth == 1
+                && t_val_range.is_none()
+                && value_of(bytes, i, b"t").is_some_and(|v| bytes[v] == b'"') =>
+            {
+                let val_start = value_of(bytes, i, b"t").map_or(i, |v| v + 1);
                 let mut j = val_start;
                 loop {
                     if j >= bytes.len() {
@@ -131,15 +148,11 @@ pub(super) fn inject_category(data: &str) -> String {
             }
             // Top-level "t": with non-string value (number, null, bool) -- use "U" (unknown) category.
             // Synthesize a range pointing to "U" so inject_category still adds the "c" field.
-            b'"' if depth == 1
-                && t_val_range.is_none()
-                && bytes[i..].starts_with(b"\"t\":")
-                && !bytes[i..].starts_with(b"\"t\":\"") =>
-            {
+            b'"' if depth == 1 && t_val_range.is_none() && value_of(bytes, i, b"t").is_some() => {
                 // Non-string t value -- set a synthetic range that will map to "U" category
                 // Use 0..0 as a sentinel: message_category("") returns "U"
                 t_val_range = Some((0, 0));
-                i += 4; // skip past "t":
+                i = value_of(bytes, i, b"t").unwrap_or(i + 1);
             }
             b'"' => {
                 in_string = true;
@@ -315,4 +328,32 @@ pub(super) fn build_server_ready(
         val["p"]["details"]["cnf"] = serde_json::json!({"jkt": jkt});
     }
     val.to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::inject_category;
+
+    fn category(json: &str) -> serde_json::Value {
+        serde_json::from_str::<serde_json::Value>(&inject_category(json)).unwrap()["c"].clone()
+    }
+
+    #[test]
+    fn the_category_is_the_same_however_the_json_is_spaced() {
+        for json in [
+            r#"{"t":"snapshot_order","p":{}}"#,
+            r#"{"t": "snapshot_order", "p": {}}"#,
+            "{\"t\" :\n\t\"snapshot_order\", \"p\": {}}",
+        ] {
+            assert_eq!(category(json), "S", "{json}");
+        }
+        assert_eq!(category(r#"{"t": "order_update", "p": {}}"#), "U");
+        assert_eq!(category(r#"{"t": 7, "p": {}}"#), "U");
+    }
+
+    #[test]
+    fn a_category_given_is_kept_and_a_nested_type_is_not_read() {
+        assert_eq!(category(r#"{"c": "S", "t": "order"}"#), "S");
+        assert_eq!(category(r#"{"p": {"t": "snapshot_x"}, "t": "order"}"#), "U");
+    }
 }
