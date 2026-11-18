@@ -141,6 +141,8 @@ server every client is checked against.
   named for a page where there is none keeps memory and says so
   (`wseStorageError`); a saved checkpoint reads as the Rust and Python
   clients read it.
+- npm: `wse-client/electron/preload` has its type declarations; the type
+  check of the package failed on it.
 - TypeScript: an end-to-end encrypted send whose time ran out while it was
   sealed, to a server that answers the outbox, is said expired, and the
   sends after it go; they all waited for the next connection.

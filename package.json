@@ -66,7 +66,10 @@
       "import": "./dist/npm/electron/renderer.js",
       "default": "./dist/npm/electron/renderer.js"
     },
-    "./electron/preload": "./dist/npm/electron/preload.cjs",
+    "./electron/preload": {
+      "types": "./dist/npm/electron/preload.d.cts",
+      "default": "./dist/npm/electron/preload.cjs"
+    },
     "./tauri": {
       "types": "./dist/npm/tauri/index.d.ts",
       "import": "./dist/npm/tauri/index.js",
@@ -109,6 +112,9 @@
       "electron/renderer": [
         "./dist/npm/electron/renderer.d.ts"
       ],
+      "electron/preload": [
+        "./dist/npm/electron/preload.d.cts"
+      ],
       "tauri": [
         "./dist/npm/tauri/index.d.ts"
       ]
@@ -121,7 +127,7 @@
   ],
   "scripts": {
     "clean": "node -e \"require('node:fs').rmSync('dist/npm', { recursive: true, force: true })\"",
-    "build": "npm run clean && tsc && node -e \"require('node:fs').copyFileSync('ts-client/electron/preload.cjs', 'dist/npm/electron/preload.cjs')\"",
+    "build": "npm run clean && tsc && node -e \"require('node:fs').copyFileSync('ts-client/electron/preload.cjs', 'dist/npm/electron/preload.cjs'); require('node:fs').copyFileSync('ts-client/electron/preload.d.cts', 'dist/npm/electron/preload.d.cts')\"",
     "lint": "tsc --noEmit",
     "test": "vitest run",
     "test:watch": "vitest",
