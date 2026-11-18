@@ -209,6 +209,11 @@ server every client is checked against.
   for a message is made again, and catches up, instead of dropping it. A
   node that went without SHUTDOWN while its link was down, another node now
   at its address, is no longer taken to have published nothing meanwhile.
+- Window bridge: a window signed out from a listener no longer drops what
+  became of its sends in the rest of the batch, nor what came while it was
+  paused when it resumes before its owner let it go. It no longer gives up
+  on an owner slow to answer the sign-out and says `cleared` of a send the
+  server may have taken: it says nothing of a send until its owner did.
 - Outbox: a message whose bytes were held up on a connection the client
   left is no longer taken once the client is back on another and was told
   the server had not taken it. The connection whose hello came last holds

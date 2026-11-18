@@ -55,13 +55,6 @@ export interface BridgeClient extends WSEClient {
   readonly bridge: { readonly phase: BridgePhase; readonly reason: string | null };
 }
 
-/**
- * How long a window that signed out waits for its owner to let it go, with
- * what it knows became of the window's sends: past it, what the window holds
- * goes as cleared.
- */
-const SIGN_OUT_WITHIN_MS = 2_000;
-
 const NO_CONN: ConnState = Object.freeze({
   connection: ConnectionState.PENDING,
   ready: false,
@@ -156,7 +149,12 @@ export function createBridgeClient(
    * The window signed out and waits for its owner to let it go: what the
    * owner knows became of its sends comes first. Until it gives up waiting.
    */
-  let signingOut: ReturnType<typeof setTimeout> | null = null;
+  /**
+   * Signed out, the owner not having let the window go yet: of what comes,
+   * only what became of its sends is taken. Until the owner says, a send's
+   * outcome is not known, and none is said.
+   */
+  let signingOut = false;
 
   const emit = (type: string, detail?: unknown) => {
     const set = listeners.get(type);
@@ -359,9 +357,10 @@ export function createBridgeClient(
   const batch = (s: number, items: BridgeItem[]) => {
     if (over()) return;
     for (const item of items) {
-      // A listener let the window go (or signed out): nothing more of the
-      // batch is handed on.
-      if (done || signingOut || over()) return;
+      // A listener let the window go: nothing more of the batch is handed on.
+      if (done || over()) return;
+      // A listener signed out: of the rest, only what became of its sends.
+      if (signingOut && !isOutcome(item)) continue;
       take(item);
     }
     took = s;
@@ -572,8 +571,7 @@ export function createBridgeClient(
 
   /** The sign-out is over: the window is let go. */
   const letGo = () => {
-    if (signingOut) clearTimeout(signingOut);
-    signingOut = null;
+    signingOut = false;
     finish();
     port?.close();
   };
@@ -701,11 +699,8 @@ export function createBridgeClient(
       if (port && !over()) {
         // Through the owner: it signs every window out, this one with what
         // it knows became of its sends first; nothing more goes meanwhile.
-        signingOut = setTimeout(() => {
-          end('revoked', 'signed_out');
-          signedOut();
-          letGo();
-        }, SIGN_OUT_WITHIN_MS);
+        // What the window held paused says what became of its sends too.
+        signingOut = true;
         refresh();
         return;
       }

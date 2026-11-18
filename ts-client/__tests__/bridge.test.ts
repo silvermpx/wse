@@ -758,16 +758,17 @@ describe('a window let go', () => {
     expect(o.attached).toBe(0);
   });
 
-  it('signing out itself from an owner that does not answer, says what it held cleared in time', async () => {
+  it('signing out itself from an owner slow to answer, says nothing of a send it cannot tell of, then what the owner said', async () => {
     vi.useFakeTimers({ shouldAdvanceTime: true });
     try {
       const { port1, port2 } = new MessageChannel();
-      // An owner that takes the window and then answers nothing more.
-      const silent = messagePortChannel<OwnerFrame, WindowFrame>(port1 as never);
-      silent.listen({
+      // An owner that takes the window, then answers its sign-out late.
+      const slow = messagePortChannel<OwnerFrame, WindowFrame>(port1 as never);
+      let signedOut = false;
+      slow.listen({
         frame: (f) => {
           if (f.k === 'hello') {
-            silent.post({
+            slow.post({
               k: 'welcome',
               v: BRIDGE_PROTOCOL,
               att: 1,
@@ -778,23 +779,104 @@ describe('a window let go', () => {
               gen: 1,
             });
           }
+          if (f.k === 'signOut') signedOut = true;
         },
         close: () => {},
       });
       const w = createBridgeClient(messagePortChannel<WindowFrame, OwnerFrame>(port2 as never));
       windows.push(w);
-      const refused: unknown[] = [];
-      w.on('wseNotDelivered', (d) => refused.push(d));
+      const heard: unknown[] = [];
+      w.on('wseDelivered', (d) => heard.push(['delivered', d]));
+      w.on('wseNotDelivered', (d) => heard.push(['not', d]));
       await vi.waitFor(() => expect(w.bridge.phase).toBe('attached'));
-      w.send('order', {}, { id: 'held' });
+      w.send('order', {}, { id: 'confirmed' });
       w.signOut();
-      expect(refused).toEqual([]);
+      await vi.waitFor(() => expect(signedOut).toBe(true));
       await vi.advanceTimersByTimeAsync(5_000);
-      await vi.waitFor(() => expect(refused).toEqual([{ reason: 'cleared', ids: ['held'] }]));
+      // It cannot tell: the server may have taken it.
+      expect(heard).toEqual([]);
+      expect(w.kept()).toBe(1);
+      // The owner says the server took it, then lets the window go.
+      slow.post({ k: 'b', s: 1, items: [{ ev: 'event', name: 'wseDelivered', detail: { ids: ['confirmed'] } }] });
+      slow.post({ k: 'revoked', reason: 'signed_out' });
+      await vi.waitFor(() => expect(w.bridge.phase).toBe('revoked'));
+      expect(heard).toEqual([['delivered', { ids: ['confirmed'] }]]);
       expect(w.kept()).toBe(0);
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  it('hears what the server confirmed, though a listener signed out on a message before it in the same batch', async () => {
+    const o = owner({ limits: { inFlight: 1, batchItems: 16 } });
+    o.client.retain();
+    const w = window(o);
+    const heard: unknown[] = [];
+    const seen: number[] = [];
+    w.on('wseDelivered', (d) => heard.push(['delivered', d]));
+    w.on('wseNotDelivered', (d) => heard.push(['not', d]));
+    w.onMessage('news', (m) => {
+      const n = (m.p as { n: number }).n;
+      seen.push(n);
+      if (n === 1) w.signOut();
+    });
+    w.retain();
+    await vi.waitFor(() => expect(FakeWebSocket.instances).toHaveLength(1));
+    const ws = FakeWebSocket.last();
+    await serve(ws);
+    await vi.waitFor(() => expect(w.state.getSnapshot().ready).toBe(true));
+    w.send('order', { n: 1 }, { id: 'confirmed' });
+    await vi.waitFor(() => expect(ws.messagesOfType('order')).toHaveLength(1));
+    // While it is paused, 0 goes in hand; 1 and then the outcome wait at
+    // the owner, and come in one batch once 0 is taken.
+    w.pause('hidden');
+    await settle();
+    ws.serverSend({ c: 'U', t: 'news', p: { n: 0 }, v: 1 });
+    await settle();
+    ws.serverSend({ c: 'U', t: 'news', p: { n: 1 }, v: 1 });
+    await settle();
+    ws.serverSend({ c: 'WSE', t: 'ack', p: { s: ws.messagesOfType('order')[0].s } });
+    await vi.waitFor(() => expect(o.client.kept()).toBe(0));
+    await settle();
+    w.resume('hidden');
+    await vi.waitFor(() => expect(w.bridge.phase).toBe('revoked'));
+    await settle();
+    expect(seen).toEqual([0, 1]);
+    expect(heard).toEqual([['delivered', { ids: ['confirmed'] }]]);
+    expect(w.kept()).toBe(0);
+  });
+
+  it('hears what the server confirmed that came while it was paused, signing out before it resumed', async () => {
+    // A batch an item: what comes while it is paused reaches it in batches.
+    const o = owner({ limits: { inFlight: 8, batchItems: 1 } });
+    o.client.retain();
+    const w = window(o);
+    const heard: unknown[] = [];
+    const seen: number[] = [];
+    w.on('wseDelivered', (d) => heard.push(['delivered', d]));
+    w.on('wseNotDelivered', (d) => heard.push(['not', d]));
+    w.onMessage('news', (m) => seen.push((m.p as { n: number }).n));
+    w.retain();
+    await vi.waitFor(() => expect(FakeWebSocket.instances).toHaveLength(1));
+    const ws = FakeWebSocket.last();
+    await serve(ws);
+    await vi.waitFor(() => expect(w.state.getSnapshot().ready).toBe(true));
+    w.send('order', { n: 1 }, { id: 'confirmed' });
+    await vi.waitFor(() => expect(ws.messagesOfType('order')).toHaveLength(1));
+    w.pause('hidden');
+    await settle();
+    ws.serverSend({ c: 'U', t: 'news', p: { n: 1 }, v: 1 });
+    await settle();
+    ws.serverSend({ c: 'WSE', t: 'ack', p: { s: ws.messagesOfType('order')[0].s } });
+    await vi.waitFor(() => expect(o.client.kept()).toBe(0));
+    await settle();
+    w.signOut();
+    w.resume('hidden');
+    await vi.waitFor(() => expect(w.bridge.phase).toBe('revoked'));
+    await settle();
+    expect(seen).toEqual([]);
+    expect(heard).toEqual([['delivered', { ids: ['confirmed'] }]]);
+    expect(w.kept()).toBe(0);
   });
 
   it('a send from a listener of the sign-out is dropped at once', async () => {
