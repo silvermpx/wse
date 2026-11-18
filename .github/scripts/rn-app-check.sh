@@ -29,7 +29,8 @@ app=dev.wse.rncheck
 
 work="$(mktemp -d)"
 port="${WSE_PORT:-$((20000 + RANDOM % 20000))}"
-(cd "$root" && cargo build -q --locked -p wse-client --example server -p wse-conformance)
+# An example's selection would leave the conformance server out: two builds.
+(cd "$root" && cargo build -q --locked -p wse-client --example server && cargo build -q --locked -p wse-conformance)
 WSE_PORT="$port" "$target/debug/examples/server" > "$work/server.log" 2>&1 &
 server=$!
 # The conformance server, each case on a server of its own.
