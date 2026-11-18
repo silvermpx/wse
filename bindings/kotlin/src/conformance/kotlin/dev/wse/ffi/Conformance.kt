@@ -12,12 +12,14 @@ import com.google.gson.JsonNull
 import com.google.gson.JsonObject
 import com.google.gson.JsonParser
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.withTimeoutOrNull
+import kotlinx.coroutines.selects.onTimeout
+import kotlinx.coroutines.selects.select
 
 /** What the Kotlin package has, by the catalog's names. */
 private val FEATURES = listOf("outbox", "start", "live", "msgpack", "e2e", "signing", "recover_or_resync")
@@ -224,12 +226,19 @@ private class Run(private val begun: JsonObject, private val scope: CoroutineSco
         while (true) take(items.tryReceive().getOrNull() ?: return)
     }
 
-    /** Takes what comes until `deadline` (nanoTime), or the next item. */
+    /**
+     * Takes what comes until `deadline` (nanoTime), or the next item. A select takes the item or
+     * the time, never both: a receive the time cut short after it took the item would lose it.
+     */
+    @OptIn(ExperimentalCoroutinesApi::class)
     private suspend fun pump(deadline: Long) {
         drain()
         val wait = minOf((deadline - System.nanoTime()) / 1_000_000, 20)
         if (wait <= 0) return
-        val item = withTimeoutOrNull(wait) { items.receive() } ?: return
+        val item = select<WseItem?> {
+            items.onReceive { it }
+            onTimeout(wait) { null }
+        } ?: return
         take(item)
     }
 
