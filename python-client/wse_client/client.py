@@ -943,7 +943,8 @@ class AsyncWSEClient:
                 refused.append((start, r["s"], why))
         acked = p.get("acked") if isinstance(p.get("acked"), int) else 0
         node = p.get("node") if isinstance(p.get("node"), str) else ""
-        self._report(outbox.answered(acked, refused, node))
+        unsure = p.get("unsure") if isinstance(p.get("unsure"), int) else 0
+        self._report(outbox.answered(acked, refused, node, unsure))
         self._write_outbox_soon()
 
     def _handle_ack(self, event: WSEEvent) -> None:

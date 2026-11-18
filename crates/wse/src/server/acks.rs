@@ -249,6 +249,19 @@ impl SlotState {
         self.holes.get(at).filter(|h| h.from <= s).map(|h| h.why)
     }
 
+    /// The highest message a client back waiting from `from` on may have
+    /// had taken without the server telling (0: none): taken on a node that
+    /// could not be asked, one whose refusal was let go, or one whose
+    /// handler never ended. Past it, one not decided was not taken.
+    fn cannot_tell(&self, from: u64) -> u64 {
+        let forgot = if from.max(1) <= self.forgot {
+            self.forgot
+        } else {
+            0
+        };
+        self.unsure.max(forgot).max(self.deciding.unwrap_or(0))
+    }
+
     /// The refusals from `from` on, for a client that still waits for
     /// those: the ones before it it heard of, and they go.
     fn told_from(&mut self, from: u64) -> Vec<Hole> {
@@ -376,14 +389,34 @@ impl Producers {
     fn link(&self, user: Option<&str>, hello: &Hello, here: bool, now: u64) -> (Link, Vec<Hole>) {
         let (slot, known) = self.attach(user, &hello.producer, now);
         if known && here {
-            let (start, told) = {
+            let (start, unsure, told) = {
                 let mut state = slot.lock();
-                (state.decided_for(hello.from), state.told_from(hello.from))
+                let told = state.told_from(hello.from);
+                (
+                    state.decided_for(hello.from),
+                    state.cannot_tell(hello.from),
+                    told,
+                )
             };
-            (Link { slot, start }, told)
+            (
+                Link {
+                    slot,
+                    start,
+                    unsure,
+                },
+                told,
+            )
         } else {
             slot.lock().unsure_up_to(hello.written);
-            (Link { slot, start: 0 }, Vec::new())
+            let unsure = hello.written;
+            (
+                Link {
+                    slot,
+                    start: 0,
+                    unsure,
+                },
+                Vec::new(),
+            )
         }
     }
 
@@ -399,16 +432,36 @@ impl Producers {
         let (slot, _) = self.attach(user, &hello.producer, now);
         match decided {
             Some(decided) => {
-                let (start, told) = {
+                let (start, unsure, told) = {
                     let mut state = slot.lock();
                     state.advance(&decided);
-                    (state.decided_for(hello.from), state.told_from(hello.from))
+                    let told = state.told_from(hello.from);
+                    (
+                        state.decided_for(hello.from),
+                        state.cannot_tell(hello.from),
+                        told,
+                    )
                 };
-                (Link { slot, start }, told)
+                (
+                    Link {
+                        slot,
+                        start,
+                        unsure,
+                    },
+                    told,
+                )
             }
             None => {
                 slot.lock().unsure_up_to(hello.written);
-                (Link { slot, start: 0 }, Vec::new())
+                let unsure = hello.written;
+                (
+                    Link {
+                        slot,
+                        start: 0,
+                        unsure,
+                    },
+                    Vec::new(),
+                )
             }
         }
     }
@@ -470,6 +523,9 @@ pub(crate) struct Link {
     /// What the client was told was decided: where its messages on this
     /// connection go on from.
     pub(crate) start: u64,
+    /// The highest message the server cannot tell whether it took (0:
+    /// none): past it and `start`, one the client wrote was not taken.
+    pub(crate) unsure: u64,
 }
 
 /// The connection ends: its producer is kept for a day from now.
@@ -554,16 +610,20 @@ pub(crate) fn start(state: &Arc<SharedState>, handle: &ConnectionHandle, user: O
 
 /// The connection's producer is known: the client hears what was decided.
 fn finish(state: &SharedState, handle: &ConnectionHandle, link: Link, told: &[Hole]) {
-    let reply = outbox_reply(link.start, &state.node_id, told);
+    let reply = outbox_reply(link.start, &state.node_id, told, link.unsure);
     let _ = handle.out.acks.link.set(link);
     handle.send_control(Message::Text(reply.into()));
 }
 
 /// The server's answer to a client's outbox hello: what was decided of it,
-/// the refusals among that it may not have heard of, and the name this node
-/// goes by.
-fn outbox_reply(acked: u64, node: &str, refused: &[Hole]) -> String {
+/// the refusals among that it may not have heard of, the name this node
+/// goes by, and how far past what was decided it cannot tell whether it took
+/// a message (`unsure`, left out when it can tell all).
+fn outbox_reply(acked: u64, node: &str, refused: &[Hole], unsure: u64) -> String {
     let mut p = serde_json::json!({"acked": acked, "node": node});
+    if unsure > acked {
+        p["unsure"] = unsure.into();
+    }
     if !refused.is_empty() {
         p["refused"] = refused
             .iter()
@@ -920,7 +980,11 @@ mod tests {
     fn a_producer_whose_connection_is_open_is_kept_however_long_it_is_silent() {
         let producers = Producers::default();
         let (slot, _) = producers.attach(None, "p", 0);
-        let link = Link { slot, start: 0 };
+        let link = Link {
+            slot,
+            start: 0,
+            unsure: 0,
+        };
         producers.sweep(3 * KEPT_FOR_MS);
         let (again, known) = producers.attach(None, "p", 3 * KEPT_FOR_MS);
         assert!(known);
@@ -1039,6 +1103,34 @@ mod tests {
         assert!(told.is_empty());
     }
 
+    #[test]
+    fn a_client_back_is_told_how_far_the_server_cannot_tell() {
+        let producers = Producers::default();
+        let (link, _) = producers.link(Some("ann"), &hello("here", 0), true, 0);
+        link.slot.lock().claim(1, Refusal::Missing);
+        // Back on this node, having written up to 3: 2 and 3 were not taken.
+        let (link, _) = producers.link(Some("ann"), &hello("here", 3), true, 0);
+        assert_eq!((link.start, link.unsure), (1, 0));
+        let reply: serde_json::Value =
+            serde_json::from_str(&outbox_reply(link.start, "n", &[], link.unsure)).unwrap();
+        assert_eq!(reply["p"], serde_json::json!({"acked": 1, "node": "n"}));
+        // From a node that cannot be asked: up to what it wrote.
+        let (link, _) = producers.link(Some("bob"), &hello("other", 3), false, 0);
+        assert_eq!((link.start, link.unsure), (0, 3));
+        let reply: serde_json::Value =
+            serde_json::from_str(&outbox_reply(link.start, "n", &[], link.unsure)).unwrap();
+        assert_eq!(reply["p"]["unsure"], 3);
+        // A message whose handler never ended.
+        let (link, _) = producers.link(Some("cid"), &hello("here", 0), true, 0);
+        {
+            let mut state = link.slot.lock();
+            state.claim(1, Refusal::Missing);
+            state.deciding(1);
+        }
+        let (link, _) = producers.link(Some("cid"), &hello("here", 2), true, 0);
+        assert_eq!((link.start, link.unsure), (0, 1));
+    }
+
     /// Refused and taken in turn, past the bound: the first refusal is let
     /// go.
     fn past_the_bound(state: &mut SlotState) -> u64 {
@@ -1123,7 +1215,7 @@ mod tests {
 
     #[test]
     fn the_answer_tells_the_refusals_the_client_may_not_have_heard_of() {
-        let reply: serde_json::Value = serde_json::from_str(&outbox_reply(5, "n", &[])).unwrap();
+        let reply: serde_json::Value = serde_json::from_str(&outbox_reply(5, "n", &[], 0)).unwrap();
         assert_eq!(
             reply,
             serde_json::json!({"c": "WSE", "t": "outbox", "p": {"acked": 5, "node": "n"}, "v": 1})
@@ -1141,7 +1233,7 @@ mod tests {
             },
         ];
         let reply: serde_json::Value =
-            serde_json::from_str(&outbox_reply(5, "n", &refused)).unwrap();
+            serde_json::from_str(&outbox_reply(5, "n", &refused, 0)).unwrap();
         assert_eq!(
             reply["p"]["refused"],
             serde_json::json!([

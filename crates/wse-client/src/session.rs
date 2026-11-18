@@ -1496,6 +1496,9 @@ impl<H: Handler> Session<H> {
             acked: u64,
             node: String,
             refused: Vec<Refused>,
+            /// How far past `acked` the server cannot tell whether it took
+            /// a message (none: it can tell all).
+            unsure: u64,
         }
         #[derive(serde::Deserialize)]
         struct Refused {
@@ -1513,7 +1516,7 @@ impl<H: Handler> Session<H> {
             })
             .collect();
         if let Some(outbox) = &mut self.outbox {
-            let outcomes = outbox.answered(answer.acked, &refused, &answer.node);
+            let outcomes = outbox.answered(answer.acked, &refused, &answer.node, answer.unsure);
             self.report_outcomes(outcomes);
         }
     }

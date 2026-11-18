@@ -143,6 +143,12 @@ server every client is checked against.
   clients read it.
 - npm: `wse-client/electron/preload` has its type declarations; the type
   check of the package failed on it.
+- The outbox's answer says how far the server cannot tell whether it took a
+  message (`unsure`): past it and `acked`, a message the client may have
+  written is as one not written, and runs out on time (TypeScript, Rust and
+  its packages, Python). A page that was reloaded while a send was sealed no
+  longer holds back the sends after it once that one's time ran out: it goes
+  as `expired`, once, where TypeScript tried it again in a loop.
 - TypeScript: an end-to-end encrypted send whose time ran out while it was
   sealed, to a server that answers the outbox, is said expired, and the
   sends after it go; they all waited for the next connection.

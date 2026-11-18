@@ -550,14 +550,14 @@ From 3.2 a client keeps each message it sends, except one sent live, until the s
 | `written` | The highest number the client may have written on an earlier connection without an answer: a client writes a message only once its store holds that it may have gone |
 | `from` | The first number the client still waits to hear of: it heard of every refusal before it, and the server forgets those |
 
-Once the connection is admitted (`server_ready`), the server answers what it decided of that producer and names itself. Every message up to `acked` was taken or refused; `refused` lists the refusals among them the client may not have heard of (its connection went before their `nack`), in the form of a `nack`'s payload. The client tells its application of each, and sends the rest, in order, before anything new:
+Once the connection is admitted (`server_ready`), the server answers what it decided of that producer and names itself. Every message up to `acked` was taken or refused; `refused` lists the refusals among them the client may not have heard of (its connection went before their `nack`), in the form of a `nack`'s payload; `unsure`, when the server cannot tell past `acked` whether it took a message (see below), is the highest such number. Past `acked` and `unsure` the server took none of the client's messages: one the client may have written is as one not written yet, and goes as `expired` once its time ran out. The client tells its application of each, and sends the rest, in order, before anything new:
 
 ```json
 {"c":"WSE","t":"outbox","p":{"acked": 39, "node": "019c53d0-...",
   "refused": [{"s": 38, "code": "busy"}]},"v":1}
 ```
 
-`refused` is left out when there is none. A producer is kept per user: another user's connection cannot reach it. The server decides one producer's messages one at a time, its application's handler included, so a connection that comes back while a message is being decided is answered once the decision is in.
+`refused` and `unsure` are left out when there is none. A producer is kept per user: another user's connection cannot reach it. The server decides one producer's messages one at a time, its application's handler included, so a connection that comes back while a message is being decided is answered once the decision is in.
 
 **Answers.** The server answers after its application took a message (a Rust `Handler::message` returned, or the Python server queued it for `drain_inbound` or its callback; a Python server with neither refuses it, `busy`), one `ack` for a batch of frames read, refusals first:
 

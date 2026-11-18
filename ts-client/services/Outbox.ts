@@ -574,15 +574,38 @@ export class Outbox {
   }
 
   /**
+   * The message may have gone on an earlier connection (the store said so,
+   * or it was written): it waits for the server's answer whatever its age.
+   */
+  mayHaveGone(message: WSMessage): boolean {
+    const record = this.taken.get(message);
+    return record !== undefined && record.s <= this.written;
+  }
+
+  /**
    * A message handed to be written later ran out while it was sealed: it
    * and those handed after it are taken back, and it goes as expired, never
-   * written.
+   * written. True when it went.
    */
-  ranOut(message: WSMessage): void {
+  ranOut(message: WSMessage): boolean {
+    const record = this.taken.get(message);
     this.takeBack(message);
     const outcomes = noOutcomes();
     this.expire(Date.now(), outcomes);
     this.onExpired?.(outcomes);
+    return record !== undefined && !this.keeps(record);
+  }
+
+  /** `record` is still one of those kept. */
+  private keeps(record: Kept): boolean {
+    let low = this.head;
+    let high = this.records.length;
+    while (low < high) {
+      const mid = (low + high) >>> 1;
+      if (this.records[mid].s < record.s) low = mid + 1;
+      else high = mid;
+    }
+    return low < this.records.length && this.records[low] === record;
   }
 
   /** Where the record numbered `s` is among those handed on this connection, or -1. */
@@ -717,13 +740,27 @@ export class Outbox {
 
   /**
    * The server's answer to the hello: what it decided, the refusals among that
-   * (first, last, why), and its name. It may come before the server took the
-   * connection or after.
+   * (first, last, why), its name, and how far past what it decided it cannot
+   * tell whether it took a message (`unsure`, 0 for nothing). It may come
+   * before the server took the connection or after.
    */
-  answeredWith(acked: number, refused: Array<[number, number, string]>, node: string): Outcomes {
+  answeredWith(
+    acked: number,
+    refused: Array<[number, number, string]>,
+    node: string,
+    unsure = 0,
+  ): Outcomes {
     const outcomes = noOutcomes();
     for (const [from, to, why] of refused) merge(outcomes, this.refused(from, to, why));
     merge(outcomes, this.acked(acked));
+    // Past both, the server took none of what may have gone: those are
+    // like any not written yet, and what ran out goes as expired (the next
+    // time they are due).
+    const mayHaveGone = Math.max(acked, Math.min(this.written, unsure));
+    if (mayHaveGone < this.written) {
+      this.written = mayHaveGone;
+      this.rearm();
+    }
     this.answered = true;
     if (this.node !== node) {
       this.node = node;
@@ -936,10 +973,15 @@ export class Outbox {
     const written = this.written;
     const cursor = this.cursor;
     this.removeWhere('expired', outcomes, (at, r) => at >= cursor && r.s > written && r.until < now);
+    this.rearm();
+  }
+
+  /** The timer, for the first message not written yet to run out. */
+  private rearm(): void {
     let earliest = Infinity;
     for (let i = this.head; i < this.records.length; i++) {
       const record = this.records[i];
-      if (record.s > written && record.until < earliest) earliest = record.until;
+      if (record.s > this.written && record.until < earliest) earliest = record.until;
     }
     this.earliestMs = earliest;
     this.arm();

@@ -24,10 +24,10 @@ def numbers(out: list[tuple[int, str]]) -> list[int]:
     return [s for s, _ in out]
 
 
-def answering(outbox: Outbox, acked: int = 0) -> Outcomes:
+def answering(outbox: Outbox, acked: int = 0, unsure: int = 0) -> Outcomes:
     outbox.connected("ann", 0)
     outbox.server_answers(True)
-    return outbox.answered(acked, [], "n1")
+    return outbox.answered(acked, [], "n1", unsure)
 
 
 class TestOutbox:
@@ -120,7 +120,9 @@ class TestOutbox:
         outbox.answered(0, [], "n1")
         assert outbox.due(0, Outcomes()) == []
 
-    def test_one_not_written_in_its_time_runs_out_and_one_written_waits(self):
+    def test_one_not_written_in_its_time_runs_out_and_one_the_server_cannot_tell_of_waits(
+        self,
+    ):
         outbox = Outbox(LIMITS)
         add(outbox, "late", ttl=5, now=0)
         add(outbox, "on time", now=0)
@@ -131,11 +133,20 @@ class TestOutbox:
         answering(outbox)
         add(outbox, "quick", ttl=5, now=10)
         assert numbers(outbox.due(10, Outcomes())) == [2, 3]
+        # Back on a node that cannot tell whether it took them: both go
+        # again, whatever their age.
         outbox.disconnected()
-        answering(outbox)
+        answering(outbox, 0, 3)
         later = Outcomes()
         assert numbers(outbox.due(100, later)) == [2, 3]
         assert not later
+        # Back where the server can tell it took neither: as any not
+        # written, the one whose time ran out goes as expired.
+        outbox.disconnected()
+        answering(outbox)
+        told = Outcomes()
+        assert numbers(outbox.due(100, told)) == [2]
+        assert told.not_delivered == {"expired": ["quick"]}
 
     def test_a_refusal_is_said_one_heard_with_the_answer_too(self):
         outbox = Outbox(LIMITS)

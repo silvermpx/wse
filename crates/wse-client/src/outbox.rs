@@ -657,12 +657,21 @@ impl Outbox {
         acked: u64,
         refused: &[(u64, u64, &str)],
         node: &str,
+        unsure: u64,
     ) -> Outcomes {
         let mut outcomes = Outcomes::default();
         for (from, to, why) in refused {
             outcomes.merge(self.refused(*from, *to, why));
         }
         outcomes.merge(self.acked(acked));
+        // Past both, the server took none of what may have gone: those are
+        // like any not written yet, and what ran out goes as expired (the
+        // next time they are due).
+        let may_have_gone = acked.max(self.written.min(unsure));
+        if may_have_gone < self.written {
+            self.written = may_have_gone;
+            self.rearm(now_ms());
+        }
         self.answered = true;
         if self.node.as_deref() != Some(node) {
             self.node = Some(node.into());
@@ -883,7 +892,13 @@ impl Outbox {
         self.remove_where("expired", outcomes, |at, r| {
             at >= cursor && r.s > written && r.until < now
         });
-        let first = self.records.partition_point(|r| r.s <= written);
+        self.rearm(now);
+        self.changed();
+    }
+
+    /// The timer, for the first message not written yet to run out.
+    fn rearm(&mut self, now: u64) {
+        let first = self.records.partition_point(|r| r.s <= self.written);
         self.earliest = self
             .records
             .range(first..)
@@ -891,7 +906,6 @@ impl Outbox {
             .min()
             .unwrap_or(u64::MAX);
         self.set_deadline(now);
-        self.changed();
     }
 
     fn set_deadline(&mut self, now: u64) {
@@ -1831,11 +1845,15 @@ mod tests {
     }
 
     /// A connection to a server that answers: taken, and answered with
-    /// `acked`.
+    /// `acked` (and as far as it cannot tell, `unsure`).
     fn answering(outbox: &mut Outbox, acked: u64) -> Outcomes {
+        answering_unsure(outbox, acked, 0)
+    }
+
+    fn answering_unsure(outbox: &mut Outbox, acked: u64, unsure: u64) -> Outcomes {
         outbox.connected(Some("ann"), 0);
         outbox.server_answers(true);
-        outbox.answered(acked, &[], "n1")
+        outbox.answered(acked, &[], "n1", unsure)
     }
 
     fn numbers(out: &[(u64, String)]) -> Vec<u64> {
@@ -1863,7 +1881,7 @@ mod tests {
             "no answer yet"
         );
         assert_eq!(outbox.hello()["from"], 1);
-        outbox.answered(0, &[], "n1");
+        outbox.answered(0, &[], "n1", 0);
         let out = due(&mut outbox, 0, &mut outcomes);
         assert_eq!(
             out,
@@ -1897,7 +1915,7 @@ mod tests {
         add(&mut outbox, "a");
         let mut outcomes = Outcomes::default();
         outbox.server_answers(true);
-        outbox.answered(0, &[], "n1");
+        outbox.answered(0, &[], "n1", 0);
         assert!(
             due(&mut outbox, 0, &mut outcomes).is_empty(),
             "not taken yet"
@@ -1939,7 +1957,7 @@ mod tests {
             [("user_changed".to_owned(), vec!["before any".to_owned()])]
         );
         outbox.server_answers(true);
-        outbox.answered(0, &[], "n1");
+        outbox.answered(0, &[], "n1", 0);
         assert!(due(&mut outbox, 0, &mut Outcomes::default()).is_empty());
     }
 
@@ -2004,7 +2022,7 @@ mod tests {
         assert_eq!(outbox.hello()["from"], 1, "waits to hear of 1 on");
         outbox.connected(Some("ann"), 0);
         outbox.server_answers(true);
-        let outcomes = outbox.answered(3, &[(2, 2, "busy")], "n1");
+        let outcomes = outbox.answered(3, &[(2, 2, "busy")], "n1", 0);
         assert_eq!(ids(&outcomes.delivered), ["a", "c"]);
         assert_eq!(
             outcomes.not_delivered,
@@ -2032,7 +2050,7 @@ mod tests {
     }
 
     #[test]
-    fn a_message_written_waits_for_its_answer_whatever_its_age() {
+    fn a_message_written_waits_for_its_answer_whatever_its_age_where_the_server_cannot_tell() {
         let mut outbox = outbox(&Offline::in_memory());
         answering(&mut outbox, 0);
         assert!(outbox.room.take(2));
@@ -2048,11 +2066,21 @@ mod tests {
         let mut outcomes = Outcomes::default();
         assert_eq!(numbers(&due(&mut outbox, 0, &mut outcomes)), [1]);
         outbox.disconnected();
-        let outcomes = answering(&mut outbox, 0);
+        let outcomes = answering_unsure(&mut outbox, 0, 1);
         assert_eq!(outcomes, Outcomes::default(), "not expired: it was written");
         let mut outcomes = Outcomes::default();
         assert_eq!(numbers(&due(&mut outbox, 100, &mut outcomes)), [1]);
         assert_eq!(outcomes, Outcomes::default());
+        // Where the server can tell it did not take it: as any not written.
+        outbox.disconnected();
+        assert_eq!(answering(&mut outbox, 0), Outcomes::default());
+        let mut outcomes = Outcomes::default();
+        assert!(due(&mut outbox, 100, &mut outcomes).is_empty());
+        assert_eq!(
+            outcomes.not_delivered,
+            [("expired".to_owned(), vec!["a".to_owned()])]
+        );
+        assert_eq!(outbox.hello()["written"], 0);
     }
 
     #[test]

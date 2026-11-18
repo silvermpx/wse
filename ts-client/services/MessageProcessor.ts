@@ -2110,7 +2110,8 @@ export class MessageProcessor {
       }
     }
     const acked = typeof p.acked === 'number' ? p.acked : 0;
-    this.report(outbox.answeredWith(acked, refused, typeof p.node === 'string' ? p.node : ''));
+    const unsure = typeof p.unsure === 'number' ? p.unsure : 0;
+    this.report(outbox.answeredWith(acked, refused, typeof p.node === 'string' ? p.node : '', unsure));
     this.scheduleFlush(0);
   }
 
@@ -2257,10 +2258,10 @@ export class MessageProcessor {
     if (kept === null) return false;
     if (kept) {
       // Its time ran out while it was sealed: it goes as expired, and what
-      // was handed after it goes again, in order.
-      if (kept.until < Date.now()) {
-        outbox!.ranOut(message);
-        this.scheduleFlush(0);
+      // was handed after it goes again, in order. One that may have gone on
+      // an earlier connection waits for the server's answer whatever its age.
+      if (kept.until < Date.now() && !outbox!.mayHaveGone(message)) {
+        if (outbox!.ranOut(message)) this.scheduleFlush(0);
         return false;
       }
       if (!kept.requires || this.continuous(kept.requires)) return true;

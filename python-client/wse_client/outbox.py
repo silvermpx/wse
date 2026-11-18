@@ -343,15 +343,27 @@ class Outbox:
         self._plain = not answers
 
     def answered(
-        self, acked: int, refused: list[tuple[int, int, str]], node: str
+        self,
+        acked: int,
+        refused: list[tuple[int, int, str]],
+        node: str,
+        unsure: int = 0,
     ) -> Outcomes:
         """The server's answer to the hello: what it decided, the refusals
-        among that, and its name. It may come before the server took the
-        connection or after."""
+        among that, its name, and how far past what it decided it cannot tell
+        whether it took a message (*unsure*, 0 for nothing). It may come
+        before the server took the connection or after."""
         outcomes = Outcomes()
         for start, end, why in refused:
             outcomes.merge(self.refused(start, end, why))
         outcomes.merge(self.acked(acked))
+        # Past both, the server took none of what may have gone: those are
+        # like any not written yet, and what ran out goes as expired (the
+        # next time they are due).
+        may_have_gone = max(acked, min(self._written, unsure))
+        if may_have_gone < self._written:
+            self._written = may_have_gone
+            self._rearm()
         self._answered = True
         if self._node != node:
             self._node = node
@@ -526,13 +538,17 @@ class Outbox:
             outcomes,
             lambda at, r: at >= cursor and r.s > written and r.until < now,
         )
+        self._rearm()
+        self._changed()
+
+    def _rearm(self) -> None:
+        """When the first message not written yet runs out."""
         earliest = float("inf")
         for record in self._records[self._head :]:
             assert record is not None
-            if record.s > written and record.until < earliest:
+            if record.s > self._written and record.until < earliest:
                 earliest = record.until
         self._earliest = earliest
-        self._changed()
 
     # -- Inside -----------------------------------------------------------------
 

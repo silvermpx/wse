@@ -9,9 +9,13 @@
 
 import 'fake-indexeddb/auto';
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
+import { mkdtempSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import {
   ENDPOINT,
   FakeWebSocket,
+  installFakeLocks,
   installFakeWebSocket,
   resetClientState,
   serverHelloMessage,
@@ -22,6 +26,9 @@ import { createWSEClient, type WSEClient } from '../core/index.js';
 import { SecurityManager } from '../utils/security.js';
 import { ConnectionManager } from '../services/ConnectionManager.js';
 import { createClientContext } from '../core/context.js';
+import { fileOutbox } from '../node/fileOutbox.js';
+import { indexedDbOutbox } from '../services/IndexedDbOutbox.js';
+import { Outbox } from '../services/Outbox.js';
 
 let clients: WSEClient[] = [];
 
@@ -380,3 +387,74 @@ it('to a server that answers, never writes a kept send whose time ran out while 
     spy.mockRestore();
   }
 });
+
+it.each([
+  ['a file', () => fileOutbox(join(mkdtempSync(join(tmpdir(), 'wse-reload-')), 'queue'))],
+  ['IndexedDB', () => indexedDbOutbox(`reload-${Math.random()}`)],
+] as const)(
+  'in %s, a send whose time ran out while the page was gone, sealed then, goes as expired, once, and the next goes',
+  async (_, makeStore) => {
+    installFakeLocks();
+    const store = makeStore();
+    let release!: () => void;
+    let started = false;
+    const gate = new Promise<void>((resolve) => (release = resolve));
+    const original = SecurityManager.prototype.encryptForTransport;
+    const seal = vi
+      .spyOn(SecurityManager.prototype, 'encryptForTransport')
+      .mockImplementation(async function (this: SecurityManager, data: string) {
+        const sealed = await original.call(this, data);
+        if (data.includes('order-expiry') && !started) {
+          started = true;
+          await gate;
+        }
+        return sealed;
+      });
+    const ranOut = vi.spyOn(Outbox.prototype, 'ranOut');
+    try {
+      // The page, until it goes while the second order is sealed.
+      const first = client({ offline: { store } });
+      first.retain();
+      await vi.waitFor(() => expect(FakeWebSocket.instances).toHaveLength(1));
+      const before = await open(first, 'u', true);
+      const delivered: string[] = [];
+      first.on('wseDelivered', (d) => delivered.push(...d.ids));
+      first.send('order', { item: 'water' }, { id: 'first', ttl: 30_000 });
+      await vi.waitFor(async () => expect(await before.orders()).toEqual([{ item: 'water' }]));
+      before.ws.serverSend({ c: 'WSE', t: 'ack', p: { s: 1 }, v: 1 });
+      await vi.waitFor(() => expect(delivered).toEqual(['first']));
+      first.send('order', { item: 'milk' }, { id: 'order-expiry', ttl: 150 });
+      await vi.waitFor(() => expect(started).toBe(true));
+      first.send('order', { item: 'bread' }, { id: 'next', ttl: 30_000 });
+      await settle();
+      first.destroy();
+      clients = clients.filter((c) => c !== first);
+      release();
+      // The page is back once the first order's time ran out.
+      await new Promise((resolve) => setTimeout(resolve, 250));
+      const back = client({ offline: { store } });
+      const outcomes: unknown[] = [];
+      back.on('wseDelivered', (d) => outcomes.push(['delivered', d.ids]));
+      back.on('wseNotDelivered', (d) => outcomes.push([d.reason, d.ids]));
+      back.retain();
+      await vi.waitFor(() => expect(FakeWebSocket.instances.length).toBeGreaterThan(1));
+      const socket = await open(back, 'u', true);
+      await vi.waitFor(async () => expect(await socket.orders()).toEqual([{ item: 'bread' }]));
+      const next = (await socket.sent()).find((m) => m.id === 'next');
+      expect(next.s).toBe(3);
+      socket.ws.serverSend({ c: 'WSE', t: 'ack', p: { s: 3 }, v: 1 });
+      await vi.waitFor(() => expect(outcomes).toContainEqual(['delivered', ['next']]));
+      await settle();
+      expect(outcomes).toEqual([
+        ['expired', ['order-expiry']],
+        ['delivered', ['next']],
+      ]);
+      expect(back.kept()).toBe(0);
+      expect(ranOut.mock.calls.length).toBeLessThanOrEqual(1);
+    } finally {
+      release();
+      seal.mockRestore();
+      ranOut.mockRestore();
+    }
+  },
+);

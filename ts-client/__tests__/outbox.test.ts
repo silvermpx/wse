@@ -27,10 +27,10 @@ function due(outbox: Outbox, now = 0, outcomes: Outcomes = noOutcomes()): Array<
   return out;
 }
 
-function answering(outbox: Outbox, acked = 0): Outcomes {
+function answering(outbox: Outbox, acked = 0, unsure = 0): Outcomes {
   outbox.connected('ann', 0);
   outbox.serverAnswers(true);
-  return outbox.answeredWith(acked, [], 'n1');
+  return outbox.answeredWith(acked, [], 'n1', unsure);
 }
 
 describe('Outbox', () => {
@@ -103,7 +103,7 @@ describe('Outbox', () => {
     expect(due(outbox)).toEqual([]);
   });
 
-  it('drops one not written within its time, and not one written', () => {
+  it('drops one not written within its time, and not one the server cannot tell it did not take', () => {
     const outbox = new Outbox(limits);
     add(outbox, 'late', 5, 0);
     add(outbox, 'on time', undefined, 0);
@@ -114,11 +114,20 @@ describe('Outbox', () => {
     answering(outbox);
     add(outbox, 'quick', 5, 10);
     expect(due(outbox, 10)).toEqual([[2, 'on time'], [3, 'quick']]);
+    // Back on a node that cannot tell whether it took them: both go again,
+    // whatever their age.
     outbox.disconnected();
-    answering(outbox);
+    answering(outbox, 0, 3);
     const later = noOutcomes();
     expect(due(outbox, 100, later)).toEqual([[2, 'on time'], [3, 'quick']]);
     expect(later.notDelivered.size).toBe(0);
+    // Back where the server can tell it took neither: as any not written,
+    // the one whose time ran out goes as expired.
+    outbox.disconnected();
+    answering(outbox);
+    const told = noOutcomes();
+    expect(due(outbox, 100, told)).toEqual([[2, 'on time']]);
+    expect([...told.notDelivered]).toEqual([['expired', ['quick']]]);
   });
 
   it('tells a refusal, one heard with the answer too', () => {
