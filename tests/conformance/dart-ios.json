@@ -1,0 +1,6 @@
+{
+  "about": "The Dart package on an iOS simulator (bindings/dart/example, run-integration-tests.sh): its client on the Rust client's native layer, in a Flutter app.",
+  "agents": {
+    "dart-ios": { "features": ["outbox", "start", "live", "msgpack", "e2e", "signing", "recover_or_resync"] }
+  }
+}

@@ -10,7 +10,10 @@
 # simulator, which runs debug builds only, the release build is made for a
 # device. APP names another copy of the example to run (default: this one),
 # such as the one in a staged package whose build hook takes prebuilt
-# libraries. Linux runs need a display (xvfb-run on a server).
+# libraries. Linux runs need a display (xvfb-run on a server). On an iOS
+# simulator or an Android emulator the integration test runs the conformance
+# cases too, against a conformance server of its own, and checks them (agents
+# dart-ios, dart-android); a desktop's are the package's (run-tests.sh).
 set -euo pipefail
 device="${1:?usage: run-integration-tests.sh <device id>}"
 root="$(cd "$(dirname "$0")/../../.." && pwd)"
@@ -52,7 +55,7 @@ simulator_test() {
   local stall="${IOS_STALL_SECONDS:-240}" output pid code=1 run stalled
   for run in 1 2 3; do
     output="$(mktemp)"
-    "$flutter" test integration_test -d "$device" --reporter expanded --suppress-analytics "${defines[@]}" \
+    "$flutter" test "$tests" -d "$device" --reporter expanded --suppress-analytics "${defines[@]}" \
       > >(tee "$output") 2>&1 &
     pid=$!
     stalled=""
@@ -88,11 +91,36 @@ log="$target/flutter-example-server.log"
 ca="$target/flutter-example-ca.pem"
 WSE_PORT="$port" WSE_TLS_PORT="$((port + 1))" WSE_TLS_CA="$ca" "$program" > "$log" 2>&1 &
 server=$!
-trap 'kill "$server" 2>/dev/null || true' EXIT
+judge=""
+trap 'kill "$server" $judge 2>/dev/null || true' EXIT
 for _ in $(seq 1 50); do
   grep -q "signing_public_key" "$log" && break
   sleep 0.1
 done
+# A phone's system reaches the conformance server's control channel, and so
+# each case's server, by this machine's name there: an Android emulator's
+# 10.0.2.2, an iOS simulator's own loopback.
+tests=integration_test/app_test.dart
+conformance=""
+case "$device" in
+  emulator-*) system=android control_host=10.0.2.2 ;;
+  macos | windows | linux) system="" control_host="" ;;
+  *) system=ios control_host=127.0.0.1 ;;
+esac
+if [[ "${MODE:-debug}" == debug && -n "$system" ]]; then
+  cargo build -q -p wse-conformance
+  conformance="$(mktemp -d "$target/flutter-conformance.XXXXXX")"
+  "$target/debug/wse-conformance" serve --out "$conformance" > "$conformance/serve.log" 2>&1 &
+  judge=$!
+  for _ in $(seq 1 100); do
+    grep -q '"ready"' "$conformance/serve.log" && break
+    sleep 0.1
+  done
+  control="$(sed -n 's/.*"control":"ws:\/\/127.0.0.1:\([0-9]*\)\/control".*/\1/p' "$conformance/serve.log")"
+  [[ -n "$control" ]] || { cat "$conformance/serve.log" >&2; exit 1; }
+  control="ws://$control_host:$control/control"
+  tests=integration_test
+fi
 # An Android emulator reaches the host's ports through adb.
 if [[ "$device" == emulator-* ]]; then
   adb -s "$device" reverse "tcp:$port" "tcp:$port"
@@ -110,6 +138,7 @@ defines=(
   --dart-define="WSE_IDENTITY=$(sed -n 's/^e2e_identity_public_key //p' "$log")"
   --dart-define="WSE_SIGNING=$(sed -n 's/^signing_public_key //p' "$log")"
 )
+if [[ -n "$conformance" ]]; then defines+=(--dart-define="WSE_CONFORMANCE=$control"); fi
 cd "$here"
 "$flutter" pub get --suppress-analytics > /dev/null
 case "${MODE:-debug}" in
@@ -117,7 +146,11 @@ case "${MODE:-debug}" in
     if [[ "$device" =~ ^[0-9A-F]{8}(-[0-9A-F]{4}){3}-[0-9A-F]{12}$ ]]; then
       simulator_test
     else
-      "$flutter" test integration_test -d "$device" --suppress-analytics "${defines[@]}"
+      "$flutter" test "$tests" -d "$device" --suppress-analytics "${defines[@]}"
+    fi
+    if [[ -n "$conformance" ]]; then
+      "$target/debug/wse-conformance" check --manifest "$root/tests/conformance/dart-$system.json" \
+        --reports "$conformance"
     fi
     ;;
   release)
