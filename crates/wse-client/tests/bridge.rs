@@ -424,6 +424,43 @@ async fn a_window_behind_hears_what_became_of_its_send_though_its_queue_overflow
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_window_signed_out_while_behind_hears_what_became_of_its_send_first() {
+    let stand = stand().await;
+    let owner = stand.owner(Options::default()).await;
+    let mut slow = TestWindow::new(&owner);
+    slow.send(json!({"k": "share", "on": true}));
+    slow.send(json!({"k": "hold", "topics": ["prices"]}));
+    slow.until("taken", |w| w.subscribed("prices")).await;
+    // Two batches in hand, not taken: what comes next waits at the owner.
+    slow.holding = true;
+    for n in 1..=2 {
+        stand.publish("prices", n);
+    }
+    slow.until("two in hand", |w| w.held.len() == 2).await;
+    slow.send(json!({"k": "send", "n": 1, "t": "order", "p": {"n": 1}, "o": {"id": "kept"}, "c": 1, "a": 0}));
+    slow.until("sent", |w| w.has_frame(|f| f["k"] == "sent" && f["n"] == 1))
+        .await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while owner.client().kept() > 0 {
+        assert!(tokio::time::Instant::now() < deadline, "the server's answer");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    slow.settle(100).await;
+    assert_eq!(slow.held.len(), 2, "the outcome waits at the owner");
+    owner.sign_out();
+    slow.until("revoked", |w| w.has_frame(|f| f["k"] == "revoked")).await;
+    // A last batch with it, before the window is let go.
+    assert_eq!(slow.held.len(), 3, "{:?}", slow.held);
+    let last = &slow.held[2];
+    assert_eq!(last["s"], slow.held[1]["s"].as_u64().unwrap() + 1);
+    assert_eq!(
+        last["items"],
+        json!([{"ev": "event", "name": "wseDelivered", "detail": {"ids": ["kept"]}}])
+    );
+    stand.server.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_window_of_another_protocol_is_refused_and_one_that_breaks_it_let_go() {
     let stand = stand().await;
     let owner = stand.owner(Options::default()).await;

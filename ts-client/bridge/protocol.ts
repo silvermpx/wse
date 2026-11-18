@@ -183,3 +183,8 @@ export type BridgeItem =
   | { ev: 'overflow'; topics: string[] }
   /** An event of the owner's client, for the window's listeners (an outcome of its own sends among them). */
   | { ev: 'event'; name: string; detail: unknown };
+
+/** What became of a window's send: said once, and the window waits for it. */
+export function isOutcome(item: BridgeItem): boolean {
+  return 'ev' in item && item.ev === 'event' && (item.name === 'wseDelivered' || item.name === 'wseNotDelivered');
+}

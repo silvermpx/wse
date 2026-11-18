@@ -26,7 +26,14 @@ import {
 import { generateId } from '../utils/id.js';
 import { logger } from '../utils/logger.js';
 import type { WindowChannel } from './channel.js';
-import { BRIDGE_PROTOCOL, type BridgeItem, type ConnState, type OwnerFrame, type WindowFrame } from './protocol.js';
+import {
+  BRIDGE_PROTOCOL,
+  isOutcome,
+  type BridgeItem,
+  type ConnState,
+  type OwnerFrame,
+  type WindowFrame,
+} from './protocol.js';
 
 export interface BridgeClientOptions {
   /** This part of the application, by a stable name: what it commits is its. Required by recover-or-resync. */
@@ -253,19 +260,21 @@ export function createBridgeClient(
     if (over()) return;
     phase = next;
     reason = why;
-    // What it held paused is the last connection's: never handed on.
+    // What it held paused is the last connection's: never handed on. What
+    // became of its sends is said all the same, once: the window is let go
+    // first, so a send from a listener of it is dropped.
+    const outcomes = pausedBatches.flatMap((b) => b.items.filter(isOutcome));
     pausedBatches = [];
     for (const resolve of signs.values()) resolve('dropped');
     signs.clear();
     // What waited for its topics never reached the owner: it goes.
-    if (waiting.length > 0) {
-      const ids = waiting.map((w) => w.options.id!);
-      waiting = [];
-      emit('wseNotDelivered', { reason: 'closed', ids });
-    }
+    const unsent = waiting.map((w) => w.options.id!);
+    waiting = [];
     // The connection is gone for good: what the window holds is not current.
     if (!done) delivery.connectionLost();
     refresh();
+    if (unsent.length > 0) emit('wseNotDelivered', { reason: 'closed', ids: unsent });
+    for (const item of outcomes) take(item);
   };
 
   const take = (item: BridgeItem) => {
@@ -388,11 +397,13 @@ export function createBridgeClient(
         return;
       }
       case 'revoked':
-        if (f.reason === 'signed_out') signedOut();
+        // What the owner said became of its sends first, then what it held
+        // went with the user.
         end('revoked', f.reason);
         if (f.reason === 'signed_out') {
           delivery.forget();
           storage.clear();
+          signedOut();
         }
         return;
     }
@@ -658,10 +669,12 @@ export function createBridgeClient(
     signOut: () => {
       if (done) return;
       post({ k: 'signOut' });
-      signedOut();
       delivery.forget();
       storage.clear();
+      // Let go first: what the owner said became of its sends, then what it
+      // held went with the user, and a send from a listener is dropped.
       finish();
+      signedOut();
       port?.close();
     },
     destroy: () => {

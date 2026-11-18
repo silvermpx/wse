@@ -135,6 +135,11 @@ server every client is checked against.
 - TypeScript: an end-to-end encrypted send whose time ran out while it was
   sealed, to a server that answers the outbox, is said expired, and the
   sends after it go; they all waited for the next connection.
+- TypeScript window bridge, and the Tauri owner: a window signed out while
+  it was paused or behind hears what the server answered of its sends
+  (`wseDelivered`), then `cleared` for the rest; it heard `cleared` for
+  all. A send from a listener of the sign-out is `dropped` at once, where it
+  said `queued` and waited for good.
 - Python: a connection for another user starts the topics over and drops
   the last user's queue; `SyncWSEClient` takes `cookie_name`.
 - Rust client (and Swift, Kotlin, Dart): a connection that died while the

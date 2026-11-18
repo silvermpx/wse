@@ -233,8 +233,10 @@ holds and listens to, in batches it acknowledges as it takes them: at most two i
 that falls behind holds back only its own queue, and one past 10,000 messages (or 64 MiB) loses its
 queue and hears its topics broke off (`wseOverloaded`; a recover-or-resync window resyncs them).
 A window's sends go through the owner's outbox (`send` says `queued`, a live one `sent`), and what
-became of each (`wseDelivered`, `wseNotDelivered`; `cleared` for what the owner held when the user
-signed out) reaches that window alone, whatever ids the windows chose. What depends on the
+became of each (`wseDelivered`, `wseNotDelivered`) reaches that window alone, whatever ids the
+windows chose: when the user signs out, what the server answered already, paused or behind as the
+window may be, then `cleared` for the rest the owner held; a send from a listener of it is
+`dropped`. What depends on the
 application stays in the window: its listeners, the delivery's barrier, resync, commit and
 checkpoint, the sends that wait for their topics; after a reconnect, a window's send that requires
 topics waits in the owner's outbox until that window resynced them. A window's `pause` holds back

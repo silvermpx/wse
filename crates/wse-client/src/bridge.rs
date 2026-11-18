@@ -656,7 +656,29 @@ impl Owner {
     }
 
     fn revoke(&self, state: &mut State, att: u64, reason: &str, detail: Option<&str>) {
-        if let Some(win) = state.windows.get(&att) {
+        if let Some(win) = state.windows.get_mut(&att) {
+            // What became of its sends is said all the same, once: what it
+            // has no room for in hand goes in a last batch, before it is let
+            // go.
+            if win.outcomes > 0 {
+                let outcomes: Vec<Arc<str>> =
+                    win.queue.drain(..).filter(|i| is_outcome(i)).collect();
+                win.outcomes = 0;
+                win.outcome_bytes = 0;
+                win.bytes = 0;
+                win.handed += 1;
+                let size: usize = outcomes.iter().map(|i| i.len() + 1).sum();
+                let mut frame = String::with_capacity(size + 32);
+                let _ = write!(frame, r#"{{"k":"b","s":{},"items":["#, win.handed);
+                for (at, item) in outcomes.iter().enumerate() {
+                    if at > 0 {
+                        frame.push(',');
+                    }
+                    frame.push_str(item);
+                }
+                frame.push_str("]}");
+                win.window.post(frame);
+            }
             win.window.post(revoked_frame(reason, detail));
         }
         self.detach_in(state, att);

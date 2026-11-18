@@ -25,6 +25,7 @@ import type { OwnerChannel } from './channel.js';
 import {
   BRIDGE_PROTOCOL,
   DEFAULT_BRIDGE_LIMITS,
+  isOutcome,
   isWindowFrame,
   type BridgeItem,
   type BridgeLimits,
@@ -118,11 +119,6 @@ function connOf(snapshot: WSEClientSnapshot): ConnState {
     lastError: snapshot.lastError,
     storage: snapshot.storage,
   };
-}
-
-/** What became of a window's send: said once, and the window waits for it. */
-function isOutcome(item: BridgeItem): boolean {
-  return 'ev' in item && item.ev === 'event' && (item.name === 'wseDelivered' || item.name === 'wseNotDelivered');
 }
 
 function sizeOf(message: WSMessage): number {
@@ -283,6 +279,14 @@ export function createBridgeOwner(options: BridgeOwnerOptions = {}): BridgeOwner
 
   const revoke = (a: Attachment, reason: 'signed_out' | 'owner_closed' | 'protocol', detail?: string) => {
     if (a.closed) return;
+    // What became of its sends is said all the same, once: what it has no
+    // room for in hand goes in a last batch, before it is let go.
+    const outcomes = a.queue.filter((q) => isOutcome(q.item));
+    if (outcomes.length > 0) {
+      a.queue = [];
+      a.handed++;
+      a.channel.post({ k: 'b', s: a.handed, items: outcomes.map((q) => q.item) });
+    }
     a.channel.post({ k: 'revoked', reason, detail });
     detach(a);
   };

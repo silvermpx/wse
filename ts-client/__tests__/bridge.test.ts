@@ -660,6 +660,93 @@ describe('a window let go', () => {
     expect(w.kept()).toBe(0);
   });
 
+  it('hears what the server confirmed, not that it was cleared, when the owner signs out while it is paused', async () => {
+    // One batch in hand at a time, one item a batch: the outcome waits at
+    // the owner, or in the paused window.
+    for (const limits of [{ inFlight: 1, batchItems: 1 }, { inFlight: 2, batchItems: 16 }]) {
+      const o = owner({ limits });
+      const w = window(o);
+      o.client.retain();
+      w.retain();
+      const delivered: unknown[] = [];
+      const refused: unknown[] = [];
+      w.on('wseDelivered', (d) => delivered.push(d));
+      w.on('wseNotDelivered', (d) => refused.push(d));
+      await vi.waitFor(() => expect(FakeWebSocket.instances.length).toBeGreaterThan(0));
+      const ws = FakeWebSocket.last();
+      await serve(ws);
+      await vi.waitFor(() => expect(w.state.getSnapshot().ready).toBe(true));
+      w.send('order', { n: 1 }, { id: 'confirmed' });
+      w.send('order', { n: 2 }, { id: 'unconfirmed' });
+      await vi.waitFor(() => expect(ws.messagesOfType('order')).toHaveLength(2));
+      w.pause('background');
+      await settle();
+      ws.serverSend({ c: 'WSE', t: 'ack', p: { s: ws.messagesOfType('order')[0].s } });
+      await vi.waitFor(() => expect(o.client.kept()).toBe(1));
+      await settle();
+      o.signOut();
+      await vi.waitFor(() => expect(w.bridge.phase).toBe('revoked'));
+      await settle();
+      expect(delivered).toEqual([{ ids: ['confirmed'] }]);
+      expect(refused).toEqual([{ reason: 'cleared', ids: ['unconfirmed'] }]);
+      expect(w.kept()).toBe(0);
+    }
+  });
+
+  it('hears what the server confirmed when it signs out while it is paused', async () => {
+    const o = owner();
+    const w = window(o);
+    o.client.retain();
+    w.retain();
+    const heard: unknown[] = [];
+    w.on('wseDelivered', (d) => heard.push(['delivered', d]));
+    w.on('wseNotDelivered', (d) => heard.push(['not', d]));
+    await vi.waitFor(() => expect(FakeWebSocket.instances.length).toBeGreaterThan(0));
+    const ws = FakeWebSocket.last();
+    await serve(ws);
+    await vi.waitFor(() => expect(w.state.getSnapshot().ready).toBe(true));
+    w.send('order', { n: 1 }, { id: 'confirmed' });
+    await vi.waitFor(() => expect(ws.messagesOfType('order')).toHaveLength(1));
+    w.pause('background');
+    await settle();
+    ws.serverSend({ c: 'WSE', t: 'ack', p: { s: ws.messagesOfType('order')[0].s } });
+    await vi.waitFor(() => expect(o.client.kept()).toBe(0));
+    await settle();
+    w.signOut();
+    expect(heard).toEqual([['delivered', { ids: ['confirmed'] }]]);
+    expect(w.kept()).toBe(0);
+  });
+
+  it('a send from a listener of the sign-out is dropped at once', async () => {
+    const o = owner();
+    const w = window(o);
+    await vi.waitFor(() => expect(w.bridge.phase).toBe('attached'));
+    let result: unknown;
+    w.on('wseNotDelivered', (d) => {
+      if (d.ids.includes('first')) result = w.send('followup', {}, { id: 'second' });
+    });
+    w.send('order', {}, { id: 'first' });
+    await vi.waitFor(() => expect(o.client.kept()).toBe(1));
+    o.signOut();
+    await vi.waitFor(() => expect(w.bridge.phase).toBe('revoked'));
+    await settle();
+    expect(result).toBe('dropped');
+    expect(w.kept()).toBe(0);
+    // And from one of a sign-out of its own.
+    const o2 = owner();
+    const w2 = window(o2);
+    await vi.waitFor(() => expect(w2.bridge.phase).toBe('attached'));
+    let own: unknown;
+    w2.on('wseNotDelivered', () => {
+      own = w2.send('followup', {}, { id: 'third' });
+    });
+    w2.send('order', {}, { id: 'first' });
+    await vi.waitFor(() => expect(o2.client.kept()).toBe(1));
+    w2.signOut();
+    expect(own).toBe('dropped');
+    expect(w2.kept()).toBe(0);
+  });
+
   it('hands on nothing more of a batch once a listener signed out', async () => {
     const o = owner({ limits: { inFlight: 1, batchItems: 16 } });
     o.client.retain();
