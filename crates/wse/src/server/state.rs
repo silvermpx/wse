@@ -786,6 +786,13 @@ pub(crate) struct SharedState {
 }
 
 impl SharedState {
+    /// A message the application sent to one connection was queued, `bytes`
+    /// as framed: `wse_messages_sent_total` and `wse_bytes_sent_total`.
+    pub(crate) fn count_sent(&self, bytes: u64) {
+        self.messages_sent_total.fetch_add(1, Ordering::Relaxed);
+        self.bytes_sent_total.fetch_add(bytes, Ordering::Relaxed);
+    }
+
     /// `conn_id` is `user_id`'s from now on: sends to the user reach it.
     pub(crate) fn register_user(&self, conn_id: &str, user_id: &str) {
         if let Some(previous) = self

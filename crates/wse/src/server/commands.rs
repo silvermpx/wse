@@ -51,11 +51,15 @@ pub(super) async fn process_commands(
             ServerCommand::SendText { conn_id, data } => {
                 let guard = state.connections.read();
                 if let Some(h) = guard.get(&conn_id) {
-                    h.send_one(
-                        Message::Text(data.into()),
+                    let message = Message::Text(data.into());
+                    let bytes = ws_frame_size(&WsFrame::Msg(message.clone())) as u64;
+                    if h.send_one(
+                        message,
                         state.max_outbound_queue_bytes,
                         state.slow_consumer_drops.shard(usize::from(h.lane)),
-                    );
+                    ) {
+                        state.count_sent(bytes);
+                    }
                 }
             }
             ServerCommand::Accept { conn_id, ready } => {
@@ -81,11 +85,15 @@ pub(super) async fn process_commands(
             ServerCommand::SendBytes { conn_id, data } => {
                 let guard = state.connections.read();
                 if let Some(h) = guard.get(&conn_id) {
-                    h.send_one(
-                        Message::Binary(data.into()),
+                    let message = Message::Binary(data.into());
+                    let bytes = ws_frame_size(&WsFrame::Msg(message.clone())) as u64;
+                    if h.send_one(
+                        message,
                         state.max_outbound_queue_bytes,
                         state.slow_consumer_drops.shard(usize::from(h.lane)),
-                    );
+                    ) {
+                        state.count_sent(bytes);
+                    }
                 }
             }
             ServerCommand::SendPrebuilt { conn_id, message } => {
@@ -99,8 +107,7 @@ pub(super) async fn process_commands(
                         state.slow_consumer_drops.shard(usize::from(h.lane)),
                     ) {
                         // Counted once really queued.
-                        state.messages_sent_total.fetch_add(1, Ordering::Relaxed);
-                        state.bytes_sent_total.fetch_add(bytes, Ordering::Relaxed);
+                        state.count_sent(bytes);
                     }
                 }
             }

@@ -245,6 +245,28 @@ class TestInboundRateLimit:
             srv.stop()
 
 
+class TestSentCounters:
+    @pytest.mark.asyncio
+    async def test_every_send_to_one_connection_is_counted_and_a_broadcast_is_not(
+        self, server_port
+    ):
+        srv = start_server(server_port)
+        try:
+            async with await connect(server_port, make_token()) as ws:
+                _, conn_id, _ = drain_until(srv, "auth_connect")
+                await asyncio.wait_for(ws.recv(), timeout=2)  # server_ready
+                srv.send_event(conn_id, {"t": "tick", "p": {}})
+                srv.send(conn_id, '{"t":"raw"}')
+                srv.send_bytes(conn_id, b"\x01\x02")
+                srv.broadcast_all('{"t":"everyone"}')
+                for _ in range(4):
+                    await asyncio.wait_for(ws.recv(), timeout=2)
+                assert metric(srv, "wse_messages_sent_total") == 3
+                assert metric(srv, "wse_bytes_sent_total") > 0
+        finally:
+            srv.stop()
+
+
 class TestHello:
     @pytest.mark.asyncio
     async def test_client_hello_is_answered_once(self, server, server_port):

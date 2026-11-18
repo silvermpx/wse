@@ -1088,9 +1088,9 @@ async def metrics():
 | Metric | Description |
 |---|---|
 | `wse_messages_received_total` | Messages received from clients |
-| `wse_messages_sent_total` | Messages sent to clients (via `send_event`) |
+| `wse_messages_sent_total` | Messages the application sent to one connection (`send_event`, `send`, `send_bytes`); broadcasts and topic messages are not counted |
 | `wse_bytes_received_total` | Bytes received from clients |
-| `wse_bytes_sent_total` | Bytes sent to clients |
+| `wse_bytes_sent_total` | Bytes of those messages, as framed |
 | `wse_connections_accepted_total` | Total connections accepted |
 | `wse_connections_rejected_total` | Connections rejected (max limit or auth failure) |
 | `wse_auth_failures_total` | JWT authentication failures |

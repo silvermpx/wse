@@ -101,7 +101,9 @@ impl SharedState {
             shared.commands_queued.load(Ordering::Relaxed)
         ));
 
-        out.push_str("# HELP wse_messages_sent_total Total messages sent to clients\n");
+        out.push_str(
+            "# HELP wse_messages_sent_total Messages the application sent to one connection (not broadcasts or topic messages)\n",
+        );
         out.push_str("# TYPE wse_messages_sent_total counter\n");
         out.push_str(&format!(
             "wse_messages_sent_total {}\n",
@@ -129,7 +131,9 @@ impl SharedState {
             shared.bytes_received_total.sum()
         ));
 
-        out.push_str("# HELP wse_bytes_sent_total Total bytes sent to clients\n");
+        out.push_str(
+            "# HELP wse_bytes_sent_total Bytes of the messages the application sent to one connection, as framed\n",
+        );
         out.push_str("# TYPE wse_bytes_sent_total counter\n");
         out.push_str(&format!(
             "wse_bytes_sent_total {}\n",
