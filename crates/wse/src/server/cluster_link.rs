@@ -3,6 +3,7 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 
 use tokio::sync::mpsc;
 
@@ -160,7 +161,8 @@ pub(crate) fn connect(
         .ok_or_else(|| Error::Cluster("Server not started".to_owned()))?;
 
     // Bound here, so a port in use is an error of this call.
-    let (inbound_links, main_port_tx) = match settings.port {
+    // The port peers' links come in on, as bound.
+    let (inbound_links, main_port_tx, links_port) = match settings.port {
         Some(port) => {
             let host = settings.host.as_deref().unwrap_or("0.0.0.0");
             let listener = std::net::TcpListener::bind((host, port))
@@ -175,15 +177,24 @@ pub(crate) fn connect(
                     )
                 })?;
             tracing::info!("[WSE-Cluster] Cluster listener on {host}:{port}");
-            (cluster::InboundLinks::Listener(listener), None)
+            let bound = listener.local_addr().map_or(port, |addr| addr.port());
+            (cluster::InboundLinks::Listener(listener), None, bound)
         }
         None => {
             tracing::info!(
                 "[WSE-Cluster] single_port: cluster links come in on the WebSocket port"
             );
             let (tx, rx) = mpsc::unbounded_channel();
-            (cluster::InboundLinks::MainPort(rx), Some(tx))
+            let port = shared.listen_port.load(Ordering::Relaxed);
+            (cluster::InboundLinks::MainPort(rx), Some(tx), port)
         }
+    };
+    // Where peers reach this node, as its HELLO says: a node that comes up
+    // there anew is known for one, whichever of the two dials.
+    let reached_at = match (&settings.cluster_addr, links_port) {
+        (Some(addr), _) => addr.clone(),
+        (None, 0) => String::new(),
+        (None, port) => format!(":{port}"),
     };
 
     let tls_holder = Some(Arc::new(arc_swap::ArcSwap::from_pointee(tls_config)));
@@ -229,6 +240,7 @@ pub(crate) fn connect(
         heard: Arc::new(dashmap::DashMap::new()),
         incarnations: Arc::new(dashmap::DashMap::new()),
         leaving: tokio_util::sync::CancellationToken::new(),
+        reached_at,
     };
 
     // Waited for when the run ends: the node leaves the cluster then.

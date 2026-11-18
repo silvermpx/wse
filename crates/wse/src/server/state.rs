@@ -717,6 +717,9 @@ pub(crate) struct SharedState {
     pub(super) cluster_cmd_tx: arc_swap::ArcSwapOption<mpsc::UnboundedSender<ClusterCommand>>,
     /// The cluster manager's task, while this node is in a cluster.
     pub(super) cluster_task: parking_lot::Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// The port the server listens on, while it runs: where peers' links
+    /// come in in single-port mode.
+    pub(super) listen_port: std::sync::atomic::AtomicU16,
     pub(crate) cluster_metrics: Arc<ClusterMetrics>,
     pub(super) cluster_dlq: Arc<std::sync::Mutex<ClusterDlq>>,
     pub(crate) cluster_instance_id: std::sync::Mutex<Option<String>>,
@@ -975,6 +978,7 @@ impl SharedState {
             conn_topics: DashMap::new(),
             cluster_cmd_tx: arc_swap::ArcSwapOption::empty(),
             cluster_task: parking_lot::Mutex::new(None),
+            listen_port: std::sync::atomic::AtomicU16::new(0),
             cluster_metrics: Arc::new(ClusterMetrics::new()),
             cluster_dlq: Arc::new(std::sync::Mutex::new(ClusterDlq::new(1000))),
             cluster_instance_id: std::sync::Mutex::new(None),

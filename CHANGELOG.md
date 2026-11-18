@@ -209,6 +209,12 @@ server every client is checked against.
   for a message is made again, and catches up, instead of dropping it. A
   node that went without SHUTDOWN while its link was down, another node now
   at its address, is no longer taken to have published nothing meanwhile.
+- Cluster: a node that comes up anew at the address of one that went
+  without SHUTDOWN is known for one also when it is the node that dials
+  (its HELLO says where it is reached), and while the link of the one gone
+  still looks up; a client whose last message of a topic came from this
+  node's own stream, or through a pattern, is no longer told it missed
+  nothing then.
 - Cluster: a node that stops no longer loses what it published just before
   the stop. Its run leaves the cluster once it takes no more publishes,
   after every one it took, and waits (two seconds at most) for each link to

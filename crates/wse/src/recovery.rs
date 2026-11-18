@@ -1617,6 +1617,8 @@ impl RecoveryManager {
     /// its place: what it published that this node did not hear of is gone,
     /// in any topic this node has or holds a stream of.
     pub(crate) fn lost_everything(&self) {
+        // Every topic a client here can have a position in: one of this
+        // node's own included, a pattern's as much as one named.
         let mut topics: Vec<String> = self
             .interest_since
             .iter()
@@ -1627,6 +1629,8 @@ impl RecoveryManager {
                     .iter()
                     .map(|entry| foreign_topic(entry.key()).to_owned()),
             )
+            .chain(self.buffers.iter().map(|entry| entry.key().clone()))
+            .chain(self.local_buffers.iter().map(|entry| entry.key().clone()))
             .filter(|topic| !crate::server::is_pattern(topic))
             .collect();
         topics.sort_unstable();
@@ -2694,6 +2698,34 @@ mod tests {
 
     fn not_recovered(result: &RecoveryResult) -> bool {
         matches!(result, RecoveryResult::NotRecovered { .. })
+    }
+
+    /// A node gone without a word, another in its place: a client whose
+    /// last message came from this node's own stream, published to the
+    /// cluster or to its own subscribers only, is not told it missed nothing
+    /// either (a pattern of its may have covered what the gone one sent).
+    #[test]
+    fn a_node_lost_anew_leaves_no_topic_here_said_whole() {
+        let mgr = RecoveryManager::new(RecoveryConfig::default());
+        mgr.push("news", make_data("0"));
+        mgr.push_stamped_local("local", |_, _| make_data("0"));
+        let (news, _) = mgr.get_position("news").unwrap();
+        let (local, _) = mgr.get_position("local").unwrap();
+        assert!(!not_recovered(&mgr.recover("news", news, 0)));
+        assert!(!not_recovered(&mgr.recover("local", local, 0)));
+        mgr.lost_everything();
+        assert!(not_recovered(&mgr.recover("news", news, 0)));
+        assert!(not_recovered(&mgr.recover_streams(
+            "news",
+            (news, 0),
+            &[(news, 0)]
+        )));
+        assert!(not_recovered(&mgr.recover("local", local, 0)));
+        assert!(not_recovered(&mgr.recover_streams(
+            "local",
+            (local, 0),
+            &[(local, 0)]
+        )));
     }
 
     #[test]

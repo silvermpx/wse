@@ -221,7 +221,7 @@ fn test_encode_decode_ping_pong() {
 #[test]
 fn test_encode_decode_hello() {
     let mut buf = BytesMut::new();
-    encode_hello(&mut buf, "instance-abc-123", CAP_INTEREST_ROUTING);
+    encode_hello(&mut buf, "instance-abc-123", CAP_INTEREST_ROUTING, "");
     let frame = decode_frame(buf).unwrap();
     assert_eq!(
         frame,
@@ -229,8 +229,90 @@ fn test_encode_decode_hello() {
             instance_id: "instance-abc-123".into(),
             protocol_version: 1,
             capabilities: CAP_INTEREST_ROUTING,
+            reached_at: None,
         }
     );
+}
+
+/// A node from 3.2 says where it is reached; one before reads no further
+/// than the capabilities, and its own HELLO says nothing of it.
+#[test]
+fn a_hello_says_where_its_node_is_reached_and_one_before_says_nothing() {
+    let mut buf = BytesMut::new();
+    encode_hello(&mut buf, "node-a", CAP_INTEREST_ROUTING, ":7001");
+    let ClusterFrame::Hello { reached_at, .. } = decode_frame(buf.clone()).unwrap() else {
+        panic!("not a HELLO");
+    };
+    assert_eq!(reached_at.as_deref(), Some(":7001"));
+    // The same HELLO as a node before 3.2 sends it: nothing after the
+    // capabilities.
+    let mut before = buf;
+    before.truncate(before.len() - 2 - ":7001".len());
+    let payload = u32::try_from(before.len() - 8).unwrap();
+    before[4..8].copy_from_slice(&payload.to_le_bytes());
+    let ClusterFrame::Hello {
+        instance_id,
+        capabilities,
+        reached_at,
+        ..
+    } = decode_frame(before).unwrap()
+    else {
+        panic!("not a HELLO");
+    };
+    assert_eq!(
+        (instance_id.as_str(), capabilities, reached_at),
+        ("node-a", CAP_INTEREST_ROUTING, None)
+    );
+}
+
+/// Where a node that dialed in is reached: the address it names, or the
+/// port it names on the address its link came from.
+#[test]
+fn a_node_that_dialed_in_is_known_by_where_it_is_reached() {
+    let from: std::net::SocketAddr = "10.0.0.3:51234".parse().unwrap();
+    let from_v6: std::net::SocketAddr = "[::1]:51234".parse().unwrap();
+    let slot = super::inbound::reached_slot;
+    assert_eq!(slot(Some(":7000"), from).as_deref(), Some("10.0.0.3:7000"));
+    assert_eq!(slot(Some(":7000"), from_v6).as_deref(), Some("[::1]:7000"));
+    assert_eq!(
+        slot(Some("node-a.internal:7000"), from).as_deref(),
+        Some("node-a.internal:7000")
+    );
+    assert_eq!(slot(None, from), None);
+    assert_eq!(slot(Some(":0"), from), None);
+    assert_eq!(slot(Some(":port"), from), None);
+}
+
+/// A node gone, another in its place: what it published after what was
+/// heard may be gone with it unless it said SHUTDOWN, or caught up since
+/// its last link ended; a link that still looks up and said nothing counts
+/// as gone without a word.
+#[test]
+fn a_node_is_gone_without_a_word_unless_it_said_so_or_caught_up() {
+    use super::Heard;
+    let still_up = Heard::default();
+    still_up.linked();
+    assert!(still_up.gone_unclean(), "its end has not come through");
+    still_up.shut_down();
+    assert!(!still_up.gone_unclean(), "it said SHUTDOWN");
+
+    let clean = Heard::default();
+    clean.linked();
+    clean.shut_down();
+    clean.ended();
+    assert!(!clean.gone_unclean());
+
+    let unclean = Heard::default();
+    unclean.linked();
+    unclean.ended();
+    assert!(unclean.gone_unclean());
+    unclean.caught_up(5);
+    assert!(!unclean.gone_unclean(), "back, and caught up");
+
+    let never_linked = Heard::default();
+    assert!(!never_linked.gone_unclean());
+    never_linked.ended();
+    assert!(never_linked.gone_unclean(), "an end without SHUTDOWN");
 }
 
 #[test]
@@ -519,7 +601,7 @@ async fn test_two_peers_exchange_hello() {
 
         // Send HELLO
         let mut hello = BytesMut::new();
-        encode_hello(&mut hello, "peer-a", LOCAL_CAPABILITIES);
+        encode_hello(&mut hello, "peer-a", LOCAL_CAPABILITIES, "");
         let mut frame = BytesMut::new();
         write_framed(&mut frame, &hello);
         write.write_all(&frame).await.unwrap();
@@ -552,7 +634,7 @@ async fn test_two_peers_exchange_hello() {
 
     // Send HELLO back
     let mut hello = BytesMut::new();
-    encode_hello(&mut hello, "peer-b", LOCAL_CAPABILITIES);
+    encode_hello(&mut hello, "peer-b", LOCAL_CAPABILITIES, "");
     let mut frame = BytesMut::new();
     write_framed(&mut frame, &hello);
     write.write_all(&frame).await.unwrap();
@@ -640,6 +722,7 @@ fn test_encode_decode_hello_with_capabilities() {
         &mut buf,
         "test-node",
         CAP_INTEREST_ROUTING | CAP_COMPRESSION,
+        "node.internal:7000",
     );
     let frame = decode_frame(buf).unwrap();
     assert_eq!(
@@ -648,6 +731,7 @@ fn test_encode_decode_hello_with_capabilities() {
             instance_id: "test-node".into(),
             protocol_version: 1,
             capabilities: CAP_INTEREST_ROUTING | CAP_COMPRESSION,
+            reached_at: Some("node.internal:7000".into()),
         }
     );
 }
@@ -843,7 +927,7 @@ async fn test_tls_cluster_hello_roundtrip() {
 
         // Send HELLO back
         let mut hello_buf = BytesMut::new();
-        encode_hello(&mut hello_buf, "server-id", LOCAL_CAPABILITIES);
+        encode_hello(&mut hello_buf, "server-id", LOCAL_CAPABILITIES, "");
         let mut framed = BytesMut::new();
         write_framed(&mut framed, &hello_buf);
         tokio::io::AsyncWriteExt::write_all(&mut tls_stream, &framed)
@@ -866,7 +950,7 @@ async fn test_tls_cluster_hello_roundtrip() {
 
         // Send HELLO
         let mut hello_buf = BytesMut::new();
-        encode_hello(&mut hello_buf, "client-id", LOCAL_CAPABILITIES);
+        encode_hello(&mut hello_buf, "client-id", LOCAL_CAPABILITIES, "");
         let mut framed = BytesMut::new();
         write_framed(&mut framed, &hello_buf);
         tokio::io::AsyncWriteExt::write_all(&mut tls_stream, &framed)
@@ -1040,7 +1124,7 @@ async fn test_peer_exchange_discovery() {
 
         // Send HELLO
         let mut hello = BytesMut::new();
-        encode_hello(&mut hello, "node-a", LOCAL_CAPABILITIES);
+        encode_hello(&mut hello, "node-a", LOCAL_CAPABILITIES, "");
         let mut frame = BytesMut::new();
         write_framed(&mut frame, &hello);
         write.write_all(&frame).await.unwrap();
@@ -1090,7 +1174,7 @@ async fn test_peer_exchange_discovery() {
 
     // Send HELLO back
     let mut hello = BytesMut::new();
-    encode_hello(&mut hello, "node-b", LOCAL_CAPABILITIES);
+    encode_hello(&mut hello, "node-b", LOCAL_CAPABILITIES, "");
     let mut frame = BytesMut::new();
     write_framed(&mut frame, &hello);
     write.write_all(&frame).await.unwrap();

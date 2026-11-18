@@ -391,6 +391,30 @@ pub(super) async fn peer_reader<R: AsyncReadExt + Unpin>(
     }
 }
 
+/// The instance met at `slot`, the address a node is reached at. Another
+/// instance there than the one met last means that one is gone: unless it
+/// said SHUTDOWN, or caught up since its last link ended, what it published
+/// after what was heard of it is gone too, and a client here whose last
+/// message came before is not told it missed nothing.
+pub(super) fn met_at(ctx: &ClusterContext, slot: &str, instance: &str) {
+    let before = ctx
+        .incarnations
+        .insert(slot.to_owned(), instance.to_owned());
+    let Some(before) = before.filter(|before| before != instance) else {
+        return;
+    };
+    let gone_unclean = ctx
+        .heard
+        .remove(&before)
+        .is_some_and(|(_, heard)| heard.gone_unclean());
+    if gone_unclean && let Some(rm) = &ctx.recovery {
+        tracing::warn!(
+            "[WSE-Cluster] {slot} is another node now, and the last went without SHUTDOWN: what it published meanwhile is gone"
+        );
+        rm.lost_everything();
+    }
+}
+
 /// Hand an update to the manager, waiting while its queue is full: a peer
 /// sending faster than the manager keeps up is slowed down at its socket,
 /// not buffered without bound. False once the link ends.
@@ -920,7 +944,7 @@ where
 
     let local_caps = local_capabilities(ctx);
     let mut hello_buf = BytesMut::new();
-    encode_hello(&mut hello_buf, instance_id, local_caps);
+    encode_hello(&mut hello_buf, instance_id, local_caps, &ctx.reached_at);
     let mut frame = BytesMut::new();
     write_framed(&mut frame, &hello_buf);
     if writer.write_all(&frame).await.is_err() || writer.flush().await.is_err() {
@@ -949,6 +973,7 @@ where
             instance_id: peer_id,
             protocol_version,
             capabilities,
+            ..
         }) => match negotiate_version(PROTOCOL_VERSION, protocol_version) {
             Some(v) => (peer_id, v, negotiate_capabilities(local_caps, capabilities)),
             None => {
@@ -964,26 +989,7 @@ where
         }
     };
 
-    // Another node at this address than the one met there last, which went
-    // without SHUTDOWN: what that one published after what was heard of it
-    // is gone, and a client here whose last message came before it is not
-    // told it missed nothing.
-    let before = ctx
-        .incarnations
-        .insert(peer_addr.to_owned(), peer_instance_id.clone());
-    if let Some(before) = before
-        && before != peer_instance_id
-        && ctx
-            .heard
-            .remove(&before)
-            .is_some_and(|(_, heard)| heard.unclean())
-        && let Some(rm) = &ctx.recovery
-    {
-        tracing::warn!(
-            "[WSE-Cluster] {peer_addr} is another node now, and the last went without SHUTDOWN: what it published meanwhile is gone"
-        );
-        rm.lost_everything();
-    }
+    met_at(ctx, peer_addr, &peer_instance_id);
 
     let peer_cancel = global_cancel.child_token();
     let session_gen = PEER_SESSION_GENERATION.fetch_add(1, Ordering::AcqRel);
@@ -1022,6 +1028,7 @@ where
     } else {
         None
     };
+    heard.linked();
 
     tracing::info!(
         "[WSE-Cluster] Connected to {peer_addr} (v{peer_version}, caps=0x{peer_caps:08x})"

@@ -39,9 +39,10 @@ pub(crate) struct Started {
 
 /// Start `shared`'s server on the current runtime: its lanes run from here
 /// on, its commands queue until `serve` takes them.
-pub(crate) fn start<H: Handler>(shared: &Arc<SharedState>, handler: &Arc<H>) -> Started {
+pub(crate) fn start<H: Handler>(shared: &Arc<SharedState>, handler: &Arc<H>, port: u16) -> Started {
     // A drain of the last run is over.
     shared.draining.store(false, Ordering::SeqCst);
+    shared.listen_port.store(port, Ordering::Relaxed);
     *shared.started_at.lock() = Some(std::time::Instant::now());
     let fanout = Fanout::start(
         shared.topics.clone(),

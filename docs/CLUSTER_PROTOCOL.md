@@ -71,9 +71,13 @@ Sent every 5 seconds. A peer that receives no data (including PONG responses) fo
 [2 bytes: instance_id length (little-endian u16)]
 [variable: instance_id (UUID string)]
 [4 bytes: capabilities bitmask (little-endian u32)]
+[2 bytes: reached_at length (little-endian u16), from 3.2]
+[variable: reached_at (UTF-8, at most 255 bytes)]
 ```
 
 The magic bytes `WSE\x00` prevent accidental connections from non-WSE services. The protocol version field enables forward-compatible upgrades - both peers use the minimum of their advertised versions.
+
+`reached_at` says where the node's peers reach it: its cluster address (`cluster_addr`), or `:port`, the port its peers' links come in on, on the address its own links come from. A node that takes a link in knows the dialer by it as a dialer knows a node by the address it dials. A node before 3.2 sends none and reads no further than the capabilities.
 
 **Capabilities**:
 
@@ -267,7 +271,7 @@ Sent after the catch-up that follows a RESUME with topics (CAP_RESUME_TOPICS): t
 
 The last frame of a catch-up with CAP_ARRIVAL: everything the sender published to the cluster up to this arrival number reached the receiver before it, replayed or told LOST. Once it delivered what came before the frame, the receiver takes it as the last arrival it heard of the sender, and its next RESUME request starts there: a loss told once is not told again.
 
-A node that comes back after a lost link catches up from where the other left off. One that does not, because it stopped without its link up to say SHUTDOWN and another node now answers at its address, took what it published meanwhile with it: the node that dials that address takes each topic it has, or holds a stream of, as not kept from then on, and a client whose last message came before it resyncs. One that said SHUTDOWN had sent everything first.
+A node that comes back after a lost link catches up from where the other left off. One that does not, because it stopped without its link up to say SHUTDOWN and another node now answers at its address, took what it published meanwhile with it. The other node sees that whichever of the two dials (by the address it dials, or by the `reached_at` of the HELLO of a node that dials in), also while the link of the one gone still looks up and has not said SHUTDOWN: it takes each topic it has, holds a stream of, or published to itself (one a pattern covers included) as not kept from then on, and a client whose last message came before it resyncs. One that said SHUTDOWN had sent everything first.
 
 ## Interest-Based Routing
 

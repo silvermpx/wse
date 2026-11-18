@@ -67,7 +67,8 @@ impl Server {
             return Err(Error::Running);
         }
         let handler = Arc::new(handler);
-        let started = run::start(&self.shared, &handler);
+        let port = listener.local_addr().map_or(0, |addr| addr.port());
+        let started = run::start(&self.shared, &handler, port);
         self.running.store(true, Ordering::SeqCst);
         *task = Some(tokio::spawn(run::serve(
             Arc::clone(&self.shared),

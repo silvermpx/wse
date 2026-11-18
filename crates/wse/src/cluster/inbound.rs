@@ -16,7 +16,7 @@ use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 
 use super::peer::{
-    exchange_resume, go_live, heartbeat_task, peer_dispatch_task, peer_reader, peer_writer,
+    exchange_resume, go_live, heartbeat_task, met_at, peer_dispatch_task, peer_reader, peer_writer,
     read_frame, tell_disconnected,
 };
 use super::protocol::write_framed;
@@ -213,6 +213,21 @@ pub(super) async fn accept_cluster_links(
 // Inbound cluster connection handler (generic over transport)
 // ---------------------------------------------------------------------------
 
+/// Where a peer that dialed in is reached: the address its HELLO names, or
+/// the port it names on the address its link came from. None from a node
+/// before 3.2.
+pub(super) fn reached_slot(reached_at: Option<&str>, from: SocketAddr) -> Option<String> {
+    let at = reached_at?;
+    match at.strip_prefix(':') {
+        Some(port) => port
+            .parse::<u16>()
+            .ok()
+            .filter(|port| *port != 0)
+            .map(|port| SocketAddr::new(from.ip(), port).to_string()),
+        None => Some(at.to_owned()),
+    }
+}
+
 /// Handle inbound cluster peer connection. Generic over stream type (TLS or plaintext).
 async fn handle_cluster_inbound_generic<S>(
     stream: S,
@@ -240,13 +255,19 @@ async fn handle_cluster_inbound_generic<S>(
             _ => None,
         };
 
-    let (peer_instance_id, _peer_version, peer_caps) = match peer_hello {
+    let (peer_instance_id, _peer_version, peer_caps, reached_at) = match peer_hello {
         Some(ClusterFrame::Hello {
             instance_id: peer_id,
             protocol_version,
             capabilities,
+            reached_at,
         }) => match negotiate_version(PROTOCOL_VERSION, protocol_version) {
-            Some(v) => (peer_id, v, negotiate_capabilities(local_caps, capabilities)),
+            Some(v) => (
+                peer_id,
+                v,
+                negotiate_capabilities(local_caps, capabilities),
+                reached_at,
+            ),
             None => {
                 tracing::warn!(
                     "[WSE-Cluster] Version mismatch with inbound {addr}: local={PROTOCOL_VERSION}, remote={protocol_version}"
@@ -259,6 +280,11 @@ async fn handle_cluster_inbound_generic<S>(
             return;
         }
     };
+    // Another node where the peer is reached than the one met there last:
+    // a node anew in its place, as when this node dials it.
+    if let Some(slot) = reached_slot(reached_at.as_deref(), addr) {
+        met_at(&ctx, &slot, &peer_instance_id);
+    }
 
     if !admitted.session() {
         tracing::warn!(
@@ -285,7 +311,7 @@ async fn handle_cluster_inbound_generic<S>(
             // this address.
             tracing::debug!("[WSE-Cluster] Closing inbound from {addr}: it is this node");
             let mut hello_buf = BytesMut::new();
-            encode_hello(&mut hello_buf, instance_id, local_caps);
+            encode_hello(&mut hello_buf, instance_id, local_caps, &ctx.reached_at);
             let mut frame = BytesMut::new();
             write_framed(&mut frame, &hello_buf);
             let _ = writer.write_all(&frame).await;
@@ -302,7 +328,7 @@ async fn handle_cluster_inbound_generic<S>(
 
     // Send our HELLO response
     let mut hello_buf = BytesMut::new();
-    encode_hello(&mut hello_buf, instance_id, local_caps);
+    encode_hello(&mut hello_buf, instance_id, local_caps, &ctx.reached_at);
     let mut frame = BytesMut::new();
     write_framed(&mut frame, &hello_buf);
     if writer.write_all(&frame).await.is_err() || writer.flush().await.is_err() {
@@ -325,6 +351,7 @@ async fn handle_cluster_inbound_generic<S>(
     } else {
         None
     };
+    heard.linked();
 
     // This node's interest (RESYNC) and presence follow from the manager once
     // the link is registered, in order with every change after them.

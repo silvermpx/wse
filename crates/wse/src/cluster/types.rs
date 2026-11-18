@@ -191,6 +191,10 @@ pub(crate) struct ClusterContext {
     /// Cancelled once this node leaves the cluster: every link ends, the
     /// ones that may saying SHUTDOWN.
     pub leaving: CancellationToken,
+    /// Where peers reach this node, as its HELLO says: its cluster address,
+    /// or `:port`, the port their links come in on, on the address this
+    /// node's links come from.
+    pub reached_at: String,
 }
 
 /// What a node heard of a peer: the last of the peer's arrivals it heard of
@@ -203,6 +207,8 @@ pub(crate) struct Heard {
     shed: std::sync::atomic::AtomicBool,
     /// The current link's peer said SHUTDOWN.
     shut_down: std::sync::atomic::AtomicBool,
+    /// The peer's links up now.
+    links: std::sync::atomic::AtomicUsize,
     /// The last link ended without SHUTDOWN, and no catch-up from the peer
     /// came since: what it published after `through` reaches this node only
     /// if it comes back.
@@ -235,8 +241,18 @@ impl Heard {
         self.shut_down.store(true, Ordering::Relaxed);
     }
 
+    /// A link to the peer is up.
+    pub(crate) fn linked(&self) {
+        self.links.fetch_add(1, Ordering::Relaxed);
+    }
+
     /// The link to the peer ended.
     pub(crate) fn ended(&self) {
+        let _ = self
+            .links
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |links| {
+                Some(links.saturating_sub(1))
+            });
         let clean = self.shut_down.swap(false, Ordering::Relaxed);
         self.unclean.store(!clean, Ordering::Relaxed);
     }
@@ -244,6 +260,16 @@ impl Heard {
     /// The last link ended without SHUTDOWN, and no catch-up came since.
     pub(crate) fn unclean(&self) -> bool {
         self.unclean.load(Ordering::Relaxed)
+    }
+
+    /// The peer is gone (another node answers where it was), and what it
+    /// published after what this node heard of it may be gone with it: its
+    /// last link ended without SHUTDOWN and no catch-up came since, or a
+    /// link of it still looks up and has not said SHUTDOWN (its end has not
+    /// come through yet).
+    pub(crate) fn gone_unclean(&self) -> bool {
+        self.unclean()
+            || (self.links.load(Ordering::Relaxed) > 0 && !self.shut_down.load(Ordering::Relaxed))
     }
 
     /// Where the next catch-up starts from: named in the request, after

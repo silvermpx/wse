@@ -201,13 +201,15 @@ def test_relayed_messages_carry_the_position_they_got_at_their_origin(nodes):
 
 class Blink:
     """A TCP proxy in front of a node's cluster port that can drop every link
-    through it and refuse new ones for a while."""
+    through it and refuse new ones for a while, or let its links go quiet."""
 
     def __init__(self, target):
         self.target = target
         self.port = _next_port()
         self.open = True
         self.links = set()
+        self.frozen = set()
+        self.quiet = asyncio.Event()
 
     @property
     def addr(self):
@@ -227,13 +229,20 @@ class Blink:
         async def pipe(src, dst):
             try:
                 while data := await src.read(65536):
+                    if pair in self.frozen:
+                        await self.quiet.wait()
+                        return
                     dst.write(data)
                     await dst.drain()
+                if pair in self.frozen:
+                    await self.quiet.wait()
+                    return
                 # The other side closed: so does this one, after what it sent.
                 if dst.can_write_eof():
                     dst.write_eof()
             except ConnectionError:
-                dst.transport.abort()
+                if pair not in self.frozen:
+                    dst.transport.abort()
 
         await asyncio.gather(pipe(down_reader, up_writer), pipe(up_reader, down_writer))
         for writer in pair:
@@ -246,8 +255,15 @@ class Blink:
             down.transport.abort()
             up.transport.abort()
 
+    def freeze(self):
+        """Its links go quiet, as if a far end were gone without a word:
+        nothing more crosses them, and nothing closes them, until close().
+        New links go through."""
+        self.frozen.update(self.links)
+
     def close(self):
         self.cut()
+        self.quiet.set()
         self.server.close()
 
 
@@ -890,6 +906,130 @@ def test_a_node_that_stopped_saying_so_and_came_back_anew_lost_nothing(nodes):
 
     for answer, numbers in asyncio.run(scenario()):
         assert answer["recovered"] is True and numbers == [], answer
+
+
+def test_a_node_back_anew_that_dials_in_itself_is_never_taken_to_have_lost_nothing(nodes):
+    """The origin is the node that dials, and so is the node that comes up at
+    its address: the other node takes their links in, and still knows the
+    one it had is gone with what it published while its link was down."""
+    websockets = pytest.importorskip("websockets")
+    relay = nodes(recovery=True)
+    relay.join()
+    origin = nodes(recovery=True)
+
+    async def scenario():
+        blink = Blink(relay)
+        await blink.start()
+        try:
+            origin.join(blink)
+            await until(lambda: origin.peers == 1 and relay.peers == 1)
+            async with websockets.connect(f"ws://127.0.0.1:{relay.port}/wse") as live:
+                await subscribe_next_client(relay, ["news", "barrier"])
+                await asyncio.sleep(0.35)  # the SUB reaches the origin
+                origin.server.broadcast("news", json.dumps({"t": "news", "p": {"n": 1}}))
+                (anchor,) = await messages_of_type(live, "news", 1)
+                blink.cut()
+                await until(lambda: origin.peers == 0 and relay.peers == 0)
+                origin.server.broadcast("news", json.dumps({"t": "news", "p": {"n": 2}}))
+                await asyncio.sleep(0.2)
+                origin.stop()
+                anew = nodes(recovery=True)
+                anew.cluster_port = origin.cluster_port
+                blink.open = True
+                anew.join(blink)
+                await until(lambda: anew.peers == 1 and relay.peers == 1, timeout=20.0)
+                await asyncio.sleep(0.4)
+                anew.server.broadcast("barrier", json.dumps({"t": "barrier", "p": {"n": 3}}))
+                await messages_of_type(live, "barrier", 1)
+            return await _recovered_both_ways(relay, anchor, websockets)
+        finally:
+            blink.close()
+
+    for answer, numbers in asyncio.run(scenario()):
+        assert answer["recovered"] is False or 2 in numbers, answer
+
+
+def test_a_node_back_anew_while_its_last_link_still_looks_up_is_never_taken_to_have_lost_nothing(nodes):
+    """The origin goes while the other node still holds its link, its end
+    never come through, and the node that comes up at its address dials in:
+    the other node takes it that the one it had went without SHUTDOWN."""
+    websockets = pytest.importorskip("websockets")
+    relay = nodes(recovery=True)
+    relay.join()
+    origin = nodes(recovery=True)
+
+    async def scenario():
+        blink = Blink(relay)
+        await blink.start()
+        try:
+            origin.join(blink)
+            await until(lambda: origin.peers == 1 and relay.peers == 1)
+            async with websockets.connect(f"ws://127.0.0.1:{relay.port}/wse") as live:
+                await subscribe_next_client(relay, ["news", "barrier"])
+                await asyncio.sleep(0.35)  # the SUB reaches the origin
+                origin.server.broadcast("news", json.dumps({"t": "news", "p": {"n": 1}}))
+                (anchor,) = await messages_of_type(live, "news", 1)
+                blink.freeze()
+                origin.server.broadcast("news", json.dumps({"t": "news", "p": {"n": 2}}))
+                await asyncio.sleep(0.2)
+                origin.stop()
+                assert relay.peers == 1  # the link it had still looks up
+                anew = nodes(recovery=True)
+                anew.cluster_port = origin.cluster_port
+                anew.join(blink)
+                await until(lambda: anew.peers == 1, timeout=20.0)
+                await asyncio.sleep(0.4)
+                anew.server.broadcast("barrier", json.dumps({"t": "barrier", "p": {"n": 3}}))
+                await messages_of_type(live, "barrier", 1)
+            return await _recovered_both_ways(relay, anchor, websockets)
+        finally:
+            blink.close()
+
+    for answer, numbers in asyncio.run(scenario()):
+        assert answer["recovered"] is False or 2 in numbers, answer
+
+
+def test_a_pattern_subscriber_is_never_told_it_lost_nothing_when_a_node_is_back_anew(nodes):
+    """A client subscribed by a pattern took a message this node published
+    to its own subscribers; the origin publishes to that topic while its link
+    is down and goes, a new node at its address: the client is not told it
+    missed nothing."""
+    websockets = pytest.importorskip("websockets")
+    origin = nodes(recovery=True)
+    relay = nodes(recovery=True)
+    origin.join()
+
+    async def scenario():
+        blink = Blink(origin)
+        await blink.start()
+        try:
+            relay.join(blink)
+            await until(lambda: origin.peers == 1 and relay.peers == 1)
+            async with websockets.connect(f"ws://127.0.0.1:{relay.port}/wse") as live:
+                await subscribe_next_client(relay, ["n*", "barrier"])
+                await asyncio.sleep(0.35)  # the SUB reaches the origin
+                relay.server.broadcast_local("news", json.dumps({"t": "news", "p": {"n": 1}}))
+                (anchor,) = await messages_of_type(live, "news", 1)
+                blink.cut()
+                await until(lambda: origin.peers == 0 and relay.peers == 0)
+                origin.server.broadcast("news", json.dumps({"t": "news", "p": {"n": 2}}))
+                await asyncio.sleep(0.2)
+                origin.stop()
+                anew = nodes(recovery=True)
+                anew.cluster_port = origin.cluster_port
+                anew.join()
+                blink.target = anew
+                blink.open = True
+                await until(lambda: anew.peers == 1 and relay.peers == 1, timeout=20.0)
+                await asyncio.sleep(0.4)
+                anew.server.broadcast("barrier", json.dumps({"t": "barrier", "p": {"n": 3}}))
+                await messages_of_type(live, "barrier", 1)
+            return await _recovered_both_ways(relay, anchor, websockets)
+        finally:
+            blink.close()
+
+    for answer, numbers in asyncio.run(scenario()):
+        assert answer["recovered"] is False or 2 in numbers, answer
 
 
 def test_a_message_its_origin_had_no_room_to_keep_is_never_said_recovered(nodes):

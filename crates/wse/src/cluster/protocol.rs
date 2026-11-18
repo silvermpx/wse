@@ -244,9 +244,23 @@ pub(crate) fn encode_pong(buf: &mut BytesMut) {
 
 /// Encode a HELLO frame.
 /// Payload: magic(4) + version(2) + id_len(2) + id_bytes(N) + capabilities(4)
-pub(crate) fn encode_hello(buf: &mut BytesMut, instance_id: &str, capabilities: u32) {
+/// HELLO: the node's instance, protocol version and capabilities, and where
+/// its peers reach it (`reached_at`: its cluster address, or `:port`, the
+/// port on the address its links come from; empty when it does not say). A
+/// node before 3.2 reads no further than the capabilities.
+pub(crate) fn encode_hello(
+    buf: &mut BytesMut,
+    instance_id: &str,
+    capabilities: u32,
+    reached_at: &str,
+) {
     let id_bytes = instance_id.as_bytes();
-    let payload_len = 4 + 2 + 2 + id_bytes.len() + 4;
+    let at = if reached_at.len() <= MAX_REACHED_AT {
+        reached_at.as_bytes()
+    } else {
+        &[]
+    };
+    let payload_len = 4 + 2 + 2 + id_bytes.len() + 4 + 2 + at.len();
     buf.reserve(8 + payload_len);
     // Header
     buf.put_u8(MsgType::Hello as u8);
@@ -259,7 +273,12 @@ pub(crate) fn encode_hello(buf: &mut BytesMut, instance_id: &str, capabilities: 
     buf.put_u16_le(id_bytes.len() as u16);
     buf.put_slice(id_bytes);
     buf.put_u32_le(capabilities);
+    buf.put_u16_le(at.len() as u16);
+    buf.put_slice(at);
 }
+
+/// The longest address a HELLO says the node is reached at.
+const MAX_REACHED_AT: usize = 255;
 
 /// Encode a SHUTDOWN frame (header only, 8 bytes).
 pub(crate) fn encode_shutdown(buf: &mut BytesMut) {
@@ -723,6 +742,9 @@ pub(crate) enum ClusterFrame {
         instance_id: String,
         protocol_version: u16,
         capabilities: u32,
+        /// Where the node is reached: its cluster address, or `:port` on the
+        /// address its links come from. None from a node before 3.2.
+        reached_at: Option<String>,
     },
     Shutdown,
     Sub {
@@ -931,10 +953,16 @@ pub(crate) fn decode_frame(mut data: BytesMut) -> Option<ClusterFrame> {
             }
             let instance_id = String::from_utf8(data.split_to(id_len).to_vec()).ok()?;
             let capabilities = data.get_u32_le();
+            // Where the node is reached, from 3.2 on.
+            let reached_at = (data.remaining() >= 2)
+                .then(|| data.get_u16_le() as usize)
+                .filter(|len| *len > 0 && *len <= MAX_REACHED_AT && data.remaining() >= *len)
+                .and_then(|len| String::from_utf8(data.split_to(len).to_vec()).ok());
             Some(ClusterFrame::Hello {
                 instance_id,
                 protocol_version: version,
                 capabilities,
+                reached_at,
             })
         }
         Some(MsgType::Shutdown) => Some(ClusterFrame::Shutdown),

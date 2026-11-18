@@ -123,7 +123,8 @@ impl RustWSEServer {
         // The lanes run from here on, on the server's runtime.
         let started = {
             let _runtime = rt.enter();
-            run::start(&self.shared, &handler)
+            let port = listener.local_addr().map_or(0, |addr| addr.port());
+            run::start(&self.shared, &handler, port)
         };
         self.cmd_tx
             .store(Some(Arc::new(Publisher::waiting(Arc::clone(&self.shared)))));
