@@ -167,7 +167,11 @@ describe('Tauri, its commands in flight', () => {
         if (frames.some((f) => f.k === 'hello')) {
           handler!.onmessage({ k: 'welcome', v: 1, att: 1, limits: {}, realm: 'test', account: { epoch: 0, user: 'ann' }, conn, gen: 1 });
         }
-        if (frames.some((f) => f.k === 'signOut')) await held;
+        if (frames.some((f) => f.k === 'signOut')) {
+          await held;
+          // The owner signs every window out, this one with it.
+          handler!.onmessage({ k: 'revoked', reason: 'signed_out' });
+        }
         return undefined as T;
       },
     };

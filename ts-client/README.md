@@ -235,14 +235,14 @@ and hears its topics broke off (`wseOverloaded`; a recover-or-resync window resy
 window's sends go through the owner's outbox (`send` says `queued`; a live one `sent` once it is
 handed to the owner, which writes it at once or says `wseNotDelivered`, `dropped`), and what became
 of each (`wseDelivered`, `wseNotDelivered`) reaches that window alone, whatever ids the windows
-chose: when the user signs out, what the server answered already, paused or behind as the window may
-be, then `cleared` for the rest the owner held; a send from a listener of it is `dropped`. What
-depends on the application stays in the window: its listeners, the delivery's barrier, resync,
-commit and checkpoint, the sends that wait for their topics; after a reconnect, a window's send that
-requires topics waits in the owner's outbox until that window resynced them. A window's `pause`
-holds back its stream and gives its share of the connection back, so the connection ends when no one
-else holds one, as a client of its own does; `signOut` signs every window out. No frame carries a
-token, a key or a cookie.
+chose: when the user signs out (a window's `signOut` goes through the owner, which signs every
+window out), what the server answered already, paused or behind as the window may be, then `cleared`
+for the rest the owner held; a send from then on is `dropped`. What depends on the application stays
+in the window: its listeners, the delivery's barrier, resync, commit and checkpoint, the sends that
+wait for their topics; after a reconnect, a window's send that requires topics waits in the owner's
+outbox until that window resynced them. A window's `pause` holds back its stream and gives its share
+of the connection back, so the connection ends when no one else holds one, as a client of its own
+does; `signOut` signs every window out. No frame carries a token, a key or a cookie.
 
 ## Electron
 

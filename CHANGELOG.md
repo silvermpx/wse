@@ -155,8 +155,10 @@ server every client is checked against.
 - TypeScript window bridge, and the Tauri owner: a window signed out while
   it was paused or behind hears what the server answered of its sends
   (`wseDelivered`), then `cleared` for the rest; it heard `cleared` for
-  all. A send from a listener of the sign-out is `dropped` at once, where it
-  said `queued` and waited for good.
+  all. A window that signs out itself does it through its owner and hears
+  the same, once the owner let it go (within 2 s, or it lets itself go). A
+  send from a listener of the sign-out, or made while it signs out, is
+  `dropped` at once, where it said `queued` and waited for good.
 - Python: a connection for another user starts the topics over and drops
   the last user's queue; `SyncWSEClient` takes `cookie_name`.
 - Python: the initial `topics` are subscribed on the client's first

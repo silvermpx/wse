@@ -55,6 +55,13 @@ export interface BridgeClient extends WSEClient {
   readonly bridge: { readonly phase: BridgePhase; readonly reason: string | null };
 }
 
+/**
+ * How long a window that signed out waits for its owner to let it go, with
+ * what it knows became of the window's sends: past it, what the window holds
+ * goes as cleared.
+ */
+const SIGN_OUT_WITHIN_MS = 2_000;
+
 const NO_CONN: ConnState = Object.freeze({
   connection: ConnectionState.PENDING,
   ready: false,
@@ -145,6 +152,11 @@ export function createBridgeClient(
   /** Batches held while the window is paused: not acknowledged, so the owner holds the rest. */
   let pausedBatches: Array<{ s: number; items: BridgeItem[] }> = [];
   let done = false;
+  /**
+   * The window signed out and waits for its owner to let it go: what the
+   * owner knows became of its sends comes first. Until it gives up waiting.
+   */
+  let signingOut: ReturnType<typeof setTimeout> | null = null;
 
   const emit = (type: string, detail?: unknown) => {
     const set = listeners.get(type);
@@ -159,7 +171,7 @@ export function createBridgeClient(
   };
 
   const post = (frame: WindowFrame) => {
-    if (done && frame.k !== 'bye' && frame.k !== 'signOut') return;
+    if ((done || signingOut) && frame.k !== 'bye' && frame.k !== 'signOut') return;
     if (port) port.post(frame);
     else early.push(frame);
   };
@@ -198,7 +210,7 @@ export function createBridgeClient(
   const snapshotOf = (): WSEClientSnapshot => ({
     connection: phase === 'attached' ? conn.connection : phase === 'attaching' ? ConnectionState.PENDING : ConnectionState.DISCONNECTED,
     paused: paused.length > 0 ? [...paused, ...conn.paused] : conn.paused,
-    ready: phase === 'attached' && conn.ready && paused.length === 0,
+    ready: phase === 'attached' && conn.ready && paused.length === 0 && !signingOut,
     endpoint: conn.endpoint,
     topics: topicList,
     lastError: reason ?? conn.lastError,
@@ -347,8 +359,9 @@ export function createBridgeClient(
   const batch = (s: number, items: BridgeItem[]) => {
     if (over()) return;
     for (const item of items) {
-      // A listener let the window go: nothing more of the batch is handed on.
-      if (done || over()) return;
+      // A listener let the window go (or signed out): nothing more of the
+      // batch is handed on.
+      if (done || signingOut || over()) return;
       take(item);
     }
     took = s;
@@ -374,6 +387,11 @@ export function createBridgeClient(
         return;
       case 'b':
         if (over()) return;
+        // Signed out: of what comes, only what became of its sends.
+        if (signingOut) {
+          for (const item of f.items) if (isOutcome(item)) take(item);
+          return;
+        }
         if (f.s !== took + pausedBatches.length + 1) {
           logger.error(`[bridge] batch ${f.s} after ${took + pausedBatches.length}: the window stops`);
           end('revoked', 'protocol');
@@ -405,6 +423,7 @@ export function createBridgeClient(
           storage.clear();
           signedOut();
         }
+        if (signingOut) letGo();
         return;
     }
   };
@@ -551,6 +570,14 @@ export function createBridgeClient(
     };
   };
 
+  /** The sign-out is over: the window is let go. */
+  const letGo = () => {
+    if (signingOut) clearTimeout(signingOut);
+    signingOut = null;
+    finish();
+    port?.close();
+  };
+
   const finish = () => {
     if (done) return;
     done = true;
@@ -601,7 +628,7 @@ export function createBridgeClient(
     subscribe,
     send: (type, payload, sendOptions = {}) => {
       // Let go for good (refused, signed out, its owner gone): nothing more goes.
-      if (done || over()) return 'dropped';
+      if (done || signingOut || over()) return 'dropped';
       if (sendOptions.live) {
         if (!snapshot.ready) return 'dropped';
         if (sendOptions.requires?.length && !delivery.continuous(sendOptions.requires)) return 'dropped';
@@ -622,7 +649,7 @@ export function createBridgeClient(
       return sendOptions.live ? 'sent' : 'queued';
     },
     sendSigned: (type, payload, signOptions: SignedMessageOptions = {}) => {
-      if (done || phase !== 'attached') return Promise.resolve('dropped');
+      if (done || signingOut || phase !== 'attached') return Promise.resolve('dropped');
       const n = nextSend++;
       return new Promise<SendStatus>((resolve) => {
         signs.set(n, resolve);
@@ -667,10 +694,21 @@ export function createBridgeClient(
       if (!done) delivery.resync([...new Set(topics)]);
     },
     signOut: () => {
-      if (done) return;
+      if (done || signingOut) return;
       post({ k: 'signOut' });
       delivery.forget();
       storage.clear();
+      if (port && !over()) {
+        // Through the owner: it signs every window out, this one with what
+        // it knows became of its sends first; nothing more goes meanwhile.
+        signingOut = setTimeout(() => {
+          end('revoked', 'signed_out');
+          signedOut();
+          letGo();
+        }, SIGN_OUT_WITHIN_MS);
+        refresh();
+        return;
+      }
       // Let go first: what the owner said became of its sends, then what it
       // held went with the user, and a send from a listener is dropped.
       finish();

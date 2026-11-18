@@ -5,6 +5,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { FakeWebSocket, installFakeWebSocket, resetClientState, serverReadyMessage, stamped } from './helpers.js';
 import {
   BRIDGE_PROTOCOL,
+  DEFAULT_BRIDGE_LIMITS,
   createBridgeClient,
   createBridgeOwner,
   messagePortChannel,
@@ -713,8 +714,87 @@ describe('a window let go', () => {
     await vi.waitFor(() => expect(o.client.kept()).toBe(0));
     await settle();
     w.signOut();
+    await vi.waitFor(() => expect(w.bridge.phase).toBe('revoked'));
     expect(heard).toEqual([['delivered', { ids: ['confirmed'] }]]);
     expect(w.kept()).toBe(0);
+  });
+
+  it('signing out itself, hears what the server confirmed that the owner still held for it', async () => {
+    // One batch in hand at a time: a message is in hand, the outcome waits
+    // at the owner.
+    const o = owner({ limits: { inFlight: 1, batchItems: 1 } });
+    const w = window(o);
+    o.client.retain();
+    w.retain();
+    const delivered: string[] = [];
+    const refused: unknown[] = [];
+    const notes: unknown[] = [];
+    w.on('wseDelivered', (d) => delivered.push(...d.ids));
+    w.on('wseNotDelivered', (d) => refused.push(d));
+    w.onMessage('news', (m) => notes.push(m.p));
+    await vi.waitFor(() => expect(FakeWebSocket.instances.length).toBeGreaterThan(0));
+    const ws = FakeWebSocket.last();
+    await serve(ws);
+    await vi.waitFor(() => expect(w.state.getSnapshot().ready).toBe(true));
+    w.send('order', { n: 1 }, { id: 'confirmed' });
+    await vi.waitFor(() => expect(ws.messagesOfType('order')).toHaveLength(1));
+    w.pause('background');
+    await settle();
+    ws.serverSend({ c: 'U', t: 'news', p: { n: 1 }, v: 1 });
+    await settle();
+    ws.serverSend({ c: 'WSE', t: 'ack', p: { s: ws.messagesOfType('order')[0].s } });
+    await vi.waitFor(() => expect(o.client.kept()).toBe(0));
+    await settle();
+    expect(w.kept()).toBe(1);
+    w.signOut();
+    // Nothing more goes once it signed out.
+    expect(w.send('order', { n: 2 }, { id: 'late' })).toBe('dropped');
+    await vi.waitFor(() => expect(w.bridge.phase).not.toBe('attached'));
+    await settle();
+    expect(delivered).toEqual(['confirmed']);
+    expect(refused).toEqual([]);
+    expect(notes).toEqual([]);
+    expect(w.kept()).toBe(0);
+    expect(o.attached).toBe(0);
+  });
+
+  it('signing out itself from an owner that does not answer, says what it held cleared in time', async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      const { port1, port2 } = new MessageChannel();
+      // An owner that takes the window and then answers nothing more.
+      const silent = messagePortChannel<OwnerFrame, WindowFrame>(port1 as never);
+      silent.listen({
+        frame: (f) => {
+          if (f.k === 'hello') {
+            silent.post({
+              k: 'welcome',
+              v: BRIDGE_PROTOCOL,
+              att: 1,
+              limits: DEFAULT_BRIDGE_LIMITS,
+              realm: null,
+              account: { epoch: 0, user: 'ann' },
+              conn: { connection: 'connected', ready: true, paused: [], endpoint: null, lastError: null, storage: 'memory' } as never,
+              gen: 1,
+            });
+          }
+        },
+        close: () => {},
+      });
+      const w = createBridgeClient(messagePortChannel<WindowFrame, OwnerFrame>(port2 as never));
+      windows.push(w);
+      const refused: unknown[] = [];
+      w.on('wseNotDelivered', (d) => refused.push(d));
+      await vi.waitFor(() => expect(w.bridge.phase).toBe('attached'));
+      w.send('order', {}, { id: 'held' });
+      w.signOut();
+      expect(refused).toEqual([]);
+      await vi.advanceTimersByTimeAsync(5_000);
+      await vi.waitFor(() => expect(refused).toEqual([{ reason: 'cleared', ids: ['held'] }]));
+      expect(w.kept()).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('a send from a listener of the sign-out is dropped at once', async () => {
@@ -743,7 +823,7 @@ describe('a window let go', () => {
     w2.send('order', {}, { id: 'first' });
     await vi.waitFor(() => expect(o2.client.kept()).toBe(1));
     w2.signOut();
-    expect(own).toBe('dropped');
+    await vi.waitFor(() => expect(own).toBe('dropped'));
     expect(w2.kept()).toBe(0);
   });
 
@@ -766,7 +846,8 @@ describe('a window let go', () => {
     for (const n of [0, 1, 2]) ws.serverSend({ c: 'U', t: 'note', p: { n }, v: 1 });
     await settle();
     w.resume('hidden');
-    await vi.waitFor(() => expect(w.bridge.phase).toBe('closed'));
+    // Signed out through the owner.
+    await vi.waitFor(() => expect(w.bridge.phase).toBe('revoked'));
     await settle();
     expect(seen).toEqual([0, 1]);
   });
