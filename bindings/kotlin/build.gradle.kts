@@ -23,6 +23,8 @@ tasks.withType<JavaCompile>().configureEach { options.release.set(17) }
 
 // The shared wrapper, the JVM's own part, and the bindings generated for the JVM.
 sourceSets["main"].kotlin.srcDirs("src/jvm/kotlin", "generated/jvm")
+// The conformance driver, which the Android library's instrumented tests run too.
+sourceSets["test"].kotlin.srcDirs("src/conformance/kotlin")
 
 dependencies {
     implementation("net.java.dev.jna:jna:5.19.1")

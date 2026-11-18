@@ -18,7 +18,8 @@ android {
         consumerProguardFiles("consumer-rules.pro")
     }
     sourceSets["main"].kotlin.srcDirs("src/main/kotlin", "../src/main/kotlin", "../generated/android")
-    sourceSets["androidTest"].kotlin.srcDirs("src/androidTest/kotlin")
+    // The conformance driver is the JVM tests' too.
+    sourceSets["androidTest"].kotlin.srcDirs("src/androidTest/kotlin", "../src/conformance/kotlin")
     // cargo-ndk's output: one folder per ABI.
     sourceSets["main"].jniLibs.srcDirs(System.getenv("WSE_JNI_LIBS") ?: "../../../target/android-jniLibs")
     compileOptions {
@@ -39,4 +40,7 @@ dependencies {
     androidTestImplementation("androidx.test.ext:junit:1.3.0")
     androidTestImplementation("androidx.test:runner:1.7.0")
     androidTestImplementation("org.jetbrains.kotlin:kotlin-test:2.4.21")
+    // The conformance driver's JSON, and its control channel's WebSocket.
+    androidTestImplementation("com.google.code.gson:gson:2.11.0")
+    androidTestImplementation("com.squareup.okhttp3:okhttp:4.12.0")
 }

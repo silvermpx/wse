@@ -6,4 +6,9 @@
             <certificates src="user" />
         </trust-anchors>
     </base-config>
+    <!-- The conformance driver's control channel: ws:// to this machine,
+         which an emulator reaches as 10.0.2.2. -->
+    <domain-config cleartextTrafficPermitted="true">
+        <domain includeSubdomains="false">10.0.2.2</domain>
+    </domain-config>
 </network-security-config>
