@@ -4,7 +4,7 @@
   "type": "module",
   "main": "main.mjs",
   "scripts": {
-    "build": "tsc -p tsconfig.json && vite build && node -e \"require('node:fs').copyFileSync('index.html', 'dist/index.html')\""
+    "build": "tsc -p tsconfig.json && vite build && vite build -c vite.preload.config.mjs && node -e \"require('node:fs').copyFileSync('index.html', 'dist/index.html')\""
   },
   "dependencies": {
     "react": "19.3.1",

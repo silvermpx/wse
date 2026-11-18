@@ -209,6 +209,10 @@ server every client is checked against.
   for a message is made again, and catches up, instead of dropping it. A
   node that went without SHUTDOWN while its link was down, another node now
   at its address, is no longer taken to have published nothing meanwhile.
+- Electron: an application's own preload that imports
+  `wse-client/electron/preload` keeps it once bundled: the package says the
+  preload acts as it is imported, so a bundler no longer drops the import
+  and leaves the window without a port.
 - Window bridge: a window signed out from a listener no longer drops what
   became of its sends in the rest of the batch, nor what came while it was
   paused when it resumes before its owner let it go. It no longer gives up

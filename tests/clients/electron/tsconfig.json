@@ -9,5 +9,5 @@
     "skipLibCheck": false,
     "types": []
   },
-  "include": ["page.ts"]
+  "include": ["page.ts", "preload.ts"]
 }

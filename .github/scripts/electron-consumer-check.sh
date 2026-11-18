@@ -2,8 +2,9 @@
 # The Electron application of tests/clients/electron, built against the
 # packed wse-client (TGZ) installed the way an application installs it,
 # outside the checkout: its main process takes wse-client/electron and
-# wse-client/node from node_modules, its two windows the package's preload
-# and wse-client/react's hooks. It runs against the Rust client's example
+# wse-client/node from node_modules, its two windows wse-client/react's
+# hooks and a preload each: the package's, and the application's own that
+# imports it, bundled as an application bundles it. It runs against the Rust client's example
 # server, built here (on Linux in a virtual display), and checks two windows
 # on one connection, then one closed and the other going on.
 #
@@ -20,7 +21,7 @@ work="$(cd "$(mktemp -d)" && pwd -P)"
 server=
 trap 'if [ -n "$server" ]; then kill "$server" 2> /dev/null || true; fi; rm -rf "${work:?}"' EXIT
 
-for file in package.json package-lock.json tsconfig.json vite.config.mjs index.html page.ts main.mjs; do
+for file in package.json package-lock.json tsconfig.json vite.config.mjs vite.preload.config.mjs index.html page.ts preload.ts main.mjs; do
   cp "$root/tests/clients/electron/$file" "$work/"
 done
 (

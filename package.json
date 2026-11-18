@@ -168,6 +168,7 @@
     "node": ">=22"
   },
   "sideEffects": [
+    "./dist/npm/electron/preload.cjs",
     "./dist/npm/react-native/textCodec.js"
   ],
   "publishConfig": {

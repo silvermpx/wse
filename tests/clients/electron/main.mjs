@@ -1,9 +1,11 @@
 // An Electron application with the packed wse-client, as an application
 // builds it: the connection in this main process (wse-client/electron, the
-// outbox in a file with wse-client/node), two windows through the package's
-// preload. It checks itself against the server WSE_URL names: both windows
-// connected and taking ticks on one connection; then one closes, and the
-// other goes on. Exit 0 when it all holds.
+// outbox in a file with wse-client/node), two windows, one with the
+// package's preload, the other with the application's own, which imports it
+// (built with the application's bundler). It checks itself against the
+// server WSE_URL names: both windows connected and taking ticks on one
+// connection; then one closes, and the other goes on. Exit 0 when it all
+// holds.
 
 import { app, BrowserWindow, ipcMain, MessageChannelMain } from 'electron';
 import { mkdtempSync } from 'node:fs';
@@ -40,8 +42,9 @@ app.whenReady().then(async () => {
     endpoints: [url],
     offline: { store: fileOutbox(join(app.getPath('userData'), 'wse-outbox')) },
   });
+  const preloads = [wsePreloadPath, join(here, 'dist', 'preload.cjs')];
   const windows = [1, 2].map((n) => {
-    const win = new BrowserWindow({ show: false, webPreferences: { preload: wsePreloadPath } });
+    const win = new BrowserWindow({ show: false, webPreferences: { preload: preloads[n - 1] } });
     owner.serve(win.webContents);
     void win.loadFile(join(here, 'dist', 'index.html'), { hash: `window=${n}` });
     return win;
