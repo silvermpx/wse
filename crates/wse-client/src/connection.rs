@@ -27,15 +27,14 @@ use crate::policy::{First, Lost, Next, Policy};
 use crate::security::{Keys, Sealing};
 use crate::session::{self, Outgoing, Session};
 
+use crate::frames::FRAME_OVERHEAD;
+
 type Ws = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
 /// Messages the application queued that go out in one write.
 const SEND_BATCH: usize = 256;
 /// Frames read in one go when they came together.
 const READ_BATCH: usize = 64;
-/// What a frame may carry past the message itself: a sealed frame's `E:`,
-/// header and tag.
-const FRAME_OVERHEAD: usize = 32;
 
 pub(crate) struct Driver<H> {
     config: Config,

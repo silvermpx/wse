@@ -277,6 +277,26 @@ async fn a_burst_longer_than_a_batch_reaches_the_application_whole() {
     client.close().await;
 }
 
+#[wasm_bindgen_test]
+async fn a_message_over_the_size_limit_never_reaches_the_application() {
+    let mut config = Config::new(given(URL, "WSE_TEST_URL"));
+    config.max_message_size = 1024;
+    let (client, mut events) = wse_client::connect(config).await.unwrap();
+    let long = "x".repeat(4096);
+    client.send("echo", &json!({ "text": long })).await.unwrap();
+    // Its echo is over the limit: the connection goes, the echo never comes.
+    loop {
+        match next(&mut events).await {
+            Incoming::Message(message) if message.kind() == "echoed" => {
+                panic!("an echo over the limit reached the application")
+            }
+            Incoming::Event(Event::Disconnected(_)) => break,
+            _ => {}
+        }
+    }
+    client.close().await;
+}
+
 // -- The outbox in IndexedDB ---------------------------------------------------
 //
 // Node has neither IndexedDB nor Web Locks: fake-indexeddb (the

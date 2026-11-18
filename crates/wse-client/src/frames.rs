@@ -7,6 +7,11 @@ use crate::decode::{Body, Decoder};
 use crate::handler::Handler;
 use crate::session::Session;
 
+/// What a frame may carry past the message itself: a sealed frame's `E:`,
+/// header and tag. A frame larger than `max_message_size` and this is taken
+/// by no client, natively (the WebSocket's own limit) or in the browser.
+pub(crate) const FRAME_OVERHEAD: usize = 32;
+
 /// The data of a frame.
 pub(crate) enum Data<'a> {
     /// A text frame, and the bytes it came in when a message may keep them.
