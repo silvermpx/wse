@@ -380,10 +380,18 @@ pub(super) async fn peer_dispatch_task(
             // (cross-node recovery), the form the local buffer stores too.
             // One this node has already (a peer catching it up sends from
             // where it stands with nothing missing) is not delivered again.
-            if let (Some(rm), Some((epoch, offset))) = (&ctx.recovery, rec)
-                && !rm.push_foreign(&topic, payload.clone(), epoch, offset)
-            {
-                continue;
+            // One with no position (its node had no room to keep it) is
+            // held nowhere: a client here whose last message of the topic
+            // came before it is not told it missed nothing.
+            if let Some(rm) = &ctx.recovery {
+                match rec {
+                    Some((epoch, offset)) => {
+                        if !rm.push_foreign(&topic, payload.clone(), epoch, offset) {
+                            continue;
+                        }
+                    }
+                    None => rm.not_kept(&topic),
+                }
             }
 
             // Per-topic message count for the Prometheus top-N metrics.

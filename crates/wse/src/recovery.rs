@@ -1279,6 +1279,12 @@ impl RecoveryManager {
         *through = (*through).max(seq);
     }
 
+    /// A message of `topic` came, relayed with no position: the node it was
+    /// published on had no room to keep it, and no node holds it.
+    pub(crate) fn not_kept(&self, topic: &str) {
+        self.note_removed(topic, self.arrival.fetch_add(1, Ordering::Relaxed));
+    }
+
     /// This node took an interest in `topic` (its first local subscriber,
     /// none lingering): other nodes relay it from now on.
     pub(crate) fn interest_began(&self, topic: &str) {
@@ -2211,6 +2217,24 @@ mod tests {
             replayed(mgr.recover_streams("room", (0xf, 0), &[(0xf, 0)])),
             None
         );
+    }
+
+    #[test]
+    fn a_message_relayed_with_no_position_is_never_recovered_as_nothing() {
+        let mgr = RecoveryManager::new(RecoveryConfig::default());
+        mgr.push("room", make_data("l0"));
+        let (local, _) = mgr.get_position("room").unwrap();
+        // Another node had no room to keep its message: it came with no
+        // position, and no node holds it.
+        mgr.not_kept("room");
+        assert!(not_recovered(&mgr.recover("room", local, 0)));
+        assert_eq!(
+            replayed(mgr.recover_streams("room", (local, 0), &[(local, 0)])),
+            None
+        );
+        // A client whose last message came after it missed nothing.
+        mgr.push("room", make_data("l1"));
+        assert!(!not_recovered(&mgr.recover("room", local, 1)));
     }
 
     #[test]

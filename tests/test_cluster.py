@@ -364,6 +364,47 @@ def test_a_stream_begun_while_a_link_was_down_arrives_after_it(nodes):
     assert [m["p"]["n"] for m in replayed] == [1, 2]
 
 
+def test_a_message_its_origin_had_no_room_to_keep_is_never_said_recovered(nodes):
+    """The origin of a message had no room left for its history and sent it
+    on with no position: a client of the other node whose last message of the
+    topic came before it is told it was not recovered, never that it missed
+    nothing."""
+    websockets = pytest.importorskip("websockets")
+    origin = nodes(recovery=True, recovery_memory_budget=1)
+    relay = nodes(recovery=True)
+    origin.join()
+    relay.join(origin)
+
+    async def scenario():
+        await until(lambda: origin.peers == 1 and relay.peers == 1)
+        async with websockets.connect(f"ws://127.0.0.1:{relay.port}/wse") as live:
+            await subscribe_next_client(relay, ["news"])
+            await asyncio.sleep(0.3)  # the SUB reaches the origin
+            relay.server.broadcast_local("news", json.dumps({"t": "news", "p": {"n": 1}}))
+            (anchor,) = await messages_of_type(live, "news", 1)
+            # The origin's budget is used up: what it publishes has no position.
+            origin.server.broadcast_local("other", json.dumps({"t": "other", "p": {}}))
+            origin.server.broadcast("news", json.dumps({"t": "news", "p": {"n": 2}}))
+            (unkept,) = await messages_of_type(live, "news", 1)
+        answers = []
+        # As a client names its last message: a scalar position, and streams.
+        for streams in ({}, {"streams": {anchor["e"]: anchor["o"]}}):
+            async with websockets.connect(f"ws://127.0.0.1:{relay.port}/wse"):
+                conn_id = await next_connect(relay)
+                past = {"epoch": anchor["e"], "offset": anchor["o"], **streams}
+                answer = relay.server.subscribe_with_recovery(
+                    conn_id, ["news"], recover=True, positions={"news": past}
+                )
+                answers.append(answer["topics"]["news"])
+        return anchor, unkept, answers
+
+    anchor, unkept, answers = asyncio.run(scenario())
+    assert anchor["o"] == 0
+    assert unkept["p"]["n"] == 2 and "o" not in unkept
+    for answer in answers:
+        assert answer["recovered"] is False, answer
+
+
 def test_a_signed_message_crosses_the_cluster_unchanged(nodes):
     websockets = pytest.importorskip("websockets")
     pytest.importorskip("cryptography")
