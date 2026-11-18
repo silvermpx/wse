@@ -24,6 +24,19 @@ from datetime import datetime
 import httpx
 import websockets
 
+
+def connect(host: str, port: int, token: str, **options):
+    """A connection as a client authenticates on the server: the token in
+    the Authorization header (the server takes it there, or as a cookie,
+    never in the query)."""
+    return websockets.connect(
+        f"ws://{host}:{port}/wse?compression=false",
+        additional_headers={"Authorization": f"Bearer {token}"},
+        open_timeout=5,
+        **options,
+    )
+
+
 # -- Config ------------------------------------------------------------------
 
 DEFAULT_HOST = "127.0.0.1"
@@ -94,10 +107,9 @@ async def bench_connection_latency(host: str, port: int, token: str, rounds: int
 
     latencies = []
     for i in range(rounds):
-        uri = f"ws://{host}:{port}/wse?token={token}&compression=false"
         t0 = time.perf_counter()
         try:
-            async with websockets.connect(uri, open_timeout=5) as ws:
+            async with connect(host, port, token) as ws:
                 # Wait for server_ready message
                 while True:
                     msg = await asyncio.wait_for(ws.recv(), timeout=5)
@@ -128,11 +140,10 @@ async def bench_ping_pong_rtt(host: str, port: int, token: str, rounds: int = 10
     print(f"Test 2: Ping/Pong RTT ({rounds} rounds)")
     print(f"{'=' * 60}")
 
-    uri = f"ws://{host}:{port}/wse?token={token}&compression=false"
     latencies = []
 
     try:
-        async with websockets.connect(uri, open_timeout=5) as ws:
+        async with connect(host, port, token) as ws:
             # Drain server_ready
             await asyncio.wait_for(ws.recv(), timeout=5)
             await asyncio.sleep(0.1)
@@ -167,11 +178,10 @@ async def bench_send_throughput(host: str, port: int, token: str, n_messages: in
     print(f"Test 3: Client->Server Throughput ({n_messages} messages)")
     print(f"{'=' * 60}")
 
-    uri = f"ws://{host}:{port}/wse?token={token}&compression=false"
     msg = json.dumps({"action": "ping", "ts": "2026-01-01T00:00:00Z"})
 
     try:
-        async with websockets.connect(uri, open_timeout=5) as ws:
+        async with connect(host, port, token) as ws:
             # Drain initial messages
             await asyncio.wait_for(ws.recv(), timeout=5)
             await asyncio.sleep(0.2)
@@ -203,13 +213,12 @@ async def bench_concurrent_connections(host: str, port: int, token: str, n_conns
     print(f"Test 4: Rapid Connect/Disconnect ({n_conns} sequential)")
     print(f"{'=' * 60}")
 
-    uri = f"ws://{host}:{port}/wse?token={token}&compression=false"
     times = []
 
     for i in range(n_conns):
         t0 = time.perf_counter()
         try:
-            async with websockets.connect(uri, open_timeout=5) as ws:
+            async with connect(host, port, token) as ws:
                 await asyncio.wait_for(ws.recv(), timeout=5)
                 t1 = time.perf_counter()
                 times.append((t1 - t0) * 1000)
@@ -239,9 +248,8 @@ async def bench_message_sizes(host: str, port: int, token: str):
     n_per_size = 200
 
     for size in sizes:
-        uri = f"ws://{host}:{port}/wse?token={token}&compression=false"
         try:
-            async with websockets.connect(uri, open_timeout=5, max_size=2**20) as ws:
+            async with connect(host, port, token, max_size=2**20) as ws:
                 # Drain initial messages
                 while True:
                     try:
@@ -271,6 +279,20 @@ async def bench_message_sizes(host: str, port: int, token: str):
 # -- Main --------------------------------------------------------------------
 
 
+async def authenticated(host: str, port: int, token: str) -> bool:
+    """One connection with the token, before anything is measured: the
+    server takes it (server_ready) rather than refusing it."""
+    try:
+        async with connect(host, port, token) as ws:
+            while True:
+                data = decode_wse_message(await asyncio.wait_for(ws.recv(), timeout=5))
+                if isinstance(data, dict) and data.get("t") == "server_ready":
+                    return True
+    except Exception as exc:
+        print(f"  The connection with the token failed: {exc}")
+    return False
+
+
 async def main(host: str, port: int, login_url: str, email: str, password: str):
     print("=" * 60)
     print("  WSE Performance Benchmark")
@@ -285,6 +307,9 @@ async def main(host: str, port: int, login_url: str, email: str, password: str):
         print("  FATAL: Cannot get JWT token. Is the server running?")
         return
     print(f"  Token: {token[:20]}...")
+    if not await authenticated(host, port, token):
+        print("  FATAL: the server did not take the token (no server_ready)")
+        raise SystemExit(1)
 
     # Run tests
     await bench_connection_latency(host, port, token)
