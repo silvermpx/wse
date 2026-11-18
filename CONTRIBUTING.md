@@ -8,7 +8,7 @@ Thank you for your interest in contributing to WSE. This guide covers the develo
 
 - Python 3.12+ for the server (the Python client supports 3.11+)
 - Rust 1.95+ (stable; the minimum is `rust-version` in `Cargo.toml`)
-- Node.js 22 for the TS client's tests and build (the published package runs on Node 18+)
+- Node.js 22 for the TS client's tests and build (the published package runs on Node 22+)
 - maturin 1.16+ (`pip install maturin`)
 
 ### Building from Source

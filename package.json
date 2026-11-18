@@ -159,7 +159,7 @@
     "url": "https://github.com/silvermpx/wse/issues"
   },
   "engines": {
-    "node": ">=18"
+    "node": ">=22"
   },
   "sideEffects": [
     "./dist/npm/react-native/textCodec.js"

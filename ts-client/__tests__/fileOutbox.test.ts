@@ -8,7 +8,7 @@ import { join } from 'node:path';
 import { transformWithOxc } from 'vite';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { createWSEClient } from '../core/client';
-import { addBody, encodeLine, encodeOutbox, fileOutbox, lockName, readOutbox, saltSeed } from '../node/fileOutbox';
+import { addBody, encodeLine, encodeOutbox, fileOutbox, lockName, lockSeen, readOutbox, saltSeed } from '../node/fileOutbox';
 import { noOutcomes, numbered, Outbox, unnumbered } from '../services/Outbox';
 
 interface VectorLine {
@@ -197,6 +197,19 @@ describe('the outbox in a file', () => {
     }
     expect(failed).toEqual([]);
     expect(readOutbox(readFileSync(path, 'utf8')).next).toBe(3);
+  });
+
+  it('takes the lock the other clients see on Linux only with a Node that names it whole (22 and newer)', () => {
+    // An older Node binds the name padded to the whole address: another
+    // runtime's client never meets it.
+    expect(lockSeen('linux', '18.20.8')).toBe(false);
+    expect(lockSeen('linux', '20.19.0')).toBe(false);
+    expect(lockSeen('android', '20.19.0')).toBe(false);
+    expect(lockSeen('linux', '22.0.0')).toBe(true);
+    expect(lockSeen('linux', '24.11.1')).toBe(true);
+    // Elsewhere the lock is the file's own.
+    expect(lockSeen('darwin', '18.20.8')).toBe(true);
+    expect(lockSeen('win32', '18.20.8')).toBe(true);
   });
 
   it('names its lock on Linux as the Rust and Python clients do', () => {

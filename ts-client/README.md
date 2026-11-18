@@ -631,8 +631,8 @@ connection once the file holds it, and that it may have gone, so that after a cr
 never another message's (IndexedDB and the React Native storage alike). When the process ends, what is
 not written yet is written at once. The file is the client's alone while the process runs: the
 system holds it for the process (a lock on `wse-outbox.lock` on macOS, the file opened for this
-process alone on Windows, an abstract socket named after the file on Linux) and lets go when the
-process ends, however it ends. A file that cannot be opened or written is a `wseStorageError` event
+process alone on Windows, an abstract socket named after the file on Linux, which needs Node 22 or
+newer) and lets go when the process ends, however it ends. A file that cannot be opened or written is a `wseStorageError` event
 and the outbox goes on in memory; `state.getSnapshot().storage` reads `durable` while the file
 holds it. `destroy()` leaves what waits in the file for the next client, `signOut()` clears it.
 

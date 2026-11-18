@@ -112,6 +112,10 @@ conformance server every client is checked against.
 - Rust client: the events hear `Event::Continuity` when a topic's messages
   break off in best effort too; Python's stream and handlers hear
   `continuity`.
+- The npm package needs Node 22 or newer (Node 18 and 20 are past their
+  end of life): the outbox's file on Linux is locked with a socket an
+  older Node names unlike the Rust and Python clients, so it refuses
+  there.
 
 ### Fixed
 

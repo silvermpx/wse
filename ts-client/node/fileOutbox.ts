@@ -264,9 +264,24 @@ export function lockName(path: string): string {
   return `wse-outbox-${createHash('sha256').update(where).digest('hex').slice(0, 40)}`;
 }
 
+/**
+ * Whether Node takes on `platform` a lock of the file the clients of the
+ * other runtimes see: on Linux a Node before 22 binds the socket's name
+ * padded to the whole address, a name no other client meets.
+ */
+export function lockSeen(platform: string, node: string): boolean {
+  if (platform !== 'linux' && platform !== 'android') return true;
+  return Number(node.split('.')[0]) >= 22;
+}
+
 function takeLock(path: string): Lock {
   const platform = process.platform;
   if (platform === 'linux' || platform === 'android') {
+    if (!lockSeen(platform, process.versions.node)) {
+      throw new Error(
+        `the outbox's file needs Node 22 or newer on ${platform}: Node ${process.versions.node} takes a lock the other clients do not see`,
+      );
+    }
     const name = `\0${lockName(path)}`;
     const server = createServer();
     server.on('error', () => {});
