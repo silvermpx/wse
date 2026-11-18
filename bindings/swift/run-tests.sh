@@ -3,7 +3,8 @@
 # and the conformance server, and runs the tests, the conformance cases among
 # them: on the Mac (swift test), and with SIMULATOR=1 also on an iOS
 # simulator, built as CONFIGURATION says (Debug, or Release: the optimized
-# build an app ships). Each run's cases are checked after it.
+# build an app ships); SIMULATOR=only runs the simulator's alone. Each run's
+# cases are checked after it.
 set -euo pipefail
 here="$(cd "$(dirname "$0")" && pwd)"
 root="$(cd "$here/../.." && pwd)"
@@ -41,9 +42,11 @@ WSE_TEST_IDENTITY="$(sed -n 's/^e2e_identity_public_key //p' "$target/swift-test
 WSE_TEST_SIGNING="$(sed -n 's/^signing_public_key //p' "$target/swift-test-server.log")"
 export WSE_TEST_IDENTITY WSE_TEST_SIGNING
 cd "$here"
-swift test
-"$target/debug/wse-conformance" check --manifest "$root/tests/conformance/swift.json" --reports "$conformance"
-if [[ "${SIMULATOR:-0}" == "1" ]]; then
+if [[ "${SIMULATOR:-0}" != "only" ]]; then
+  swift test
+  "$target/debug/wse-conformance" check --manifest "$root/tests/conformance/swift.json" --reports "$conformance"
+fi
+if [[ "${SIMULATOR:-0}" == "1" || "${SIMULATOR:-0}" == "only" ]]; then
   # A simulator of its own (an iPhone of the newest iOS installed), whose
   # system trusts the run's CA: the system's verifier must connect there.
   # Other simulators and the Mac's own trust are left as they are.

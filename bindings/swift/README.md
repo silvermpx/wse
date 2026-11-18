@@ -132,8 +132,9 @@ what is queued and closes.
 ## Tests
 
 ```sh
-bindings/swift/run-tests.sh               # on the Mac
-SIMULATOR=1 bindings/swift/run-tests.sh   # and on an iOS simulator
+bindings/swift/run-tests.sh                  # on the Mac
+SIMULATOR=1 bindings/swift/run-tests.sh      # and on an iOS simulator
+SIMULATOR=only bindings/swift/run-tests.sh   # on an iOS simulator alone
 ```
 
 They run against the Rust client's example server, which the script starts.
