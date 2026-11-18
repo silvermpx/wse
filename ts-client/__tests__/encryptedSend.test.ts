@@ -290,3 +290,43 @@ it('says one outcome of each send to a server that does not answer, when an earl
     spy.mockRestore();
   }
 });
+
+it('never writes a kept send whose time ran out while it was sealed, and says it expired', async () => {
+  let release!: () => void;
+  let started = false;
+  const gate = new Promise<void>((resolve) => (release = resolve));
+  const original = SecurityManager.prototype.encryptForTransport;
+  const spy = vi
+    .spyOn(SecurityManager.prototype, 'encryptForTransport')
+    .mockImplementation(async function (this: SecurityManager, data: string) {
+      const sealed = await original.call(this, data);
+      if (data.includes('order-expiry')) {
+        started = true;
+        await gate;
+      }
+      return sealed;
+    });
+  const c = client({ offline: { enabled: true } });
+  const delivered: string[] = [];
+  const refused: unknown[] = [];
+  c.on('wseDelivered', (d) => delivered.push(...d.ids));
+  c.on('wseNotDelivered', (d) => refused.push(d));
+  try {
+    c.retain();
+    await vi.waitFor(() => expect(FakeWebSocket.instances).toHaveLength(1));
+    const socket = await open(c, 'u');
+    c.send('order', { item: 'milk' }, { id: 'order-expiry', ttl: 80 });
+    await vi.waitFor(() => expect(started).toBe(true));
+    // Sealing takes longer than the message may wait.
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    release();
+    await vi.waitFor(() => expect(refused).toEqual([{ reason: 'expired', ids: ['order-expiry'] }]));
+    await settle();
+    expect(await socket.orders()).toEqual([]);
+    expect(delivered).toEqual([]);
+    expect(c.kept()).toBe(0);
+  } finally {
+    release();
+    spy.mockRestore();
+  }
+});

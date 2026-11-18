@@ -2248,14 +2248,19 @@ export class MessageProcessor {
 
   /**
    * A message about to be written may still go: its user is the client's,
-   * the topics it requires continuous; one of the outbox was not taken back
-   * since it was handed.
+   * its time not run out, the topics it requires continuous; one of the
+   * outbox was not taken back since it was handed.
    */
   mayStillGo(message: WSMessage): boolean {
     const outbox = this.ctx.outbox.current;
     const kept = outbox?.handed(message);
     if (kept === null) return false;
     if (kept) {
+      // Its time ran out while it was sealed: it goes as expired.
+      if (kept.until < Date.now()) {
+        outbox!.ranOut(message);
+        return false;
+      }
       if (!kept.requires || this.continuous(kept.requires)) return true;
       // It waits in the outbox, and what was handed after it waits behind it.
       outbox!.takeBack(message);

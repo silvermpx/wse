@@ -573,6 +573,18 @@ export class Outbox {
     if (at >= 0 && this.records[at] === record) this.cursor = at;
   }
 
+  /**
+   * A message handed to be written later ran out while it was sealed: it
+   * and those handed after it are taken back, and it goes as expired, never
+   * written.
+   */
+  ranOut(message: WSMessage): void {
+    this.takeBack(message);
+    const outcomes = noOutcomes();
+    this.expire(Date.now(), outcomes);
+    this.onExpired?.(outcomes);
+  }
+
   /** Where the record numbered `s` is among those handed on this connection, or -1. */
   private handedAt(s: number): number {
     let low = this.head;
