@@ -1,0 +1,6 @@
+{
+  "about": "The npm package in a React Native app on an Android emulator (.github/scripts/rn-app-check.sh): a release build on Hermes, React Native's WebSocket, its WebCrypto from react-native-quick-crypto.",
+  "agents": {
+    "react-native": { "features": ["outbox", "start", "live", "msgpack", "e2e", "signing", "recover_or_resync"] }
+  }
+}

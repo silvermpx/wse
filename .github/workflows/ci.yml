@@ -40,6 +40,7 @@ jobs:
       conformance: ${{ steps.filter.outputs.conformance }}
       electron: ${{ steps.filter.outputs.electron }}
       tauri: ${{ steps.filter.outputs.tauri }}
+      react_native: ${{ steps.filter.outputs.react_native }}
     steps:
       # Credentials stay: on a push the filter fetches the previous commit.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
@@ -76,7 +77,6 @@ jobs:
               - 'vitest.config.ts'
               - '.github/scripts/npm-consumer-check.sh'
               - '.github/scripts/rn-bundle-check.sh'
-              - '.github/scripts/rn-app-check.sh'
               - '.github/scripts/framework-consumer-check.sh'
               - 'tests/clients/**'
               - '.github/workflows/ci.yml'
@@ -136,6 +136,19 @@ jobs:
               - 'bindings/example-ui/**'
               - 'tests/clients/tauri/**'
               - '.github/scripts/tauri-consumer-check.sh'
+              - 'tests/conformance/**'
+              - '.github/workflows/ci.yml'
+            react_native:
+              - 'crates/wse/**'
+              - 'crates/wse-conformance/**'
+              - 'crates/wse-client/examples/**'
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - 'ts-client/**'
+              - 'package.json'
+              - 'package-lock.json'
+              - 'tsconfig.json'
+              - '.github/scripts/rn-app-check.sh'
               - 'tests/conformance/**'
               - '.github/workflows/ci.yml'
 
@@ -1112,11 +1125,12 @@ jobs:
 
   # React Native: the packed npm package in an app made from React Native's
   # template, built for release (Hermes bytecode) and run on an emulator
-  # against the Rust client's example server.
+  # against the Rust client's example server, then through the conformance
+  # cases.
   react-native:
     name: React Native app (emulator)
     needs: changes
-    if: needs.changes.outputs.ts_client == 'true'
+    if: needs.changes.outputs.react_native == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 60  # a simulator or an emulator can hang
     env:

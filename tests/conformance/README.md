@@ -13,7 +13,14 @@ the same way.
   trace). The judge holds the trace and what the server published and took to the case's rules.
   A driver asserts nothing.
 - The drivers: `ts-client/__tests__/conformance.test.ts` (TypeScript), `crates/wse-client/tests/conformance.rs`
-  (Rust), `python-client/tests/test_conformance.py` (Python).
+  (Rust), `python-client/tests/test_conformance.py` (Python). The packages' drivers run on the
+  systems apps run on: Swift's (`bindings/swift/Tests`) on the Mac and an iOS simulator, Kotlin's
+  (`bindings/kotlin/src/conformance`) on the JVM and an Android emulator, Dart's
+  (`bindings/dart/test/conformance`) on the desktop and, in the example app, on an iOS simulator and
+  an Android emulator; the TypeScript driver also runs in Electron, Tauri and a React Native app on
+  an Android emulator (`.github/scripts/rn-app-check.sh`). Each of these runs has a manifest here of
+  its own (`swift-ios.json`, `kotlin-android.json`, `dart-ios.json`, `dart-android.json`,
+  `react-native.json`, ...).
 
 ```bash
 cargo run -p wse-conformance -- serve --out target/conformance   # prints {"ready":true,"control":"ws://..."}
