@@ -30,7 +30,7 @@ VERSION = "3.2.0"
 # platform dropped from its table fails here too. Each platform's abi3 wheel,
 # and its free-threaded ones where there is a CPython of them.
 WHEEL_PLATFORMS = {
-    "manylinux_2_28_x86_64": True,
+    "manylinux2014_x86_64.manylinux_2_17_x86_64": True,
     "manylinux_2_28_aarch64": True,
     "musllinux_1_2_x86_64": False,
     "musllinux_1_2_aarch64": False,
@@ -153,6 +153,41 @@ class Artifacts(unittest.TestCase):
         code, out = check_artifacts(names)
         self.assertEqual(code, 1)
         self.assertIn("no Dart library aarch64-linux-android", out)
+
+    def test_a_jvm_library_in_a_directory_of_its_artifact_is_no_release(self) -> None:
+        # The Maven job takes dist/wse-client-jvm-<version>.jar.
+        names = [
+            n.replace("jvm-package/", "jvm-package/lib/") if n.startswith("jvm-package/") else n
+            for n in release_files()
+        ]
+        code, out = check_artifacts(names)
+        self.assertEqual(code, 1)
+        self.assertIn("no JVM library", out)
+
+    def test_a_linux_wheel_for_a_newer_glibc_than_the_release_says_is_no_release(self) -> None:
+        names = [
+            n.replace("manylinux_2_28_aarch64", "manylinux_2_39_aarch64") for n in release_files()
+        ]
+        code, out = check_artifacts(names)
+        self.assertEqual(code, 1)
+        self.assertIn("no wse-server wheel for Linux aarch64 (glibc) abi3", out)
+        self.assertIn("needs glibc 2.39", out)
+
+    def test_a_macos_wheel_for_a_newer_macos_than_the_release_says_is_no_release(self) -> None:
+        names = [n.replace("macosx_10_12_x86_64", "macosx_14_0_x86_64") for n in release_files()]
+        code, out = check_artifacts(names)
+        self.assertEqual(code, 1)
+        self.assertIn("no wse-server wheel for macOS x86_64 abi3", out)
+
+    def test_a_free_threaded_wheel_whose_python_is_not_its_abi_is_no_release(self) -> None:
+        names = [
+            n.replace("-cp314-cp314t-macosx_11_0_arm64", "-cp315-cp314t-macosx_11_0_arm64")
+            for n in release_files()
+        ]
+        code, out = check_artifacts(names)
+        self.assertEqual(code, 1)
+        self.assertIn("no wse-server wheel for macOS arm64 cp314t", out)
+        self.assertIn("cp315-cp314t", out)
 
     def test_a_file_of_another_version_fails(self) -> None:
         code, out = check_artifacts(

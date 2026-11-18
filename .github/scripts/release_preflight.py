@@ -546,19 +546,45 @@ def _mobile_files(version: str) -> dict[str, str]:
 _MOBILE_PREFIXES = ("WseFFIC-", "wse-client-android-", "wse_client-dart-", "wse_dart-")
 
 # The wse-server wheels a release holds (release.yml's wheel matrix): an abi3
-# wheel for each platform, as its file name says the platform, and the
-# free-threaded 3.14t and 3.15t wheels where there is a CPython of them.
-SERVER_WHEELS: dict[str, tuple[tuple[str, ...], bool]] = {
-    "Linux x86_64 (glibc)": (("manylinux", "x86_64"), True),
-    "Linux aarch64 (glibc)": (("manylinux", "aarch64"), True),
-    "Linux x86_64 (musl)": (("musllinux", "x86_64"), False),
-    "Linux aarch64 (musl)": (("musllinux", "aarch64"), False),
-    "macOS x86_64": (("macosx", "x86_64"), True),
-    "macOS arm64": (("macosx", "arm64"), True),
-    "Windows x64": (("win_amd64",), True),
-    "Windows arm64": (("win_arm64",), True),
+# wheel for each platform, and the free-threaded 3.14t and 3.15t wheels where
+# there is a CPython of them. Each platform as a wheel's platform tag names it
+# (its system and machine), with the oldest C library (glibc, musl) or macOS
+# it runs on: the build image's, or the deployment target's. A wheel that
+# needs a newer one leaves out systems the release says it runs on.
+SERVER_WHEELS: dict[str, tuple[str, str, tuple[int, int] | None, bool]] = {
+    "Linux x86_64 (glibc)": ("manylinux", "x86_64", (2, 17), True),
+    "Linux aarch64 (glibc)": ("manylinux", "aarch64", (2, 28), True),
+    "Linux x86_64 (musl)": ("musllinux", "x86_64", (1, 2), False),
+    "Linux aarch64 (musl)": ("musllinux", "aarch64", (1, 2), False),
+    "macOS x86_64": ("macosx", "x86_64", (10, 12), True),
+    "macOS arm64": ("macosx", "arm64", (11, 0), True),
+    "Windows x64": ("win", "amd64", None, True),
+    "Windows arm64": ("win", "arm64", None, True),
 }
 FREE_THREADED = ("cp314t", "cp315t")
+_LEGACY_MANYLINUX = {"manylinux1": (2, 5), "manylinux2010": (2, 12), "manylinux2014": (2, 17)}
+_NEEDS = {"manylinux": "glibc", "musllinux": "musl", "macosx": "macOS"}
+
+
+def _wheel_tags(name: str) -> tuple[str, str, str] | None:
+    """A wheel's Python, ABI and platform tags, by its file name."""
+    m = re.fullmatch(r"[^-]+-[^-]+(?:-\d[^-]*)?-([^-]+)-([^-]+)-([^-]+)\.whl", name)
+    return (m.group(1), m.group(2), m.group(3)) if m else None
+
+
+def _platforms(tag: str) -> list[tuple[str, str, tuple[int, int] | None]]:
+    """The platforms a wheel's platform tag (a set of them, joined by dots)
+    names: each one's system, machine, and the oldest version of its C
+    library or macOS it runs on (None on Windows)."""
+    named: list[tuple[str, str, tuple[int, int] | None]] = []
+    for one in tag.split("."):
+        if m := re.fullmatch(r"(manylinux|musllinux|macosx)_(\d+)_(\d+)_(\w+)", one):
+            named.append((m.group(1), m.group(4), (int(m.group(2)), int(m.group(3)))))
+        elif m := re.fullmatch(r"(manylinux1|manylinux2010|manylinux2014)_(\w+)", one):
+            named.append(("manylinux", m.group(2), _LEGACY_MANYLINUX[m.group(1)]))
+        elif m := re.fullmatch(r"win_(\w+)", one):
+            named.append(("win", m.group(1), None))
+    return named
 
 
 def abi3_tag() -> str:
@@ -572,20 +598,58 @@ def abi3_tag() -> str:
     return f"cp3{m.group(1)}"
 
 
-def missing_server_wheels(names: list[str]) -> list[str]:
-    """The wse-server wheels of SERVER_WHEELS that ``names`` lack."""
-    wheels = [n for n in names if n.startswith("wse_server-") and n.endswith(".whl")]
-    abi3 = f"-{abi3_tag()}-abi3-"
+def server_wheels(names: list[str]) -> tuple[list[str], list[str]]:
+    """Of the wse-server wheels SERVER_WHEELS names, those ``names`` lack;
+    and why each wse-server wheel among ``names`` that is none of them is
+    not."""
+    abi3 = abi3_tag()
+    found: set[tuple[str, str]] = set()
+    wrong: list[str] = []
+    for name in names:
+        if not (name.startswith("wse_server-") and name.endswith(".whl")):
+            continue
+        tags = _wheel_tags(name)
+        if tags is None:
+            wrong.append(f"{name} is no wheel's name")
+            continue
+        python, abi, platform_tag = tags
+        if abi == "abi3" and python == abi3:
+            kind = "abi3"
+        elif abi in FREE_THREADED and python == abi[:-1]:
+            kind = abi
+        elif abi == "abi3":
+            wrong.append(f"{name} is an abi3 wheel of {python}; requires-python takes {abi3}")
+            continue
+        elif abi in FREE_THREADED:
+            wrong.append(f"{name} is of {python} for the ABI {abi}: only {abi[:-1]}-{abi} loads")
+            continue
+        else:
+            wrong.append(f"{name} is for the ABI {abi}, none the release builds")
+            continue
+        named = _platforms(platform_tag)
+        known = False
+        for platform, (system, machine, oldest, _) in SERVER_WHEELS.items():
+            needs = [v for s, m, v in named if s == system and m == machine]
+            if not needs:
+                continue
+            known = True
+            # Any tag of the set will do: the oldest system it runs on.
+            need = min(needs, key=lambda v: v or (0, 0))
+            if oldest is not None and need is not None and need > oldest:
+                wrong.append(
+                    f"{name} needs {_NEEDS[system]} {need[0]}.{need[1]}; "
+                    f"the release runs on {oldest[0]}.{oldest[1]}"
+                )
+                continue
+            found.add((platform, kind))
+        if not known:
+            wrong.append(f"{name} is for no platform the release builds")
     missing = []
-    for platform, (fragments, free_threaded) in SERVER_WHEELS.items():
-        mine = [w for w in wheels if all(f in w for f in fragments)]
-        if not any(abi3 in w for w in mine):
-            missing.append(f"{platform} abi3")
-        if free_threaded:
-            for tag in FREE_THREADED:
-                if not any(f"-{tag}-" in w for w in mine):
-                    missing.append(f"{platform} {tag}")
-    return missing
+    for platform, (_, _, _, free_threaded) in SERVER_WHEELS.items():
+        for kind in ("abi3", *(FREE_THREADED if free_threaded else ())):
+            if (platform, kind) not in found:
+                missing.append(f"{platform} {kind}")
+    return missing, wrong
 
 
 # The artifact the files of each kind are published from: release.yml's
@@ -608,13 +672,6 @@ HOMES = {
 def _home(kind: str) -> str:
     """The artifact the files of *kind* are published from."""
     return "dart-binaries-*" if kind.startswith("Dart library ") else HOMES[kind]
-
-
-def _artifact(path: Path, base: Path) -> str:
-    """The artifact *path* came in: the directory under the download *base*
-    it is in ("" for a file directly in it)."""
-    parts = path.relative_to(base).parts
-    return parts[0] if len(parts) > 1 else ""
 
 
 def _maven_companion(name: str, base: str) -> bool:
@@ -644,11 +701,13 @@ def cmd_artifacts(args: argparse.Namespace) -> int:
     homed: list[str] = []
 
     def at_home(kind: str, path: Path, base: Path) -> bool:
-        """Counted when *path* is in the artifact *kind* is published from."""
-        if fnmatch.fnmatchcase(_artifact(path, base), _home(kind)):
+        """Counted when *path* is at the top of the artifact *kind* is
+        published from: the jobs take it there, by its name."""
+        parts = path.relative_to(base).parts
+        if len(parts) == 2 and fnmatch.fnmatchcase(parts[0], _home(kind)):
             counts[kind] += 1
             return True
-        print(f"  {'elsewhere':<9}  {path}  (published from {_home(kind)})")
+        print(f"  {'elsewhere':<9}  {path}  (published from the top of {_home(kind)})")
         return False
 
     for path, base in files:
@@ -711,8 +770,13 @@ def cmd_artifacts(args: argparse.Namespace) -> int:
             gh_error(
                 ".github/workflows/release.yml", None, f"no {kind} among the release artifacts"
             )
-    # Every platform's wheels: one of them missing is no release.
-    for wheel in missing_server_wheels(homed):
+    # Every platform's wheels, each for the systems the release says it runs
+    # on: one of them missing, or one of another kind, is no release.
+    missing, wrong = server_wheels(homed)
+    for why in wrong:
+        errors += 1
+        gh_error(".github/workflows/release.yml", None, why)
+    for wheel in missing:
         errors += 1
         gh_error(
             ".github/workflows/release.yml",
