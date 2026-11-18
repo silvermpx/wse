@@ -83,6 +83,28 @@ simulator_test() {
   return 1
 }
 
+# The integration test file $1 on an Android emulator. Flutter can fail to
+# start the Dart Development Service there: the file fails as it loads,
+# before any of its tests ran, and runs again then, three times at most. A
+# test that fails is never run again.
+emulator_test() {
+  local output code run
+  for run in 1 2 3; do
+    output="$(mktemp)"
+    code=0
+    "$flutter" test "$1" -d "$device" --suppress-analytics "${defines[@]}" 2>&1 | tee "$output" || code=$?
+    if ((code != 0)) && grep -q "Failed to start Dart Development Service" "$output" \
+      && ! grep -Eq '^[0-9:]+ \+[1-9]' "$output"; then
+      echo "the Dart Development Service did not start; no test ran (run $run of 3)" >&2
+      rm -f "$output"
+      continue
+    fi
+    rm -f "$output"
+    return "$code"
+  done
+  return 1
+}
+
 cd "$root"
 cargo build -q -p wse-client --example server
 program="$target/debug/examples/server"
@@ -148,6 +170,8 @@ case "${MODE:-debug}" in
     for test in "${tests[@]}"; do
       if [[ "$device" =~ ^[0-9A-F]{8}(-[0-9A-F]{4}){3}-[0-9A-F]{12}$ ]]; then
         simulator_test "$test"
+      elif [[ "$device" == emulator-* ]]; then
+        emulator_test "$test"
       else
         "$flutter" test "$test" -d "$device" --suppress-analytics "${defines[@]}"
       fi
