@@ -115,7 +115,9 @@
     }
   },
   "files": [
-    "dist/npm/"
+    "dist/npm/",
+    "ts-client/**/*.ts",
+    "!ts-client/__tests__/**"
   ],
   "scripts": {
     "clean": "node -e \"require('node:fs').rmSync('dist/npm', { recursive: true, force: true })\"",

@@ -142,3 +142,27 @@ echo "::group::Types and package layout (attw, publint)"
 npx --yes @arethetypeswrong/cli@0.18.5 "$tarball" --profile esm-only
 npx --yes publint@0.3.25 --strict "$tarball"
 echo "::endgroup::"
+
+echo "::group::Every source map's sources are in the package"
+mkdir "$work/unpacked"
+tar -xzf "$tarball" -C "$work/unpacked"
+node --input-type=module - "$work/unpacked/package" <<'NODE'
+import { existsSync, readFileSync, readdirSync } from 'node:fs';
+import { dirname, join, resolve } from 'node:path';
+const root = resolve(process.argv[2]);
+const maps = readdirSync(root, { recursive: true }).filter((f) => f.endsWith('.map'));
+const missing = [];
+for (const map of maps) {
+  const { sources = [], sourceRoot = '' } = JSON.parse(readFileSync(join(root, map), 'utf8'));
+  for (const source of sources) {
+    const at = resolve(dirname(join(root, map)), sourceRoot, source);
+    if (!at.startsWith(root) || !existsSync(at)) missing.push(`${map}: ${source}`);
+  }
+}
+if (maps.length === 0 || missing.length > 0) {
+  console.error(`${missing.length} sources missing of ${maps.length} maps`, missing.slice(0, 5));
+  process.exit(1);
+}
+console.log(`${maps.length} maps, every source in the package`);
+NODE
+echo "::endgroup::"
