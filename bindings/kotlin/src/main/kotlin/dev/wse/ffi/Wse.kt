@@ -407,8 +407,14 @@ class WseSendOptionsBuilder internal constructor() {
     /** Its id: the app's own, or a random UUID; its outcome names it. */
     fun id(id: String?): WseSendOptionsBuilder = apply { this.id = id }
 
-    /** How long it may wait to be written first (zero: the outbox's `maxAge`). */
-    fun ttl(ttl: Duration): WseSendOptionsBuilder = apply { this.ttl = millis(ttl) }
+    /**
+     * How long it may wait to be written first (not set: the outbox's `maxAge`; zero or less: it
+     * goes only if it is written at once, else it is said expired).
+     */
+    fun ttl(ttl: Duration): WseSendOptionsBuilder = apply {
+        // 0 is none (the outbox's max age): one with no time left may wait a millisecond.
+        this.ttl = maxOf(1uL, millis(ttl))
+    }
 
     /** Topics that must each be continuous when it goes. */
     fun requires(topics: List<String>): WseSendOptionsBuilder = apply { requires = topics.toList() }

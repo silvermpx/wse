@@ -31,6 +31,15 @@ class WseClientTest {
     }
 
     @Test
+    fun aSendWithNoTimeLeftMayWaitAMillisecondNeverAnHour() {
+        // Not set: the outbox's maxAge; no time left: written at once, or said expired.
+        assertEquals(0uL, Wse.sendOptions().build().ttlMs)
+        assertEquals(1uL, Wse.sendOptions().ttl(java.time.Duration.ZERO).build().ttlMs)
+        assertEquals(1uL, Wse.sendOptions().ttl(java.time.Duration.ofMillis(-5)).build().ttlMs)
+        assertEquals(1500uL, Wse.sendOptions().ttl(java.time.Duration.ofMillis(1500)).build().ttlMs)
+    }
+
+    @Test
     fun anEncryptedSessionWithThePinnedServer(): Unit = runBlocking {
         val identity = checkNotNull(System.getenv("WSE_TEST_IDENTITY")) { "run-tests.sh passes the key" }
         val client = connectClient(WseConfig(url = url, serverIdentityKeys = listOf(identity), insecure = true))

@@ -3,6 +3,7 @@ library;
 
 import 'dart:async';
 import 'dart:io';
+import 'dart:math' as math;
 import 'dart:typed_data';
 
 import 'package:flutter/foundation.dart'
@@ -201,7 +202,8 @@ class WseClient {
 
   /// [send] with its own [id] (the app's, say; a random UUID without one),
   /// how long it may wait to be written first ([ttl]; the outbox's
-  /// `maxAge` without one), the [requires] topics it waits for (see
+  /// `maxAge` without one; zero or less: it goes only if it is written at
+  /// once, else it is said expired), the [requires] topics it waits for (see
   /// [sendRequiring]), the [correlationId] the reply names (`cid`), how
   /// urgent it is ([priority], `pri`: 10 critical, 8 high, 5 normal, 3 low,
   /// 1 background; 0 none; the outbox keeps the order), or [live]: on the
@@ -249,9 +251,12 @@ class WseClient {
     bool live,
   ) {
     RangeError.checkValueInInterval(priority, 0, 255, 'priority');
+    // 0 is no time to live of its own (the outbox's maxAge): one with no
+    // time left may wait a millisecond, never wrap around to a near forever.
+    final ttlMs = ttl == null ? 0 : math.max(1, ttl.inMilliseconds);
     return rust.WseSendOptions(
       id: id,
-      ttlMs: BigInt.from(ttl?.inMilliseconds ?? 0),
+      ttlMs: BigInt.from(ttlMs),
       requires: requires,
       correlationId: correlationId,
       priority: priority,
@@ -358,7 +363,9 @@ class WseClient {
       _closing ??= _close(deadline);
 
   Future<void> _close(Duration deadline) async {
-    await _native.disconnect(deadlineMs: BigInt.from(deadline.inMilliseconds));
+    await _native.disconnect(
+      deadlineMs: BigInt.from(math.max(0, deadline.inMilliseconds)),
+    );
     _closed = true;
     // The events go on to what the close said, then end: the native client
     // goes once they ended (else with this object).

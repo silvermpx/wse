@@ -265,6 +265,34 @@ void main() {
     expect(refused, ['closed: left-behind']);
   });
 
+  test('a send whose time ran out before it went is said expired', () async {
+    // Nobody answers on port 9: what is sent waits, and its time runs out.
+    final client = await WseClient.start(
+      wseConfig('ws://127.0.0.1:9/wse', insecure: true),
+    ).timeout(const Duration(seconds: 2));
+    final items = StreamIterator(client.events());
+    client.trySendWith(
+      'echo',
+      '{}',
+      id: 'late',
+      ttl: const Duration(milliseconds: -1),
+    );
+    String? why;
+    while (why == null && await items.moveNext()) {
+      final item = items.current;
+      if (item.kind == WseItemKind.notDelivered && item.ids.contains('late')) {
+        why = item.reason;
+      }
+    }
+    expect(why, 'expired');
+    expect(client.kept, 0);
+    await items.cancel();
+    // A deadline already past closes at once.
+    await client
+        .close(deadline: const Duration(milliseconds: -5))
+        .timeout(const Duration(seconds: 5));
+  });
+
   test('a started client gets in on its own', () async {
     final client = await WseClient.start(wseConfig(url, insecure: true));
     final items = StreamIterator(client.events());
