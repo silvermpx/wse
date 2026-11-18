@@ -207,9 +207,10 @@ impl Stand {
             .ok_or_else(|| "the server is stopped".to_owned())
     }
 
-    /// What a driver needs for the case: where, its users' tokens, the keys
+    /// What a driver needs for the case: where (the server by `host`, the
+    /// name the driver reached this machine by), its users' tokens, the keys
     /// it pins.
-    pub fn about(&self, users: &[&str]) -> Result<Value, String> {
+    pub fn about(&self, users: &[&str], host: &str) -> Result<Value, String> {
         let publisher = self.publisher()?;
         let mut tokens = serde_json::Map::new();
         for user in users {
@@ -219,7 +220,7 @@ impl Stand {
             tokens.insert((*user).to_owned(), Value::String(token));
         }
         Ok(json!({
-            "url": format!("ws://{}/wse", self.addr),
+            "url": format!("ws://{host}:{}/wse", self.addr.port()),
             "tokens": tokens,
             "identity_key": publisher.e2e_identity_public_key(),
             "signing_key": publisher.signing_public_key(),

@@ -31,7 +31,8 @@ cargo run -p wse-conformance -- check --manifest tests/conformance/agents.json -
 A WebSocket of JSON requests, `{id, op, ...}`, each answered `{id, ok, ...}`:
 
 - `hello {agent, version, runtime, os, arch, features}`: the cases the driver can run;
-- `begin {case}`: the case's server (`url`), its users' `tokens`, the server's `identity_key` and
+- `begin {case}`: the case's server (`url`, by the host the driver reached the control channel by:
+  `10.0.2.2` from an Android emulator), its users' `tokens`, the server's `identity_key` and
   `signing_key`, and the `steps`;
 - `act {step}`: a server step: `publish {topic, count}` (answers the numbers published, `p.n`),
   `await_subscribers {topic, count}`, `kick`, `stop`, `restart` (a new server on the same port:

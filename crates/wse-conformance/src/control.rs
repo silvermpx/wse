@@ -31,9 +31,33 @@ struct Running {
 struct Session {
     catalog: Arc<Catalog>,
     out: PathBuf,
+    /// The name the driver reached this machine by.
+    host: String,
     agent: Option<Agent>,
     running: Option<Running>,
     verdicts: Vec<Verdict>,
+}
+
+/// The host of a request's `Host` (`10.0.2.2:5000` is `10.0.2.2`, `[::1]:5000`
+/// is `[::1]`): the name the driver reached this machine by, which its case's
+/// server goes by too (an Android emulator reaches this machine's loopback
+/// as 10.0.2.2). Anything a URL could not hold is 127.0.0.1.
+fn host_of(authority: &str) -> &str {
+    let host = match authority.strip_prefix('[') {
+        Some(rest) => rest
+            .find(']')
+            .map_or("", |end| &authority[..end + 2])
+            .trim_end_matches(':'),
+        None => authority
+            .rsplit_once(':')
+            .map_or(authority, |(host, _)| host),
+    };
+    let fits = |c: char| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | ':' | '[' | ']');
+    if host.is_empty() || !host.chars().all(fits) {
+        "127.0.0.1"
+    } else {
+        host
+    }
 }
 
 /// Serves drivers on `listener` until the process ends.
@@ -48,17 +72,20 @@ pub async fn serve(listener: TcpListener, catalog: Arc<Catalog>, out: PathBuf) {
         let out = out.clone();
         tokio::spawn(async move {
             let mut path = String::new();
+            let mut host = String::new();
             let accepted = tokio_tungstenite::accept_hdr_async(
                 stream,
                 |request: &tokio_tungstenite::tungstenite::handshake::server::Request, response| {
                     request.uri().path().clone_into(&mut path);
+                    let authority = request.headers().get("host").and_then(|h| h.to_str().ok());
+                    host_of(authority.unwrap_or_default()).clone_into(&mut host);
                     Ok(response)
                 },
             )
             .await;
             let served = match accepted {
                 Ok(ws) if path == "/bridge" => crate::bridge::host(ws).await,
-                Ok(ws) => session(ws, catalog, out).await,
+                Ok(ws) => session(ws, catalog, out, host).await,
                 Err(e) => Err(e.to_string()),
             };
             if let Err(why) = served {
@@ -72,10 +99,12 @@ async fn session(
     mut ws: tokio_tungstenite::WebSocketStream<TcpStream>,
     catalog: Arc<Catalog>,
     out: PathBuf,
+    host: String,
 ) -> Result<(), String> {
     let mut session = Session {
         catalog,
         out,
+        host,
         agent: None,
         running: None,
         verdicts: Vec::new(),
@@ -187,7 +216,7 @@ impl Session {
                 users.push(user);
             }
         }
-        let mut answer = stand.about(&users)?;
+        let mut answer = stand.about(&users, &self.host)?;
         answer["case"] = Value::String(case.case.clone());
         answer["steps"] = Value::Array(case.steps.clone());
         self.running = Some(Running {
@@ -244,5 +273,61 @@ impl Session {
         {
             eprintln!("wse-conformance: the report: {why}");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+
+    #[test]
+    fn the_host_is_the_authority_without_its_port() {
+        assert_eq!(host_of("10.0.2.2:5000"), "10.0.2.2");
+        assert_eq!(host_of("localhost"), "localhost");
+        assert_eq!(host_of("[::1]:5000"), "[::1]");
+        assert_eq!(host_of("[::1]"), "[::1]");
+        // Nothing a URL could not hold.
+        assert_eq!(host_of("a b:1"), "127.0.0.1");
+        assert_eq!(host_of("x/y:1"), "127.0.0.1");
+        assert_eq!(host_of(""), "127.0.0.1");
+    }
+
+    /// A driver that reached the control channel by another name of this
+    /// machine (an Android emulator's 10.0.2.2) reaches the case's server
+    /// by it too.
+    #[tokio::test]
+    async fn the_case_server_is_named_as_the_driver_named_the_control() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let out = std::env::temp_dir().join(format!("wse-conformance-host-{}", std::process::id()));
+        let served = tokio::spawn(serve(
+            listener,
+            Arc::new(crate::cases::catalog()),
+            out.clone(),
+        ));
+        let stream = TcpStream::connect(addr).await.unwrap();
+        let request = format!("ws://10.0.2.2:{}/control", addr.port())
+            .into_client_request()
+            .unwrap();
+        let (mut ws, _) = tokio_tungstenite::client_async(request, stream)
+            .await
+            .unwrap();
+        let mut call = async |body: Value| {
+            ws.send(Message::text(body.to_string())).await.unwrap();
+            loop {
+                if let Some(Ok(Message::Text(text))) = ws.next().await {
+                    return serde_json::from_str::<Value>(&text).unwrap();
+                }
+            }
+        };
+        let hello = json!({"id": 1, "op": "hello", "agent": "host-check", "features": []});
+        assert_eq!(call(hello).await["ok"], true);
+        let begun = call(json!({"id": 2, "op": "begin", "case": "connect.plain"})).await;
+        let url = begun["url"].as_str().unwrap_or_default().to_owned();
+        assert!(url.starts_with("ws://10.0.2.2:"), "{begun}");
+        call(json!({"id": 3, "op": "bye"})).await;
+        served.abort();
+        std::fs::remove_dir_all(&out).ok();
     }
 }
