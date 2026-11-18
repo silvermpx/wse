@@ -12,7 +12,8 @@
 //! its features reach, its report naming what ran it (version, runtime,
 //! system, architecture, of the runtime and system the manifest names) and
 //! coming from the commit `--source` names, or else the one checked out
-//! where the check runs (the server names the one it was started in).
+//! where the check runs (`WSE_SOURCE` names it in a copy with no git; the
+//! server names the one it was started in the same way).
 //! `wse-conformance cases` prints the built-in catalog.
 //!
 //! Beside the control channel, `/bridge` serves a window of the bridge's
@@ -46,9 +47,16 @@ fn option(args: &[String], name: &str) -> Option<String> {
         .cloned()
 }
 
-/// The commit the server is started in (git's HEAD where it runs), empty
-/// when there is none to tell.
+/// The commit the server is started in: the one `WSE_SOURCE` names (a copy
+/// of the tree with no git), else git's HEAD where it runs; empty when there
+/// is none to tell.
 fn source_commit() -> String {
+    if let Some(named) = std::env::var("WSE_SOURCE")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+    {
+        return named.trim().to_owned();
+    }
     std::process::Command::new("git")
         .args(["rev-parse", "HEAD"])
         .output()

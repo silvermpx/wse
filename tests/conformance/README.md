@@ -51,7 +51,8 @@ A WebSocket of JSON requests, `{id, op, ...}`, each answered `{id, ok, ...}`:
   `HEAD`) and the server's version, and each case's verdict. `check` fails a report that names
   no version, runtime, system or architecture, one whose runtime or system is not the one its
   manifest names for the agent (`runtime`, `os`: words one of which it must have, in any case),
-  and one from another commit than `--source COMMIT`, or than git's `HEAD` where it runs.
+  and one from another commit than `--source COMMIT`, or than git's `HEAD` where it runs (in a
+  copy of the tree with no git, `WSE_SOURCE` names the commit, for the server and the check).
 
 ## The trace
 
