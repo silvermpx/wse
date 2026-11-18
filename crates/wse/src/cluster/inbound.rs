@@ -385,7 +385,7 @@ async fn handle_cluster_inbound_generic<S>(
         ctx.clone(),
         dispatch_tx,
         cancel.clone(),
-        (last_activity.clone(), session_gen, heard),
+        (last_activity.clone(), session_gen, Arc::clone(&heard)),
     ));
 
     // Publish/Sub/Unsub frames from the manager (bidirectional routing),
@@ -419,6 +419,7 @@ async fn handle_cluster_inbound_generic<S>(
     let _ = writer_handle.await;
     let _ = dispatch_handle.await;
     let _ = heartbeat_handle.await;
+    heard.ended();
 
     // Deregister inbound peer from the cluster manager's peer_txs
     let _ = peer_reg_tx.send(PeerRegistration::Deregister {

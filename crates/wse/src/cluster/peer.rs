@@ -199,6 +199,7 @@ pub(super) async fn peer_reader<R: AsyncReadExt + Unpin>(
             }
             Some(ClusterFrame::Shutdown) => {
                 tracing::info!("[WSE-Cluster] Peer sent SHUTDOWN");
+                heard.shut_down();
                 break;
             }
             Some(ClusterFrame::Drain) => {
@@ -899,6 +900,27 @@ where
         }
     };
 
+    // Another node at this address than the one met there last, which went
+    // without SHUTDOWN: what that one published after what was heard of it
+    // is gone, and a client here whose last message came before it is not
+    // told it missed nothing.
+    let before = ctx
+        .incarnations
+        .insert(peer_addr.to_owned(), peer_instance_id.clone());
+    if let Some(before) = before
+        && before != peer_instance_id
+        && ctx
+            .heard
+            .remove(&before)
+            .is_some_and(|(_, heard)| heard.unclean())
+        && let Some(rm) = &ctx.recovery
+    {
+        tracing::warn!(
+            "[WSE-Cluster] {peer_addr} is another node now, and the last went without SHUTDOWN: what it published meanwhile is gone"
+        );
+        rm.lost_everything();
+    }
+
     let peer_cancel = global_cancel.child_token();
     let session_gen = PEER_SESSION_GENERATION.fetch_add(1, Ordering::AcqRel);
     let last_activity = Arc::new(AtomicU64::new(epoch_ms()));
@@ -996,7 +1018,7 @@ where
         ctx.clone(),
         dispatch_tx,
         peer_cancel.clone(),
-        (last_activity.clone(), session_gen, heard),
+        (last_activity.clone(), session_gen, Arc::clone(&heard)),
     ));
 
     if !go_live(
@@ -1036,6 +1058,7 @@ where
     let _ = reader_handle.await;
     let _ = dispatch_handle.await;
     let _ = heartbeat_handle.await;
+    heard.ended();
 
     let _ = peer_reg_tx.send(PeerRegistration::Deregister {
         peer_addr: peer_addr.to_owned(),

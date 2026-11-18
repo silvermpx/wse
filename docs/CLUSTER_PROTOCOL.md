@@ -267,6 +267,8 @@ Sent after the catch-up that follows a RESUME with topics (CAP_RESUME_TOPICS): t
 
 The last frame of a catch-up with CAP_ARRIVAL: everything the sender published to the cluster up to this arrival number reached the receiver before it, replayed or told LOST. Once it delivered what came before the frame, the receiver takes it as the last arrival it heard of the sender, and its next RESUME request starts there: a loss told once is not told again.
 
+A node that comes back after a lost link catches up from where the other left off. One that does not, because it stopped without its link up to say SHUTDOWN and another node now answers at its address, took what it published meanwhile with it: the node that dials that address takes each topic it has, or holds a stream of, as not kept from then on, and a client whose last message came before it resyncs. One that said SHUTDOWN had sent everything first.
+
 ## Interest-Based Routing
 
 Without interest routing, every MSG is forwarded to every peer regardless of whether that peer has subscribers for the topic. This works but wastes bandwidth in clusters where topics are partitioned across nodes.

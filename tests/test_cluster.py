@@ -809,6 +809,86 @@ def test_a_relayed_stream_whose_history_went_is_not_delivered_again_after_a_lost
     assert numbers == list(range(last + 1)), numbers
 
 
+def test_a_node_back_anew_after_a_lost_link_is_never_taken_to_have_lost_nothing(nodes):
+    """The origin publishes while its link to the other node is down, and
+    goes before the link is back; a new node comes up in its place. A client
+    of the other node whose last message came from the origin before the
+    outage is not told it missed nothing."""
+    websockets = pytest.importorskip("websockets")
+    origin = nodes(recovery=True)
+    relay = nodes(recovery=True)
+    origin.join()
+
+    async def scenario():
+        blink = Blink(origin)
+        await blink.start()
+        try:
+            relay.join(blink)
+            await until(lambda: origin.peers == 1 and relay.peers == 1)
+            async with websockets.connect(f"ws://127.0.0.1:{relay.port}/wse") as live:
+                await subscribe_next_client(relay, ["news", "barrier"])
+                await asyncio.sleep(0.35)  # the SUB reaches the origin
+                origin.server.broadcast("news", json.dumps({"t": "news", "p": {"n": 1}}))
+                (anchor,) = await messages_of_type(live, "news", 1)
+                blink.cut()
+                await until(lambda: origin.peers == 0 and relay.peers == 0)
+                origin.server.broadcast("news", json.dumps({"t": "news", "p": {"n": 2}}))
+                await asyncio.sleep(0.2)
+                # Its history goes with it; the other node hears no SHUTDOWN.
+                origin.stop()
+                anew = nodes(recovery=True)
+                anew.join()
+                blink.target = anew
+                blink.open = True
+                await until(lambda: anew.peers == 1 and relay.peers == 1, timeout=20.0)
+                await asyncio.sleep(0.4)
+                anew.server.broadcast("barrier", json.dumps({"t": "barrier", "p": {"n": 3}}))
+                await messages_of_type(live, "barrier", 1)
+            return await _recovered_both_ways(relay, anchor, websockets)
+        finally:
+            blink.close()
+
+    for answer, numbers in asyncio.run(scenario()):
+        assert answer["recovered"] is False or 2 in numbers, answer
+
+
+def test_a_node_that_stopped_saying_so_and_came_back_anew_lost_nothing(nodes):
+    """The origin stops while its link is up (it says SHUTDOWN after what it
+    sent), and a new node comes up in its place: a client of the other node
+    recovers as before."""
+    websockets = pytest.importorskip("websockets")
+    origin = nodes(recovery=True)
+    relay = nodes(recovery=True)
+    origin.join()
+
+    async def scenario():
+        blink = Blink(origin)
+        await blink.start()
+        try:
+            relay.join(blink)
+            await until(lambda: origin.peers == 1 and relay.peers == 1)
+            async with websockets.connect(f"ws://127.0.0.1:{relay.port}/wse") as live:
+                await subscribe_next_client(relay, ["news", "barrier"])
+                await asyncio.sleep(0.35)  # the SUB reaches the origin
+                origin.server.broadcast("news", json.dumps({"t": "news", "p": {"n": 1}}))
+                (anchor,) = await messages_of_type(live, "news", 1)
+                origin.stop()
+                await until(lambda: relay.peers == 0)
+                anew = nodes(recovery=True)
+                anew.join()
+                blink.target = anew
+                await until(lambda: anew.peers == 1 and relay.peers == 1, timeout=20.0)
+                await asyncio.sleep(0.4)
+                anew.server.broadcast("barrier", json.dumps({"t": "barrier", "p": {"n": 3}}))
+                await messages_of_type(live, "barrier", 1)
+            return await _recovered_both_ways(relay, anchor, websockets)
+        finally:
+            blink.close()
+
+    for answer, numbers in asyncio.run(scenario()):
+        assert answer["recovered"] is True and numbers == [], answer
+
+
 def test_a_message_its_origin_had_no_room_to_keep_is_never_said_recovered(nodes):
     """The origin of a message had no room left for its history and sent it
     on with no position: a client of the other node whose last message of the

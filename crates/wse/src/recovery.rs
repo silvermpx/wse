@@ -1610,6 +1610,29 @@ impl RecoveryManager {
         }
     }
 
+    /// A node this one heard from is gone without a word, and another took
+    /// its place: what it published that this node did not hear of is gone,
+    /// in any topic this node has or holds a stream of.
+    pub(crate) fn lost_everything(&self) {
+        let mut topics: Vec<String> = self
+            .interest_since
+            .iter()
+            .map(|entry| entry.key().clone())
+            .chain(self.foreign_epochs.iter().map(|entry| entry.key().clone()))
+            .chain(
+                self.relayed_unkept
+                    .iter()
+                    .map(|entry| foreign_topic(entry.key()).to_owned()),
+            )
+            .filter(|topic| !crate::server::is_pattern(topic))
+            .collect();
+        topics.sort_unstable();
+        topics.dedup();
+        for topic in &topics {
+            self.not_kept(topic);
+        }
+    }
+
     /// A peer said messages of `topic` (or, a pattern, of each topic here it
     /// matches) were published that no node holds.
     pub(crate) fn lost(&self, topic: &str) {

@@ -184,6 +184,10 @@ pub(crate) struct ClusterContext {
     /// What this node heard of each peer, by its instance id: where the
     /// catch-up starts once a lost link to it is back (CAP_ARRIVAL).
     pub heard: Arc<DashMap<String, Arc<Heard>>>,
+    /// The instance last met at each address this node dials: one that is
+    /// another node now, after a link that ended without SHUTDOWN, took
+    /// what it published meanwhile with it.
+    pub incarnations: Arc<DashMap<String, String>>,
 }
 
 /// What a node heard of a peer: the last of the peer's arrivals it heard of
@@ -194,6 +198,12 @@ pub(crate) struct Heard {
     /// A message of the peer was shed here since the catch-up: `through`
     /// stays where it was, so the next catch-up brings it again.
     shed: std::sync::atomic::AtomicBool,
+    /// The current link's peer said SHUTDOWN.
+    shut_down: std::sync::atomic::AtomicBool,
+    /// The last link ended without SHUTDOWN, and no catch-up from the peer
+    /// came since: what it published after `through` reaches this node only
+    /// if it comes back.
+    unclean: std::sync::atomic::AtomicBool,
 }
 
 impl Heard {
@@ -211,9 +221,26 @@ impl Heard {
 
     /// The peer's catch-up covers up to `through`.
     pub(crate) fn caught_up(&self, through: u64) {
+        self.unclean.store(false, Ordering::Relaxed);
         if !self.shed.load(Ordering::Relaxed) {
             self.through.fetch_max(through, Ordering::Relaxed);
         }
+    }
+
+    /// The peer said SHUTDOWN: it published nothing more.
+    pub(crate) fn shut_down(&self) {
+        self.shut_down.store(true, Ordering::Relaxed);
+    }
+
+    /// The link to the peer ended.
+    pub(crate) fn ended(&self) {
+        let clean = self.shut_down.swap(false, Ordering::Relaxed);
+        self.unclean.store(!clean, Ordering::Relaxed);
+    }
+
+    /// The last link ended without SHUTDOWN, and no catch-up came since.
+    pub(crate) fn unclean(&self) -> bool {
+        self.unclean.load(Ordering::Relaxed)
     }
 
     /// Where the next catch-up starts from: named in the request, after

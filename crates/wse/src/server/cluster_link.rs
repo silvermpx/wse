@@ -227,6 +227,7 @@ pub(crate) fn connect(
         producers: Arc::clone(&shared.producers),
         producer_links: Arc::clone(&shared.producer_links),
         heard: Arc::new(dashmap::DashMap::new()),
+        incarnations: Arc::new(dashmap::DashMap::new()),
     };
 
     tokio::spawn(cluster::cluster_manager(

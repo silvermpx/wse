@@ -206,7 +206,9 @@ server every client is checked against.
   empty outage. What a node publishes to its own subscribers only is a
   stream of its own: it no longer leaves a gap in the stream other nodes get,
   nor pushes a message for the cluster out of its history. A link too full
-  for a message is made again, and catches up, instead of dropping it.
+  for a message is made again, and catches up, instead of dropping it. A
+  node that went without SHUTDOWN while its link was down, another node now
+  at its address, is no longer taken to have published nothing meanwhile.
 - Swift, Kotlin and Dart: once the client is closed, the events end with
   what the close said (the messages it will not deliver, the close itself);
   a reader waiting at the close no longer gets its end before them.
