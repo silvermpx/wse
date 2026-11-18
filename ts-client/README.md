@@ -595,8 +595,11 @@ sendMessage('open_valve', { id: 'v-7' }, { live: true });                 // now
 ```
 
 Every message, except a live or signed one, waits in the outbox until the server answers for it,
-goes again after a reconnect, and reaches the server's application once: it is numbered, and a
-server of 3.2 drops a repeat. The client says what became of each, by its id: `wseDelivered`
+goes again after a reconnect, and is numbered: a server of 3.2 drops a repeat of one it took. What
+the server cannot tell (the client comes from a cluster node that is gone, or its handler panicked
+on the message) reaches the server's application marked `possible_repeat`, and an application that
+must apply an order once checks the message's `id` against what it applied. The client says what
+became of each, by its id: `wseDelivered`
 (`{ ids }`) once the server took it, `wseNotDelivered` (`{ reason, ids }`) when it will not:
 the server refused it (`busy`, `rate_limited`, `missing`, `not_ready`), it was not written within
 its time (`expired`), it was the last user's (`user_changed`), the user signed out (`cleared`), or

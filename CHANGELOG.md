@@ -51,8 +51,11 @@ conformance server every client is checked against.
   sent, except a live or signed one, waits until the server confirms it,
   numbered, and goes again after a reconnect, in the order it was sent, only
   ever as the user whose connection first wrote it; the server takes each
-  once (a repeat is confirmed and dropped, a refusal said: `busy`,
-  `rate_limited`, `missing`, `not_ready`). The application
+  once when it can tell it took it already (a repeat is confirmed and
+  dropped, a refusal said: `busy`, `rate_limited`, `missing`, `not_ready`),
+  and when it cannot (the client's last node is gone, a handler panicked)
+  its application gets the message marked `possible_repeat` and checks
+  its id against what it applied. The application
   hears what became of each message by its id (`delivered`,
   `not_delivered`: also `expired`, `user_changed`, `cleared`, `closed`). In
   memory by default; durable in a file, one format for the Rust client (and

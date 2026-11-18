@@ -531,7 +531,7 @@ The negotiated protocol version is the minimum of both sides.
 
 ## The client's outbox
 
-From 3.2 a client keeps each message it sends, except one sent live, until the server answers for it, and sends what was not answered again after a reconnect. The server confirms what its application took, drops a repeat of a message it took already and says what it refused, so the application takes each message once.
+From 3.2 a client keeps each message it sends, except one sent live, until the server answers for it, and sends what was not answered again after a reconnect. The server confirms what its application took, drops a repeat of a message it took already and says what it refused; what it cannot tell reaches the application marked as a possible repeat (see below).
 
 **Numbers.** Each outbox is a producer with a random id, and each of its messages carries its number, `s`, from 1 up, first in the object: `{"s":42,"t":"order","p":{...},"id":"..."}`. A client sends its messages in the order of their numbers; a number may be skipped (a message that expired before it was sent). The number comes first so that the server can read it from the first bytes of a frame it does not parse (one its rate limit drops).
 

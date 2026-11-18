@@ -247,10 +247,10 @@ while let Some(incoming) = events.next().await {
 Every message sent, except a live or signed one, waits in the outbox until
 the server answers for it. It goes numbered and in order; after a reconnect
 what was not answered goes again, before anything new, and a 3.2 server
-drops a repeat, so its application takes each message once. What the
-server cannot tell (the client comes from a node of a cluster that is gone)
-reaches its application marked `possible_repeat`, and the application
-checks the message's `id`.
+drops a repeat of one it took. What the server cannot tell (the client
+comes from a node of a cluster that is gone, or its handler panicked on the
+message) reaches its application marked `possible_repeat`, and the
+application checks the message's `id`.
 
 The application hears what became of each message by its id:
 `Event::Delivered`, or `Event::NotDelivered` and why: the server refused it
@@ -298,7 +298,7 @@ the browser, `Offline::in_indexed_db(name)` keeps it in the IndexedDB
 database `name`, so that it outlives the page: each tab keeps a producer of
 its own there, held by a Web Lock while the tab lives, and sends on its own
 connection; a page that opens takes over what a closed or crashed tab left,
-under that tab's producer, so the server still takes each message once. It
+under that tab's producer, so the server still knows a repeat of each. It
 is the database the TypeScript client keeps. Web Locks need a secure
 context (HTTPS, or localhost): without them, or without IndexedDB, it is an
 `Event::StorageFailed` and the outbox stays in memory. `config.offline =

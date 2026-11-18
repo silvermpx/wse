@@ -267,7 +267,7 @@ await client.send("log", {"msg": "debug"}, priority=MessagePriority.BACKGROUND) 
 
 ### The outbox
 
-Every message sent, except a live or signed one, waits in the outbox until the server answers for it, goes again after a reconnect, and reaches the server's application once: it is numbered, and a 3.2 server drops a repeat. The handlers of `delivered` (`{"ids": [...]}`) and `not_delivered` (`{"reason": ..., "ids": [...]}`) hear what became of each, by its id - the application's own with `send(..., id=...)`, a random UUID without one. They are handlers' events, as `connected` is, never on the stream `recv()` reads.
+Every message sent, except a live or signed one, waits in the outbox until the server answers for it, goes again after a reconnect, and is numbered: a 3.2 server drops a repeat of one it took. What the server cannot tell (the client comes from a cluster node that is gone, or its handler panicked on the message) reaches the server's application marked `possible_repeat`, and an application that must apply an order once checks the message's `id` against what it applied. The handlers of `delivered` (`{"ids": [...]}`) and `not_delivered` (`{"reason": ..., "ids": [...]}`) hear what became of each, by its id - the application's own with `send(..., id=...)`, a random UUID without one. They are handlers' events, as `connected` is, never on the stream `recv()` reads.
 
 ```python
 @client.on("delivered")
