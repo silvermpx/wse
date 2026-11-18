@@ -109,11 +109,12 @@ def rust_jwt_encode(
 ) -> str:
     """Encode claims into a JWT token string.
 
-    Supported algorithms: HS256 (default), RS256, ES256.
-    For HS256: secret is the shared key (>= 32 bytes).
-    For RS256/ES256: secret is the PEM-encoded private key.
+    Supported algorithms: HS256 (default), HS384, HS512, RS256, RS384,
+    RS512, PS256, PS384, PS512, ES256, ES384 and EdDSA. For HS*: secret is
+    the shared key (at least 32, 48 or 64 bytes). For the others: secret is
+    the PEM-encoded private key. key_id sets the kid header.
 
-    Raises ValueError if algorithm is not HS256, RS256, or ES256.
+    Raises ValueError for an algorithm not among these.
     Raises RuntimeError on signing failure (invalid key, bad PEM, etc.).
     """
     ...
@@ -129,12 +130,14 @@ def rust_jwt_decode(
 ) -> dict[str, Any] | None:
     """Decode and validate a JWT. Returns None on failure.
 
-    Supported algorithms: HS256 (default), RS256, ES256.
-    For HS256: secret is the shared key (>= 32 bytes).
-    For RS256/ES256: secret is the PEM-encoded public key.
+    Supported algorithms: HS256 (default), HS384, HS512, RS256, RS384,
+    RS512, PS256, PS384, PS512, ES256, ES384 and EdDSA. For HS*: secret is
+    the shared key (at least 32, 48 or 64 bytes). For the others: secret is
+    the PEM-encoded public key. previous_secret takes tokens of the key
+    before a rotation; key_id requires the token's kid.
 
-    Raises ValueError if algorithm is not HS256, RS256, or ES256.
-    Returns None on all other failures (expired, wrong key, invalid signature, etc.)
+    Returns None on any failure: an unsupported algorithm, an expired
+    token, a wrong key, an invalid signature, and the rest.
     """
     ...
 
@@ -728,6 +731,9 @@ class RustWSEServer:
         by default), or with single_port=True on the WebSocket port. One of
         the two is required (ValueError otherwise); a cluster_port that
         cannot be bound raises OSError.
+
+        Addresses are host:port; an IPv6 address carries its zone by number
+        ([fe80::1%2]:9999): one by an interface's name raises ValueError.
         """
         ...
     def cluster_connected(self) -> bool:
@@ -745,10 +751,19 @@ class RustWSEServer:
     def prometheus_metrics(self) -> str:
         """Return Prometheus exposition format metrics string.
 
-        Gauges: wse_connections, wse_inbound_queue_depth, wse_uptime_seconds,
-        wse_slow_consumer_drops, wse_inbound_dropped.
+        Gauges: wse_connections, wse_topics, wse_inbound_queue_depth,
+        wse_command_queue_depth, wse_uptime_seconds, wse_build_info.
+        Counters: wse_connections_accepted_total,
+        wse_connections_rejected_total, wse_messages_sent_total,
+        wse_messages_received_total, wse_bytes_sent_total,
+        wse_bytes_received_total, wse_slow_consumer_drops_total,
+        wse_inbound_dropped_total, wse_auth_failures_total,
+        wse_rate_limited_total.
         Per-topic: wse_topic_messages_total{topic="..."} (top 50 by count).
-        Cluster: wse_cluster_peers, wse_cluster_dlq_size.
+        Cluster: wse_cluster_peers, wse_cluster_messages_sent_total,
+        wse_cluster_messages_delivered_total, wse_cluster_messages_dropped_total,
+        wse_cluster_bytes_sent_total, wse_cluster_bytes_received_total,
+        wse_cluster_reconnects_total.
         Recovery: wse_recovery_topics, wse_recovery_bytes.
         Presence: wse_presence_topics, wse_presence_users.
         """

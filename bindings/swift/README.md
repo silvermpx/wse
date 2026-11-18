@@ -104,8 +104,10 @@ closed with it in memory (`closed`).
 the outbox on sign-out. The options also name a request's `correlationId`,
 which the reply names back (`message.correlationId`), and its `priority`
 (10 critical, 8 high, 5 normal, 3 low, 1 background), for the server's
-app; `live: true` sends on the connection that is ready now, or not at
-all.
+app; `requires: ["orders"]` waits until those topics are continuous, as
+`sendRequiring` does, under the app's own id; `live: true` sends on the
+connection that is ready now, or not at all. A message received carries
+its sender's `priority` and `timestamp` too.
 
 The outbox is in memory by default. With `offline: WseOffline(path: path)`
 (a file in the app's own storage) it outlives the app. At most
@@ -137,4 +139,8 @@ SIMULATOR=1 bindings/swift/run-tests.sh      # and on an iOS simulator
 SIMULATOR=only bindings/swift/run-tests.sh   # on an iOS simulator alone
 ```
 
-They run against the Rust client's example server, which the script starts.
+They run against the Rust client's example server and the conformance server,
+which the script starts: the tests include the conformance cases (agent
+`swift`, and `swift-ios` on the simulator), checked against
+`tests/conformance/swift.json` and `swift-ios.json` after each run.
+`CONFIGURATION` builds the simulator's run as Debug (default) or Release.

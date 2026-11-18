@@ -427,14 +427,18 @@ The messages each client sends go through a per-connection token bucket
 before the server parses them (`rate_limit_capacity`, `rate_limit_refill`):
 - **Capacity**: 100,000 messages
 - **Refill rate**: 10,000 messages/second
-- **Exceeded**: the message is dropped; the client receives an error with code `RATE_LIMITED` (at most once a second)
+- **Exceeded**: the message is dropped; the client receives an error with code `RATE_LIMITED` (at most once a second), and a message of a 3.2 client's outbox is refused (`rate_limited`), which its client hears
 - **Warning**: sent at 20% remaining capacity
 - **Abuse**: a client that keeps sending into the empty bucket for 10 seconds is closed with code 4429
 
 Callback mode additionally bounds the callbacks in flight per connection
 (256). In both modes the client messages waiting for the application are
 bounded by `max_inbound_queue_size` (count) and `max_inbound_queue_bytes`
-(size); connect, disconnect and presence events are never dropped.
+(size); connect, disconnect and presence events are never dropped. A message
+of a 3.2 client's outbox the application has no room for is refused instead
+(`busy`), and one that comes before the application took the connection
+(`not_ready`): its client's application hears it was not delivered, and
+why.
 
 ### Client-Side
 
@@ -450,16 +454,16 @@ The frontend `RateLimiter` prevents excessive sends.
 
 ### Handshake Protection
 
-- 10-second timeout on WebSocket upgrade handshake prevents slow loris attacks
+- 5-second timeout on WebSocket upgrade handshake prevents slow loris attacks
 - Connections that stall during HTTP upgrade are terminated before consuming server resources
-- At most 512 connections may sit in the pre-handshake state at once (`MAX_PENDING_HANDSHAKES`); further accepts are dropped before the upgrade, so a flood of half-open sockets can't exhaust tasks/file descriptors before the connection limit applies
+- At most 4096 connections may sit in the pre-handshake state at once (`MAX_PENDING_HANDSHAKES`); further accepts are dropped before the upgrade, so a flood of half-open sockets can't exhaust tasks/file descriptors before the connection limit applies
 
 ### Connection Limits
 
 - `max_connections` caps total concurrent WebSocket connections; a full server answers the upgrade with HTTP 503 and `Retry-After: 5`
 - `max_subscriptions_per_connection` caps topics per connection (0 = unlimited). Prevents topic explosion DoS where a single client creates millions of unique topics
 - Inbound queue bounded at 131,072 events
-- Per-connection deduplication: 50,000-entry AHashSet with FIFO eviction
+- `send_event` deduplication: one server-wide window of the last 50,000 (connection, id) pairs, oldest out first
 
 ## Topic ACL
 

@@ -655,6 +655,9 @@ impl RustWSEServer {
     /// 0.0.0.0 by default), or with `single_port=True` on the WebSocket port.
     /// One of the two is required.
     ///
+    /// Addresses are `host:port`; an IPv6 address carries its zone by number
+    /// (`[fe80::1%2]:9999`): one by an interface's name is a ValueError.
+    ///
     /// Raises RuntimeError if cluster is already connected or if seeds
     /// is used without cluster_addr, ValueError for a missing or short
     /// secret or a missing or contradictory option, OSError if

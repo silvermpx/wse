@@ -17,7 +17,7 @@ Server: `bench_server.py` with `RustWSEServer` - same maturin-compiled binary as
 running through the full Python wrapper with drain_mode=ON and JWT auth enabled.
 
 - **Node.js**: 22.22.0
-- **WebSocket**: `ws` 8.18 (C++ addon for frame encode/decode)
+- **WebSocket**: `ws` 8.18 (frames in JavaScript: its optional native addons are not installed)
 - **Timer**: `process.hrtime.bigint()` (nanosecond precision)
 - **Histogram**: `hdr-histogram-js` 3.0
 
@@ -249,9 +249,10 @@ Node.js `ws` can handle well beyond 64K - the server proved 500K with the Rust c
 ## Reproducing
 
 ```bash
-# Start the server (separate terminal)
-cd /root/wse && source venv/bin/activate
-DRAIN_MODE=1 python benchmarks/bench_server.py --max-connections 100000
+# Start the server (separate terminal), from the checkout's root with the
+# wse-server package installed
+ulimit -n 100000
+python benchmarks/bench_server.py --max-connections 100000
 
 # Navigate to ts-bench
 cd benchmarks/ts-bench

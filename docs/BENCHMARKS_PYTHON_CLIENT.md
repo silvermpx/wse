@@ -435,17 +435,19 @@ Results: [BENCHMARKS_RUST_CLIENT.md](BENCHMARKS_RUST_CLIENT.md).
 ## Reproducing
 
 ```bash
-# Start the benchmark server (standalone mode)
-python benchmarks/bench_server.py
-
-# Single-client benchmarks
-python benchmarks/bench_wse.py
+# Start the benchmark server (standalone mode, drain mode on;
+# --no-drain for the drain_mode=OFF tables)
+python benchmarks/bench_server.py --max-connections 10000
+TOKEN="$(python benchmarks/bench_server.py --token-only)"
 
 # Multi-process benchmarks (M2: 10 workers, EPYC: 64 workers)
-python benchmarks/bench_wse_multiprocess.py --workers 10
+python benchmarks/bench_wse_multiprocess.py --workers 10 --token "$TOKEN"
 
 # Brutal concurrency (EPYC)
-python benchmarks/bench_brutal.py --token <JWT> --tiers 100,500,1000 --duration 5
+python benchmarks/bench_brutal.py --token "$TOKEN" --tiers 100,500,1000 --duration 5
+
+# Single-client benchmarks: against an application with a login endpoint
+python benchmarks/bench_wse.py --port 5005 --login-url /auth/login --email <email> --password <password>
 ```
 
 ---

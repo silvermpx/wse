@@ -155,8 +155,11 @@ WseSendOptions(id = "order-17"))` sends with the app's own id and returns it;
 `client.clear()` empties the outbox on sign-out. The options also name a
 request's `correlationId`, which the reply names back
 (`message.correlationId`), and its `priority` (10 critical, 8 high, 5 normal,
-3 low, 1 background), for the server's app; `live = true` sends on the
-connection that is ready now, or not at all.
+3 low, 1 background), for the server's app; `requires = listOf("orders")`
+waits until those topics are continuous, as `sendRequiring` does, under the
+app's own id; `live = true` sends on the connection that is ready now, or not
+at all. A message received carries its sender's `priority` and `timestamp`
+too.
 
 The outbox is in memory by default. With `offline = WseOffline(path = path)`
 (a file in the app's own storage) it outlives the app. At most `maxMessages`
@@ -219,7 +222,7 @@ once the topics are continuous. The outbox in a file is
 `Wse.config(url).offline(Wse.offline().path(file).build())`, `Wse.kept(client)`
 says how many messages wait in it, and `Wse.sendWith(client, kind, json,
 Wse.sendOptions().id("order-17").build())` sends with the app's own id
-(`.correlationId(...)`, `.priority(...)` and `.live(true)` too). Signed messages: `Wse.generateSigningKey()`, `Wse.signingPublicKey(key)`
+(`.correlationId(...)`, `.priority(...)`, `.requires(List.of("orders"))` and `.live(true)` too). Signed messages: `Wse.generateSigningKey()`, `Wse.signingPublicKey(key)`
 and `Wse.sendSigned(...)`. Kotlin's unsigned numbers are hidden from Java,
 and `Wse` gives them as plain numbers: a `Disconnected` item's with
 `Wse.retryInMillis(...)`, `Wse.attempt(...)` and `Wse.closeCode(...)`; a
@@ -239,7 +242,11 @@ bindings/kotlin/run-jvm-consumer-check.sh        # the JVM package in a Java app
 bindings/kotlin/android/run-emulator-tests.sh    # in an Android emulator
 ```
 
-They run against the Rust client's example server, which the scripts start.
-`run-jvm-consumer-check.sh` makes the JAR with this machine's library, lays
-it out in a Maven repository and runs an application that installs it from
-there (`ALPINE=1` on Linux runs it in Alpine too).
+They run against the Rust client's example server and the conformance server,
+which the scripts start: the tests include the conformance cases (agents
+`kotlin` and `kotlin-android`), checked against `tests/conformance/kotlin.json`
+and `kotlin-android.json`. `run-jvm-consumer-check.sh` makes the JAR with
+this machine's library, lays it out in a Maven repository and runs an
+application that installs it from there (`ALPINE=1` on Linux runs it in
+Alpine too; a JAR made here then also carries the musl library, built in the
+container `MUSL_IMAGE` names).

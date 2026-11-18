@@ -19,4 +19,6 @@ integration test on a device: an iOS simulator's id, an Android emulator's
 (`emulator-5554`), or this desktop's (`macos`, `windows`, `linux`; on a Linux
 server under `xvfb-run`). With `MODE=release` it builds `lib/check.dart` in
 release mode instead and, on a desktop, runs the built app from a folder of
-its own.
+its own. On an iOS simulator or an Android emulator the integration test also
+runs the conformance cases against a conformance server of its own, and
+checks them (agents `dart-ios` and `dart-android`).

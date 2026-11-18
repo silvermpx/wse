@@ -8,7 +8,7 @@ Thank you for your interest in contributing to WSE. This guide covers the develo
 
 - Python 3.12+ for the server (the Python client supports 3.11+)
 - Rust 1.95+ (stable; the minimum is `rust-version` in `Cargo.toml`)
-- Node.js 22 for the TS client's tests and build (the published package runs on Node 22+)
+- Node.js 22.22+ or 24.15+ for the TS client's tests and build (Angular 22, in the frameworks lane, needs it; the published package runs on Node 22+)
 - maturin 1.16+ (`pip install maturin`)
 
 ### Building from Source
@@ -39,6 +39,10 @@ cargo test -p wse --features python
 cargo test -p wse --no-default-features
 cargo test -p wse-client
 cargo test -p wse-client --no-default-features
+# What CI runs: the workspace (the client's window bridge among it), then the
+# client with the native module the mobile packages are built on
+cargo test --workspace
+cargo test -p wse-client --features native
 
 # The pure-Rust crypto the client has in the browser, natively
 RUSTFLAGS="--cfg wse_rustcrypto" CARGO_TARGET_DIR=target/rustcrypto \
@@ -59,12 +63,20 @@ cd python-client && pytest tests/
 # TS client
 npm test
 
+# The conformance cases every client passes (tests/conformance/README.md):
+# the server, the drivers against it, then the judge; or all of it at once
+cargo xtask check conformance
+
+# The Tauri plugin, a workspace of its own
+cd bindings/tauri && cargo test -p tauri-plugin-wse
+
 # The mobile clients, each against the Rust client's example server:
 # Swift on the Mac (SIMULATOR=1 also on an iOS simulator of its own),
 # Kotlin on the JVM, Dart with Flutter; and on an Android emulator the
 # Kotlin library, an app built with R8 and the Flutter example
 bindings/swift/run-tests.sh
 bindings/kotlin/run-tests.sh
+bindings/kotlin/run-jvm-consumer-check.sh
 bindings/dart/run-tests.sh
 bindings/kotlin/android/run-emulator-tests.sh
 bindings/kotlin/android/run-consumer-check.sh
@@ -94,12 +106,16 @@ types and tests, the Python client's lint and tests (through uv), and for the
 pushed range the commit messages and a gitleaks scan. A push leaves only once
 it passes.
 
-`cargo xtask check` runs `fast`, then CI's jobs here: the Rust tests, the TypeScript client,
-the Python client and server (and the TypeScript client against it), Kotlin
-on the JVM, the Dart package, the Flutter example as a desktop app, and Swift.
-A lane this machine has no tools for is skipped with the reason (Swift needs
-a Mac; a Linux desktop app needs GTK 3 and xvfb), so a Mac and a Linux
-machine between them cover CI. `FLUTTER=` and `GRADLE=` name those tools when
+`cargo xtask check` runs `fast`, then CI's jobs here: the Rust tests, the
+Rust client in the browser, the TypeScript client, the framework
+applications (Angular, Solid, Electron and Tauri, built against the packed
+package), the Python client and server (and the TypeScript client against
+it), the conformance cases, Electron, Tauri, Kotlin and Java on the JVM, the
+Dart package, the Flutter example as a desktop app, and Swift. Run `npm ci`
+first. A lane this machine has no tools for is skipped with the reason (Swift
+needs a Mac; Angular 22 needs Node 22.22 or newer; on Linux a desktop app
+needs GTK 3 and xvfb, Electron a display or xvfb-run, and Tauri WebKitGTK
+4.1), so a Mac and a Linux machine between them cover CI. `FLUTTER=` and `GRADLE=` name those tools when
 they are not on PATH. Each lane builds under `target/xtask-check/<lane>/` and
 logs to `target/xtask-check/<lane>.log`. `cargo xtask check swift dart` runs
 only the lanes named, side by side, without `fast`.
@@ -126,10 +142,15 @@ the one result a pull request needs.
 wse/
   crates/wse/            # The engine (server, cluster, presence, recovery) and the protocol it shares with the client; its Python module behind `python`
   crates/wse-client/     # The Rust client (wse-client on crates.io)
+  crates/wse-ffi/        # The Rust client's interface for the Swift, Kotlin and Java packages
+  crates/wse-bindgen/    # Generates those packages' bindings
+  crates/wse-conformance/ # The conformance server and its judge
   crates/wse-py/         # The Python extension built from it (wse-server on PyPI)
   wse_server/            # Python server package (thin wrapper over Rust)
   python-client/         # Python client SDK (wse-client on PyPI)
-  ts-client/             # TypeScript/React client SDK (wse-client on npm)
+  ts-client/             # TypeScript client (wse-client on npm): core, React, Vue, Svelte, Angular, Solid, React Native, the window bridge, Electron, Tauri
+  bindings/              # Swift, Kotlin and Java, Dart, Electron, and the Tauri plugin (a workspace of its own)
+  hooks/                 # The gate before a push (cargo xtask hooks)
   xtask/                 # Repository checks (cargo xtask)
   examples/              # Working example scripts
   tests/                 # Integration tests
@@ -142,9 +163,9 @@ wse/
 ### Rust
 
 - Format with `cargo fmt` before every commit.
-- Pass `cargo clippy --workspace --all-targets -- -D warnings`, `cargo clippy -p wse --all-targets -- -D warnings` and `cargo clippy -p wse-client --no-default-features --all-targets -- -D warnings` with zero warnings.
+- Pass `cargo xtask fast` with zero warnings: rustfmt and clippy for every build CI checks (the workspace, the engine without its server, the client with and without its crypto and with `native`, and the browser's).
 - Use `DashMap` for concurrent state, `crossbeam` for channels.
-- Prefer `Arc<Bytes>` for shared message payloads (zero-copy broadcast).
+- Shared message payloads are `Bytes` (zero-copy broadcast).
 
 ### Performance
 
@@ -181,24 +202,11 @@ Speed is a requirement from the first line, not something to win back later.
 
 ## Commit Messages
 
-Write commit messages in imperative form. Describe what the change does, not what you did.
-
-```
-Add per-topic presence stats endpoint
-
-- PresenceManager exposes O(1) member/connection counts
-- New presence_stats() method on RustWSEServer
-- Avoids full member iteration for dashboard use cases
-```
-
-For version bumps, include the version in the title:
-
-```
-v2.0.1 - Fix cluster frame size mismatch
-
-Tighten sender payload limit to account for 8-byte header.
-Receiver now correctly validates total wire frame size.
-```
+A commit title is `type(scope): what is true now`, as the history reads:
+`fix(cluster): an address is one place however it is spelled`. The type is
+`feat`, `fix`, `test`, `docs`, `ci`, `perf`, `refactor` or `style`; the scope
+is the part it changes. The body says what was wrong and why the change is
+the way it is. `cargo xtask commits` checks the messages of your branch.
 
 ## Pull Requests
 

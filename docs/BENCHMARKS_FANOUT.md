@@ -5,7 +5,7 @@ message loss (sequence gaps), and end-to-end latency.
 
 Two modes tested:
 - **Single-Instance Broadcast** (Test 8) -- `server.broadcast_all()` directly to all connections
-- **Multi-Instance Cluster** (Test 11) -- publish on Server A -> custom TCP protocol -> Server B -> N subscribers
+- **Multi-Instance Cluster** (Test 11) -- publish on Server A -> cluster link -> Server B, the subscribers split 50/50 across both (in v2.0.0, all of them on Server B)
 
 ## v3.0.0 Results (November 2026)
 
@@ -95,7 +95,7 @@ at typical rates (100-10K msg/s), delivery latency is sub-millisecond.
 
 ## Test 11: Multi-Instance Fan-out (Cluster Protocol)
 
-Two separate server processes connected via WSE's built-in cluster protocol (direct TCP):
+Two separate server processes connected via WSE's built-in cluster protocol (direct TCP in v2.x; TLS from the cluster's secret since 3.0). These are the v2.0.0 results, with every subscriber on Server B; the test now splits the subscribers 50/50 across both servers (see [v2.2.0](#test-11-cluster-fan-out-5050-split-3232-cores-pinned)):
 
 ```
 Server A (port 5006, cluster mode) -- publishes continuously

@@ -1,6 +1,6 @@
 # wse-client (TypeScript)
 
-TypeScript client for [WSE](https://github.com/silvermpx/wse), the WebSocket engine for reactive user interfaces: topics, message recovery, reconnects, an outbox that keeps each message until the server took it (offline too), once where the server can tell, end-to-end encryption and signed messages. It runs without a framework, and comes with adapters for React, Vue, Svelte and React Native.
+TypeScript client for [WSE](https://github.com/silvermpx/wse), the WebSocket engine for reactive user interfaces: topics, message recovery, reconnects, an outbox that keeps each message until the server took it (offline too), once where the server can tell, end-to-end encryption and signed messages. It runs without a framework, comes with adapters for React, Vue, Svelte, Angular, Solid and React Native, and keeps one connection for every window of an Electron or Tauri application.
 
 [![npm](https://img.shields.io/npm/v/wse-client)](https://www.npmjs.com/package/wse-client)
 [![TypeScript](https://img.shields.io/badge/TypeScript-5.0+-blue)](https://www.typescriptlang.org/)
@@ -18,15 +18,17 @@ npm install wse-client
 | `wse-client/react` | A provider and hooks over a core client | `react >= 18` |
 | `wse-client/vue` | A plugin and composables over a core client | `vue >= 3.3` |
 | `wse-client/svelte` | Stores over a core client | nothing (Svelte's store contract) |
+| `wse-client/angular` | A provider and functions for an injection context, over a core client | `@angular/core`, `@angular/common` >= 20 |
+| `wse-client/solid` | Functions for a component, over a core client | `solid-js` 1.9 or 2 |
 | `wse-client/react-native` | A core client for React Native apps | `react-native` |
-| `wse-client/node` | The outbox in a file, for Node and Electron's main process | Node |
+| `wse-client/node` | The outbox in a file, for Node and Electron's main process | Node 22+ |
 | `wse-client/bridge` | One connection for every window: an owner and the windows' clients | nothing |
 | `wse-client/electron` | Electron: the connection in the main process, a client in each window | Electron |
 | `wse-client/tauri` | Tauri: a window's client over the Rust side's connection (`tauri-plugin-wse`) | Tauri 2 |
 | `wse-client` | The page-wide `useWSE` hook (described below), as in 3.0 | `react >= 18`, `zustand >= 4` |
 
-React, Vue and zustand are optional peer dependencies: an application installs only what the
-import it uses needs.
+React, Vue, Angular, Solid and zustand are optional peer dependencies: an application installs
+only what the import it uses needs. In Node the package needs Node 22 or newer.
 
 The package is ESM (`"type": "module"`, explicit `.js` import paths). It loads in bundlers
 (Vite, webpack, esbuild, Next.js) and directly in Node.js (SSR, tests, scripts) without a bundler.
@@ -47,8 +49,10 @@ client.pause('background');                              // the connection ends,
 client.resume('background');                             // back, and what was missed comes
 client.wake();                                           // the network is back: connect now
 await client.close(2000);                                // send what it holds (2 s at most), then end
-client.signOut();                                        // the user's queue, topics and positions go
 ```
+
+`close()`, `destroy()` and `signOut()` each end the client; `signOut()` is the one to call, in
+place of the others, when the user signs out: the user's queue, topics and positions go.
 
 A client holds nothing of the page: two clients on one page share no state, and importing
 `wse-client/core` reads or changes nothing. It connects while any share (`retain()`) is held and
@@ -233,7 +237,8 @@ and listens to, in batches it acknowledges as it takes them: at most two in hand
 falls behind holds back only its own queue, and one past 10,000 messages (or 64 MiB) loses its queue
 and hears its topics broke off (`wseOverloaded`; a recover-or-resync window resyncs them). A
 window's sends go through the owner's outbox (`send` says `queued`; a live one `sent` once it is
-handed to the owner, which writes it at once or says `wseNotDelivered`, `dropped`), and what became
+handed to the owner, which writes it at once or says `wseNotDelivered`, `dropped`, as it does for a
+send its outbox has no room for, or an `encrypted` one with no session), and what became
 of each (`wseDelivered`, `wseNotDelivered`) reaches that window alone, whatever ids the windows
 chose: when the user signs out (a window's `signOut` goes through the owner, which signs every
 window out), what the server answered already, paused or behind as the window may be, or signed out
@@ -246,6 +251,32 @@ wait for their topics; after a reconnect, a window's send that requires topics w
 outbox until that window resynced them. A window's `pause` holds back its stream and gives its share
 of the connection back, so the connection ends when no one else holds one, as a client of its own
 does; `signOut` signs every window out. No frame carries a token, a key or a cookie.
+
+`createBridgeOwner` takes a core client's options and two of its own: `limits` (what it hands a
+window at once and holds for it: batches of 256 messages or 1 MiB, two in hand, a queue of 10,000
+messages or 64 MiB) and `allowSign(type)`, the message types a window may have signed with the
+owner's key (default: every type). A window's `signOut()` signs the user out of the owner, as
+`owner.signOut()` does: every window is let go and the owner ends, so the application makes a new
+owner for the next user, and a window a new client.
+
+`createBridgeClient(channel, options)` takes, as a client of its own does, `consumer` (required by
+recover-or-resync), `realm` (the server its checkpoint is bound to: none by default), `delivery`
+and `storage` (where its checkpoint is kept: memory by default), and `agent`, a name the owner logs
+it by. `client.bridge.phase` says where it stands with its owner: `attaching`, `attached`, or
+`refused`, `revoked` and `closed`, with `client.bridge.reason`; a window let go makes a new client.
+A window hears its own client's events (`wseGap`, `wseContinuity`, `wseConnected` with `{ user,
+reconnected }`, the outcomes of its sends) and those the owner forwards: `wseServerError`,
+`wseAuthFailed`, `wseEncryptionFailed`, `wseReconnectFailed`, `wseOverloaded`,
+`wseTokenRefreshFailed`, `wseStorage`, `wseStorageError` and `wseCheckpointRejected`; the owner's
+other events (`serverError`, the rate limits, `subscriptionUpdate`, presence, `snapshotComplete`,
+`connectionQualityChanged`) stay with the owner. A window's `close(deadlineMs)` waits, up to the
+deadline, until the owner said what became of its sends (those that wait for their topics too),
+which stay in the owner's outbox; it ends at once when the owner has let the window go.
+
+Any channel will do that hands frames on in order each way: `{ post(frame), listen({ frame, close
+}), close() }`, with one listener (`messagePortChannel` makes one of a `MessagePort`). It may hand a
+frame on at once, inside `post`: the window takes each batch whole before the next, and
+acknowledges it once taken.
 
 ## Electron
 
@@ -288,9 +319,11 @@ port only from the top frame of a window the owner serves, at a URL the applicat
 default its own pages (a file, a scheme of its own such as `app://`, or a development server on
 `localhost`), never a page of the web; `allow: (url) => ...` decides otherwise. A page that goes
 lets its share go, and a window that closes lets all of its pages go. `owner.signOut()` signs every
-window out and forgets what the client kept for the user; the next user gets a new owner. The main
-process connects with Node's WebSocket (Node 22 and newer); with an older Electron, pass a
-`webSocket` factory.
+window out and forgets what the client kept for the user, and so does a window's `signOut()`: the
+owner serves no window any more, and the next user gets a new owner. A page waits 15 s for its port
+(`createElectronClient({ attachTimeoutMs })`): in a window the owner does not serve, or without the
+preload, its client ends and says why (`client.bridge`). The main process needs Node 22 or newer,
+as the package does: Node's WebSocket, and on Linux the outbox file's lock.
 
 An example application, two windows on one connection, is in
 [bindings/electron/example](https://github.com/silvermpx/wse/tree/main/bindings/electron/example);
@@ -329,11 +362,12 @@ client.subscribe(['prices']);
 ```
 
 Tauri's own API is passed in, so the package depends on no version of it (`window.__TAURI__.core`
-gives the same with `withGlobalTauri`). The page's frames go one command at a time, in order, those
-of one turn together; the owner's come on a Channel. A page that reloads, or a window that closes,
+gives the same with `withGlobalTauri`). The page's frames go one command at a time, in order: the
+first at once, those posted while a command is on its way together in the next; the owner's come on
+a Channel. A page that reloads, or a window that closes,
 lets its share go; `app.wse().start(config)` again (another user) lets the last connection's pages
 go, and `app.wse().sign_out()` lets every page go and forgets what the connection kept for the
-user. An example application is in
+user, as a page's `signOut()` does. An example application is in
 [bindings/tauri/example](https://github.com/silvermpx/wse/tree/main/bindings/tauri/example).
 
 ## Quick Start
@@ -382,8 +416,8 @@ sends the first argument of `useWSE` anywhere; it is the auth *mode*:
 | `undefined` / `''` | Signed out: close the connection and clear per-user data (outgoing queues, the outbox and its IndexedDB database, recovery positions, saved subscriptions, the opt-in error log). |
 | any other string | Connect like `'cookie'`; a change from one non-empty value to another is treated as a different user (reconnect and clear per-user data). Do not pass a rotating JWT here - it is not sent, and each rotation would reset the session. A JWT-shaped value logs a warning. |
 
-When the server rejects the credentials (close code 4401/4403, or an `AUTH_FAILED` error before the
-close) the client calls `refreshAuthToken` once (if configured) and retries once; when that is
+When the server rejects the credentials (close code 4401/4403 or 1008, or an `AUTH_FAILED` error
+before the close) the client calls `refreshAuthToken` once (if configured) and retries once; when that is
 rejected too, or without `refreshAuthToken`, it **stops reconnecting**, enters `ERROR` and dispatches
 `wseAuthFailed`. Sign the user in again and call `forceReconnect()` (or remount with a new auth value).
 
@@ -498,7 +532,7 @@ useWSE('cookie', ['notifications'], {
     maxSize: 100000,                          // messages that wait at most, those not answered yet included
     maxBytes: 16 * 1024 * 1024,               // bytes of messages that wait at most
     maxAge: 3600000,                          // ms a message may wait to be written first
-    persistToStorage: true,                   // with a consumer named, the outbox outlives the page (IndexedDB)
+    persistToStorage: true,                   // the outbox outlives the page (IndexedDB, where the page has Web Locks)
     // store: fileOutbox(path),               // Node, Electron's main process: the outbox in a file
   },
 
@@ -586,6 +620,13 @@ Other window events the client dispatches:
 | `subscriptionUpdate` | The server answered a subscription request |
 | `serverError`, `rateLimitExceeded`, `clientRateLimitExceeded` | Server errors and rate limits |
 | `snapshotComplete` | The server finished sending a snapshot |
+| `wseConnected` | The server took a connection: `{ connectionId, user, reconnected, recovery }` |
+| `wseDelivered` / `wseNotDelivered` | What became of a message of the outbox (see Sending Messages) |
+| `wseOverloaded` | More messages waited to be handled than the client holds (`{ frames, bytes }`): it reconnects and recovers |
+| `wseStorage` / `wseStorageError` | Where the outbox keeps what waits (`{ state }`: `durable`, `unavailable`) / a store that could not be opened or written |
+
+A client of its own (`wse-client/core`) emits the same events to `client.on(name, listener)`, and
+with a delivery also `wseContinuity` (`{ topic, continuity, reason }`) and `wseCheckpointRejected`.
 
 ## Sending Messages
 
@@ -610,10 +651,11 @@ became of each, by its id: `wseDelivered`
 the server refused it (`busy`, `rate_limited`, `missing`, `not_ready`), it was not written within
 its time (`expired`), it was the last user's (`user_changed`), the user signed out (`cleared`), or
 the client ended with it (`closed`). The outbox sends in the order of sending, whatever the
-priority. `close(deadlineMs)` waits for the server's answers too. With a server older than 3.2 a
+priority. A client of its own's `close(deadlineMs)` waits for the server's answers too. With a server older than 3.2 a
 message is gone once written, as before. `offline: { enabled: false }` has no outbox: a message
-that cannot go out at once waits in the outgoing queue, in priority then FIFO order. `kept()` says
-how many messages wait for the server's answer.
+that cannot go out at once waits in the outgoing queue, in priority then FIFO order. A client of its
+own's `kept()` says how many messages wait for the server's answer; useWSE's `getQueueSize()` counts
+what waits in the outbox and the outgoing queue.
 
 In Node and in Electron's main process the outbox can live in a file, so that what waits outlives
 the process:
@@ -659,12 +701,16 @@ holds it. `destroy()` leaves what waits in the file for the next client, `signOu
   (`sendSigned`) are always live.
 - `encrypted`: refuse to send unless E2E encryption is on; never falls back to plaintext.
 - `correlation_id`: sent as `cid`.
+- `requires`: topics that must each be continuous when it goes (a client of its own with a
+  delivery, or a window; useWSE has no delivery and ignores it). It takes its place in the outbox
+  when it is sent, so a full outbox drops it; a live one whose topics are not continuous is
+  `'dropped'`.
 
 ## Reconnection and Close Codes
 
 - Any close the server or network initiates - `1000`/`1001` (server stop), `1005` (kick), `1006`,
   `1011`-`1013`, `4300` (drain), `4429` - is followed by a reconnect with backoff.
-- `4401`/`4403` stop reconnecting (see Authentication).
+- `4401`/`4403` and `1008` stop reconnecting (see Authentication).
 - A single failed attempt is never terminal. With the default `maxAttempts: -1` the client retries
   forever; the backoff resets only when a connection reaches `server_ready`.
 - It reconnects at once when the browser goes back online or the tab becomes visible again, and
@@ -727,7 +773,7 @@ client.send('cancel', { id: 9 }, { requires: ['orders'] }); // goes once orders 
 ```
 
 The checkpoint is what the consumer committed, per stream only through what was applied without a
-hole. It is bound to the realm (the first endpoint, or `realm`), the user, the consumer
+hole. It is bound to the realm (the first endpoint, or `realm`; a window's is its `realm` alone), the user, the consumer
 and the schema; the client keeps it in its storage, and `client.checkpoint()` gives it to save with
 the application's own state (pass it back as `delivery.checkpoint`). A checkpoint of anything else
 is refused with a `wseCheckpointRejected` event. After a reconnect the recovery starts from it, so
@@ -818,7 +864,7 @@ import { useWSEStore, useMessageQueueStore } from 'wse-client';
 
 const state = useWSEStore.getState().connectionState;
 const metrics = useWSEStore.getState().metrics;
-const queueSize = useMessageQueueStore.getState().size;
+const queued = useMessageQueueStore.getState().size;   // the outgoing queue; useWSE's getQueueSize() adds the outbox
 
 // Select narrowly in components to avoid re-rendering on every message:
 const health = useWSEStore((s) => s.connectionState);
@@ -857,12 +903,22 @@ import { MessagePriority, ConnectionState, ConnectionQuality, CircuitBreakerStat
 import { useWSEStore, useMessageQueueStore } from 'wse-client';
 import {
   ConnectionManager, MessageProcessor, RateLimiter, ConnectionPool,
-  NetworkMonitor, OfflineQueue, EventSequencer,
+  NetworkMonitor, OfflineQueue, EventSequencer,   // OfflineQueue: 3.1's queue, unused by the client since 3.2
 } from 'wse-client';
 import { logger, CircuitBreaker, createCircuitBreaker, generateId, compressionManager, eventTransformer } from 'wse-client';
 import { EventHandlers, registerAllHandlers } from 'wse-client';
 import { WSE_VERSION, WS_CLIENT_VERSION, WS_PROTOCOL_VERSION, clearWSEStorage } from 'wse-client';
 ```
+
+## Upgrading from 3.1
+
+- The offline queue became the outbox: every message but a live or signed one waits until the
+  server answers for it, and goes again after a reconnect. The `offline` option of a send is
+  ignored; `clearOfflineQueue()` clears the outbox.
+- What a 3.1 page kept in IndexedDB moves into the outbox, in order (version 3 of the database); the
+  upgrade waits while a page of 3.1 still holds the database open.
+- `state.getSnapshot().storage` reads `memory`, `durable` or `unavailable`; it no longer reads `busy`.
+- In Node the package needs Node 22 or newer.
 
 ## Upgrading from 2.x
 
@@ -899,9 +955,9 @@ Full protocol specification: [PROTOCOL.md](../docs/PROTOCOL.md)
 ## Requirements
 
 - For `wse-client/core`: a browser, or Node.js with a global `WebSocket` (Node 22+)
-- For `wse-client/electron`: Electron with Node 22 or newer in its main process, or a `webSocket` factory
+- For `wse-client/electron`: Electron with Node 22 or newer in its main process
 - For `useWSE` (the root entry): React 18+ and zustand 4+; for the adapters: React 18+, Vue 3.3+,
-  Svelte 5, Angular 20+ or Solid 1.9+ (optional peer dependencies)
+  Svelte 4 or 5, Angular 20+ or Solid 1.9+ (optional peer dependencies)
 
 ## License
 

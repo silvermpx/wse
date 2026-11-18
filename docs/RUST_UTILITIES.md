@@ -65,7 +65,7 @@ Priority levels:
 | LOW        | 3     |
 | BACKGROUND | 1     |
 
-When the queue is full and a new message arrives, the queue drops the lowest-priority message to make room. BACKGROUND messages are dropped first, then LOW, then NORMAL. HIGH and CRITICAL messages are never evicted by lower-priority arrivals.
+When the queue is full, a new message takes the place of the oldest one of a strictly lower priority among BACKGROUND, LOW and NORMAL, lowest first. When nothing lower is queued, the new message is refused (`False`) and counted as dropped under its own priority. HIGH and CRITICAL messages are never evicted. A priority other than 1, 3, 5, 8 or 10 counts as the nearest of them.
 
 ```python
 q = RustPriorityMessageQueue(max_size=1000, batch_size=10)
@@ -269,13 +269,13 @@ hex_digest = rust_sha256(b"data")                        # hex string
 signature = rust_sign_message('{"event":"trade"}', secret=b"key")  # hex HMAC
 ```
 
-`rust_sign_message` computes SHA-256 of the payload string, then HMAC-SHA256 of that hash.
+`rust_sign_message` computes the SHA-256 of the payload string, then the HMAC-SHA256 of that hash's hex text (64 ASCII bytes), and returns it in hex.
 
 ---
 
 ## JWT
 
-HS256 JSON Web Token encoding and decoding.
+JSON Web Token encoding and decoding: HS256, HS384 and HS512 (secrets of at least 32, 48 and 64 bytes), RS256, RS384, RS512, PS256, PS384, PS512, ES256, ES384 and EdDSA (PEM keys). `algorithm` names it (HS256 by default), `key_id` sets or requires the `kid` header, and `previous_secret` lets a decode take tokens of the key before a rotation.
 
 ```python
 import time
@@ -306,7 +306,7 @@ Validation rules:
 - `nbf` claim is optional, with the same 30 seconds of skew
 - `iss` is checked when `issuer` is given; the token must then carry it
 - `aud` is checked when `audience` is given (string or array); the token must then carry it
-- Algorithms: HS256 (secret of 32+ bytes; a PEM key is refused), RS256 and ES256 (PEM keys)
+- Algorithms: as above; an HMAC secret shorter than its hash, or a PEM key given as an HMAC secret, is refused
 
 ---
 
@@ -336,7 +336,7 @@ envelope = rust_transform_event(event, sequence=42, event_type_map=type_map)
 # }
 ```
 
-The transformer handles UUID, datetime, Decimal, and Enum conversion to JSON-safe types. Events that already have the wire format (`t`, `p`, `id`, `ts`, `v`) are returned unchanged.
+The envelope also carries `c` first: the event's own, or `S` for a snapshot, `WSE` for a system message and `U` otherwise, and the event's latency and correlation fields when it has them. The transformer handles UUID, datetime, Decimal, and Enum conversion to JSON-safe types. An event that already has the wire format (`t`, `p`, `id`, `ts`, `v`) is returned unchanged when it carries a `seq`, and as a copy stamped with `sequence` when it does not.
 
 ### rust_match_event
 

@@ -1,8 +1,8 @@
 # tauri-plugin-wse
 
 One [WSE](https://github.com/silvermpx/wse) connection for every window of a Tauri application.
-The Rust side holds the connection, with the token, the keys and the outbox (in a file, so that
-what is not answered yet outlives the application); each window's page holds a client of the npm
+The Rust side holds the connection, with the token, the keys and the outbox (in memory, or in a
+file, so that what is not answered yet outlives the application); each window's page holds a client of the npm
 package's `wse-client/tauri` and talks to it through this plugin's commands. The windows share the
 connection's topics: each is subscribed once, and each page gets the messages of the topics it
 holds, in batches it acknowledges, so a page that falls behind holds back only itself.
@@ -23,9 +23,10 @@ tauri::Builder::default()
     .setup(|app| {
         let mut config = wse_client::Config::new("wss://example.com/wse");
         config.token = Some(token); // the signed-in user's
-        config.offline = Some(wse_client::Offline::in_file(
-            app.path().app_data_dir()?.join("wse-outbox"),
-        ));
+        // Tauri does not create the application's data folder.
+        let dir = app.path().app_data_dir()?;
+        std::fs::create_dir_all(&dir)?;
+        config.offline = Some(wse_client::Offline::in_file(dir.join("wse-outbox")));
         // It returns at once: the connection is made in the background.
         tauri::async_runtime::block_on(app.wse().start(config))?;
         Ok(())
@@ -42,6 +43,15 @@ re-exports `wse_client`, at the version it is built with; `app.wse().owner()` is
   pages go.
 - `app.wse().sign_out()` lets every page go and forgets what the connection kept for the user.
 - `app.wse().close()` ends the connection; what it keeps in a file stays for the next start.
+- A page's `client.signOut()` signs the user out of the whole connection, as `sign_out()` does:
+  the owner ends, and pages that come later are refused (`closing`) until the application calls
+  `start` again. `owner.client().closed()` resolves when the owner ended. After `start` again, or
+  `sign_out()`, a page makes a new client.
+
+`app.wse().start_with(config, options)` takes the bridge's `wse_client::bridge::Options`: `limits`
+(how much a page is handed at once and may fall behind) and `allow_sign`, which message types a
+page may have signed with the owner's key (default: every type). The pages keep their own
+delivery, so a `config.delivery` is refused (`Error::Config`).
 
 ## Permissions
 

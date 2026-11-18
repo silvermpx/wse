@@ -13,7 +13,7 @@ WSE uses a custom binary protocol for communication between cluster nodes. All i
 
 If the HELLO handshake fails - wrong magic bytes, unsupported version, or malformed payload - the connection is closed immediately and the initiator retries with exponential backoff.
 
-**One link per pair.** Any node may dial any other, so a node started later joins through an older seed like any other. A node keeps one live link per peer instance. When a second link to the same instance appears (both nodes dialed each other at the same moment, or a peer is known under two addresses), both nodes keep the one whose **dialer** has the lexicographically lower `instance_id` and close the other, so they always agree without coordination. A peer that dials again while the receiver still holds its earlier link has given up on that one (a half-open connection), so the new link replaces it. A node that finds its own address in the peer list stops dialing it. The losing dialer keeps retrying with backoff, so the pair reconnects at once if the winning link goes away.
+**One link per pair.** Any node may dial any other, so a node started later joins through an older seed like any other. A node keeps one live link per peer instance. When a second link to the same instance appears (both nodes dialed each other at the same moment, or a peer is known under two addresses), both nodes keep the one whose **dialer** has the lexicographically lower `instance_id` and close the other, so they always agree without coordination. A peer that dials again while the receiver still holds its earlier link replaces that one only when it has carried nothing for 10 s, two heartbeats (a half-open connection); while it is alive, the new link is refused as a duplicate: the receiver closes it before its HELLO, and the dialer backs off. A node that finds its own address in the peer list stops dialing it. The losing dialer keeps retrying with backoff, so the pair reconnects at once if the winning link goes away.
 
 ## Frame Format
 
@@ -22,7 +22,7 @@ On the wire every frame follows a 4-byte big-endian length (u32), the length of 
 | Offset | Size | Field | Description |
 |--------|------|-------|-------------|
 | 0 | 1 | type | Message type (0x01 - 0x12) |
-| 1 | 1 | flags | Per type: MSG bit 0 compressed (zstd), bit 1 recovery trailer, bit 2 replayed, bit 3 arrival trailer; RESYNC bit 0 continuation; RESUME bit 0 last, bit 1 topics, bit 2 heard; PresenceFull bits 0-2 sync round; otherwise 0 |
+| 1 | 1 | flags | Per type: MSG bit 0 compressed (zstd), bit 1 recovery trailer, bit 2 replayed, bit 3 arrival trailer; RESYNC bit 0 continuation, bit 1 more frames follow; RESUME bit 0 last, bit 1 topics, bit 2 heard; PresenceFull bits 0-2 sync round; otherwise 0 |
 | 2 | 2 | topic_len | Topic field length (little-endian u16) |
 | 4 | 4 | payload_len | Payload field length (little-endian u32) |
 | 8 | N | topic | Topic string (UTF-8, N = topic_len) |
@@ -90,9 +90,9 @@ A node compares these addresses as places, however they are spelled: an IPv4 add
 | 2 | CAP_PRESENCE | Presence sync support |
 | 3 | CAP_RECOVERY | MSG frames carry the origin's recovery position |
 | 4 | CAP_RESUME | Catch-up after a lost link (RESUME); offered by a node with recovery on |
-| 5 | CAP_PRODUCERS | A node asks another what it decided of a client's outbox (PRODUCER_QUERY / PRODUCER_STATE) |
-| 6 | CAP_RESUME_TOPICS | The catch-up covers streams the asking node does not hold: its RESUME request names its topics too (from 3.2) |
-| 7 | CAP_ARRIVAL | Relayed messages carry the origin's arrival number; the catch-up starts after the last one the asking node heard of (from 3.2) |
+| 5 | CAP_PRODUCERS | A node asks another what it decided of a client's outbox (PRODUCER_QUERY / PRODUCER_STATE) (from 3.2) |
+| 6 | CAP_RESUME_TOPICS | The catch-up covers streams the asking node does not hold: its RESUME request names its topics too; offered with recovery on (from 3.2) |
+| 7 | CAP_ARRIVAL | Relayed messages carry the origin's arrival number; the catch-up starts after the last one the asking node heard of; offered with recovery on (from 3.2) |
 
 The instance id is the name the node gives its clients in the `outbox` answer: a client that comes to another node names it, and that node asks it (see [PRODUCER_QUERY](#producer_query-0x0f-and-producer_state-0x10---a-clients-outbox-moves)).
 
@@ -133,7 +133,7 @@ Sent when the last local client on a node unsubscribes from a topic. The receivi
 [N bytes: newline-separated topic list]
 ```
 
-The sender's whole interest. The receiver replaces what it held for the sender with these topics. A list over the frame limit is split: the first frame (flags 0) replaces, the following ones (flags 0x01) extend, and only within the same link.
+The sender's whole interest. The receiver replaces what it held for the sender with these topics. A list over the frame limit is split, within the same link: every frame but the last carries flags 0x02 (more follow), and every frame but the first 0x01 (a continuation). The receiver gathers the round apart, routing meanwhile by what it held plus what the round named so far, and takes the whole list in place of the old one at its last frame; a single frame replaces at once.
 
 The cluster manager sends it when a link comes up, queued in the same order as every SUB and UNSUB after it, so a subscription made while the link came up reaches the peer after the snapshot, never before it. It sends it again on every link every 60 seconds (`CLUSTER_RESYNC_INTERVAL_SECS`), whole or not at all, so a SUB or UNSUB dropped on a full link heals.
 
@@ -206,9 +206,10 @@ The receiver merges this state into its own presence tables, creating **per-orig
 [header: type=0x0D, all other fields zero]
 ```
 
-Sent when a node begins graceful drain. On receipt, a peer clears the draining
-node's interest entries so it stops routing **new** messages there, but keeps the
-TCP connection open so in-flight delivery can finish (lame-duck). See
+Sent when a node begins graceful drain. On receipt, a peer routes no **new**
+message to the draining node until its link ends, whatever RESYNC it sends
+meanwhile, but keeps the connection open so in-flight delivery can finish
+(lame-duck). See
 [Drain Notification](#drain-notification).
 
 ### RESUME (0x0E) - Catch-up After a Lost Link
@@ -221,7 +222,7 @@ TCP connection open so in-flight delivery can finish (lame-duck). See
    [8 bytes: offset (little-endian u64)]]
 ```
 
-Where the sender stands in every stream other nodes relay to it: for each foreign recovery buffer, the topic, the origin's epoch and the last offset it holds with nothing missing before it; for a stream it holds no buffer of (no room in its memory budget for one, or the buffer was removed), the last offset it delivered with nothing missing before it, for 100,000 such streams. What it delivered of those streams is not delivered again when a peer sends it again, within the last 64 offsets past that one. A request over the frame limit is split; flags `0x01` marks its last frame, and a node with nothing relayed to it sends one empty frame with that flag.
+Where the sender stands in every stream other nodes relay to it: for each foreign recovery buffer, the topic, the origin's epoch and the last offset it holds with nothing missing before it; for a stream it holds no buffer of (no room in its memory budget for one, or the buffer was removed), the last offset it delivered with nothing missing before it, for 100,000 such streams. What it delivered of those streams is not delivered again when a peer sends it again, within the last 64 offsets past that one. A request over the frame limit is split; flags `0x01` marks its last frame. To a node without CAP_ARRIVAL or CAP_RESUME_TOPICS, one with nothing relayed to it sends one empty frame with that flag; between two 3.2 nodes with recovery the request is two frames at least, the entries (empty or not) and the `0x04` frame below, flagged last unless topic frames (`0x02`) follow.
 
 With CAP_ARRIVAL, a frame flagged `0x04` follows those entries with one entry (no topic, an epoch of 0): in place of the offset, the last of the receiver's arrival numbers the sender heard of (0 for none).
 
@@ -273,7 +274,7 @@ Sent after the catch-up that follows a RESUME with topics (CAP_RESUME_TOPICS): t
 
 The last frame of a catch-up with CAP_ARRIVAL: everything the sender published to the cluster up to this arrival number reached the receiver before it, replayed or told LOST. Once it delivered what came before the frame, the receiver takes it as the last arrival it heard of the sender, and its next RESUME request starts there: a loss told once is not told again.
 
-A node that comes back after a lost link catches up from where the other left off. One that does not, because it stopped without its link up to say SHUTDOWN and another node now answers at its address, took what it published meanwhile with it. The other node sees that whichever of the two dials (by the address it dials, or by the `reached_at` of the HELLO of a node that dials in), also while the link of the one gone still looks up and has not said SHUTDOWN: it takes each topic it has, holds a stream of, or published to itself (one a pattern covers included) as not kept from then on, and a client whose last message came before it resyncs. One that said SHUTDOWN had sent everything first.
+A node that comes back after a lost link catches up from where the other left off. One that does not, because it stopped without its link up to say SHUTDOWN and another node now answers at its address, took what it published meanwhile with it. The other node sees that whichever of the two dials (by the address it dials and the `reached_at` the dialed node's HELLO gives, a `:port` on the address the dial reached; or by the `reached_at` of the HELLO of a node that dials in), however the address is written, also while the link of the one gone still looks up and has not said SHUTDOWN: it takes each topic it has, holds a stream of, or published to itself (one a pattern covers included) as not kept from then on, and a client whose last message came before it resyncs. One that said SHUTDOWN had sent everything first.
 
 ## Interest-Based Routing
 
@@ -381,8 +382,8 @@ The `cluster_info()` method exposes the current cluster topology from the perspe
 ```python
 peers = server.cluster_info()
 # [
-#     {"address": "10.0.0.2:9999", "instance_id": "a1b2c3...", "capabilities": 15, "connected_at": 1731470000123},
-#     {"address": "10.0.0.3:41822", "instance_id": "d4e5f6...", "capabilities": 15, "connected_at": 1731470000456},
+#     {"address": "10.0.0.2:9999", "instance_id": "a1b2c3...", "capabilities": 255, "connected_at": 1731470000123},
+#     {"address": "10.0.0.3:41822", "instance_id": "d4e5f6...", "capabilities": 255, "connected_at": 1731470000456},
 # ]
 ```
 
@@ -401,8 +402,7 @@ Use `cluster_info()` for monitoring dashboards, verifying that gossip discovery 
 
 When a node initiates graceful drain via `drain()`, the internal `ClusterCommand::Drain` is sent on the wire as a **DRAIN frame (0x0D)** to all connected peers before closing client connections. On receipt, each peer:
 
-1. Clears the draining node's interest entries so it stops routing **new** messages to it
-2. Keeps the TCP connection open so any in-flight delivery can finish (lame-duck)
-3. Redirects interest-routed traffic to remaining nodes
+1. Routes no **new** message to the draining node until its link ends, whatever RESYNC it sends meanwhile
+2. Keeps the connection open so any in-flight delivery can finish (lame-duck)
 
 The drain notification is a best-effort signal. If the draining node loses connectivity before the DRAIN frame is delivered, peers detect the failure through the standard heartbeat timeout (15s) and remove the node automatically.

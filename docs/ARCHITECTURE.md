@@ -15,6 +15,9 @@ The crates:
 | `crates/wse` | The engine: server, cluster, presence, recovery; the Python module behind the `python` feature. Its `protocol` module (the crypto on aws-lc-rs, E2E sessions, signed messages) is what the Rust client shares: without the `server` feature the crate is that module alone |
 | `crates/wse-py` | The Python extension built from it (`wse-server` on PyPI) |
 | `crates/wse-client` | The Rust client |
+| `crates/wse-ffi` | The Rust client for Swift and Kotlin (and Java on the JVM), through UniFFI |
+| `crates/wse-bindgen` | Generates the Swift and Kotlin bindings of `wse-ffi` |
+| `crates/wse-conformance` | The server every client is checked against: a server of its own for each case, and one judge (`cargo xtask check conformance`) |
 
 ```
 Python Application
@@ -36,14 +39,17 @@ RustWSEServer (PyO3)
           +-- fanout: the lanes' job queues, while the server runs
           +-- conn_topics: DashMap<String, DashSet<String>>
           +-- conn_formats: DashMap<String, bool>
-          +-- conn_last_activity: DashMap<String, Instant>
+          +-- conn_last_activity: DashMap<String, Arc<Activity>>
           +-- connection_count: AtomicUsize
-          +-- inbound_tx/rx: crossbeam bounded channel
+          +-- inbound_tx/rx: crossbeam unbounded channel, counted against max_inbound_queue_size and max_inbound_queue_bytes
           +-- recovery: Option<Arc<RecoveryManager>>
           +-- presence: Option<Arc<PresenceManager>>
-          +-- cluster_cmd_tx: RwLock<Option<Sender<ClusterCommand>>>
+          +-- cluster_cmd_tx: ArcSwapOption<UnboundedSender<ClusterCommand>>
           +-- cluster_metrics: Arc<ClusterMetrics>
           +-- cluster_dlq: Arc<Mutex<ClusterDlq>>
+          +-- producers: the clients' outboxes known here (see Deduplication)
+          +-- producer_links: the cluster links that take PRODUCER_QUERY
+          +-- node_id: the name this node gives its clients in the outbox answer
 ```
 
 ---
@@ -63,9 +69,8 @@ Key runtime properties:
 ### Connection Lifecycle
 
 ```
-TCP accept
-  -> TLS handshake (if configured)
-  -> WebSocket upgrade with 10s timeout (tungstenite, prevents slow loris)
+TCP accept (plain TCP: TLS ends at a proxy in front, see SECURITY.md)
+  -> WebSocket upgrade with 5s timeout (tungstenite, prevents slow loris)
   -> OnceLock handshake: extract cookies, format preference, Authorization header
   -> JWT validation in Rust (if jwt_secret configured, zero GIL)
   -> Spawn read task + write task
@@ -138,7 +143,7 @@ Full reference with usage examples: [RUST_UTILITIES.md](RUST_UTILITIES.md)
 
 **Drain mode** (recommended for production):
 
-Events are queued in a lock-free crossbeam channel. Connect, disconnect and presence events always get in; client messages are dropped (counted in `inbound_dropped`) while `max_inbound_queue_size` of them or `max_inbound_queue_bytes` of their size are waiting. Callback mode uses the same budget for the messages its callbacks are handling. Python polls with `drain_inbound(max_count, timeout_ms)`, which releases the GIL while waiting on the channel and acquires it once for the entire batch conversion.
+Events are queued in a lock-free crossbeam channel. Connect, disconnect and presence events always get in; client messages are dropped (counted in `inbound_dropped`) while `max_inbound_queue_size` of them or `max_inbound_queue_bytes` of their size are waiting. A numbered message of a 3.2 client's outbox is refused instead, with a `nack` its client hears: `busy` when there is no room, and `not_ready` when it comes before the application took the connection. Callback mode uses the same budget for the messages its callbacks are handling. Python polls with `drain_inbound(max_count, timeout_ms)`, which releases the GIL while waiting on the channel and acquires it once for the entire batch conversion.
 
 ```python
 server.enable_drain_mode()
@@ -151,7 +156,7 @@ while True:
 
 **Callback mode**:
 
-Python callbacks are invoked via `spawn_blocking` to run off tokio worker threads. The GIL is acquired per callback invocation. Simpler to use but higher overhead under load. In-flight callbacks are bounded to 256 per connection (`MAX_INFLIGHT_CALLBACKS`); when saturated, inbound messages are shed and counted in `rate_limited_total`, so an inbound flood can't exhaust the tokio blocking pool.
+Python callbacks are invoked via `spawn_blocking` to run off tokio worker threads. The GIL is acquired per callback invocation. Simpler to use but higher overhead under load. In-flight callbacks are bounded to 256 per connection (`MAX_INFLIGHT_CALLBACKS`); when saturated, inbound messages are shed and counted in `rate_limited_total` (a numbered outbox message is refused, `busy`), so an inbound flood can't exhaust the tokio blocking pool. A server with neither drain mode nor `on_message` refuses outbox messages, `busy`.
 
 ### Event Types
 
@@ -167,6 +172,7 @@ Python callbacks are invoked via `spawn_blocking` to run off tokio worker thread
 | `"disconnect"` | None                                    |
 | `"presence_join"` | dict: user_id, topic, data           |
 | `"presence_leave"` | dict: user_id, topic, data          |
+| `"signed"`     | dict: a signed message the server verified (with `on_signed_message`) |
 
 ### GIL Management
 
@@ -196,14 +202,14 @@ server.broadcast(t, d)       -> Local fan-out + ClusterCommand::Publish to peers
 Client WebSocket frame
   -> tokio read task
   -> Parse: JSON text / msgpack binary / raw text / binary
-  -> A numbered message of the client's outbox (`s`): claimed on its
-     producer's mark (one compare-and-swap); a repeat is confirmed again
-     and not handed on
-  -> Push InboundEvent to crossbeam channel
+  -> A numbered message of the client's outbox (`s`): decided under its
+     producer's lock, against the highest message decided (taken or
+     refused); a repeat is confirmed again and not handed on
+  -> Push InboundEvent to crossbeam channel: the application took it
+  -> Once nothing more waits on the socket (or 256 frames on): refusals
+     (`nack`), then one `ack` for what was taken
   -> Python: drain_inbound(256, 50)
   -> Returns list of (event_type, conn_id, payload) tuples
-  -> Once nothing more waits on the socket (or 64 frames on): refusals
-     (`nack`), then one `ack` for what was taken
 ```
 
 ### Outbound (Server to Client)
@@ -215,7 +221,7 @@ server.send(conn_id, event_dict)
   -> Compress if above threshold (zlib)
   -> Build WSE envelope: {"t": type, "p": payload, "id": uuid, "seq": N, "ts": timestamp, "v": 1}
   -> Send through connection's mpsc channel
-  -> Write task: tungstenite feed() + flush()
+  -> Write task: encodes the frame itself and writes with writev
 ```
 
 ### Broadcast (Server to All/Topic)
@@ -237,8 +243,11 @@ server.broadcast_local(topic, data)
      by that member's lane
 
 server.broadcast(topic, data)
-  -> broadcast_local(topic, data)          - local fan-out
-  -> ClusterCommand::Publish{topic, data}  - forward to cluster peers
+  -> Stamp in the topic's cluster stream (broadcast_local stamps in a
+     stream of its own, with its own epoch, never sent to another node)
+  -> Local fan-out, as broadcast_local
+  -> ClusterCommand::Publish{topic, payload, position, seq}: the stamped
+     payload, its (epoch, offset) and its arrival number, for the peers
 ```
 
 ### Signed Messages
@@ -286,7 +295,7 @@ Binary frame format - 8-byte header followed by topic and payload:
   1 byte   1 byte  2 bytes     4 bytes       var     var
 ```
 
-Thirteen message types:
+Eighteen message types:
 
 | Type (u8) | Name           | Purpose                                  |
 |-----------|----------------|------------------------------------------|
@@ -303,6 +312,11 @@ Thirteen message types:
 | 0x0B      | PresenceUpdate | Presence join/leave/update for one user  |
 | 0x0C      | PresenceFull   | Full presence state sync on peer connect |
 | 0x0D      | Drain          | Lame-duck: peer draining, stop routing new messages |
+| 0x0E      | RESUME         | Catch-up after a lost link: where the sender stands in the receiver's streams |
+| 0x0F      | PRODUCER_QUERY | What the receiver decided of a client's outbox; it hands the outbox over |
+| 0x10      | PRODUCER_STATE | The answer to a PRODUCER_QUERY           |
+| 0x11      | LOST           | Messages of a topic were published that the sender no longer holds |
+| 0x12      | CAUGHT_UP      | The catch-up covers what the sender published up to an arrival number |
 
 ### Handshake
 
@@ -312,8 +326,11 @@ When two peers connect, they exchange HELLO frames:
 HELLO payload:
   magic:         "WSE\x00" (4 bytes)
   version:       u16 LE (protocol version, currently 1)
+  id_len:        u16 LE
   instance_id:   UUID string (unique per server instance)
   capabilities:  u32 LE (bitfield of supported features)
+  at_len:        u16 LE (3.2; at most 255)
+  reached_at:    where the node says it is reached (3.2)
 ```
 
 Capability negotiation uses bitwise AND of both peers' capability fields. Currently defined capabilities:
@@ -323,6 +340,11 @@ Capability negotiation uses bitwise AND of both peers' capability fields. Curren
 | 0   | CAP_INTEREST_ROUTING  | SUB/UNSUB/RESYNC support   |
 | 1   | CAP_COMPRESSION       | zstd inter-peer compression|
 | 2   | CAP_PRESENCE          | Presence sync frames       |
+| 3   | CAP_RECOVERY          | MSG frames carry the origin's recovery position |
+| 4   | CAP_RESUME            | Catch-up after a lost link (with recovery on) |
+| 5   | CAP_PRODUCERS         | PRODUCER_QUERY / PRODUCER_STATE (3.2) |
+| 6   | CAP_RESUME_TOPICS     | The catch-up covers streams begun while the link was down (3.2, with recovery on) |
+| 7   | CAP_ARRIVAL           | The catch-up starts after the last arrival heard (3.2, with recovery on) |
 
 ### Interest-Based Routing
 
@@ -340,7 +362,7 @@ This reduces inter-peer bandwidth proportionally to topic overlap between instan
 For dynamic environments (auto-scaling, container orchestration), peers discover each other through gossip:
 
 - **PeerAnnounce**: when a node learns about a new peer, it broadcasts the address to all other connected peers (excluding the source).
-- **PeerList**: periodically shared list of all known peer addresses.
+- **PeerList**: the list of all known peer addresses, sent by both sides when a link comes up.
 
 Nodes that receive a previously unknown peer address initiate an outbound connection automatically.
 
@@ -348,9 +370,9 @@ Nodes that receive a previously unknown peer address initiate an outbound connec
 
 MSG frames with payloads above 256 bytes are compressed with zstd (level 1) before transmission. The `FLAG_COMPRESSED` bit (0x01) in the frame flags byte signals compressed payloads. If the compressed output is not smaller than the original, the frame is sent uncompressed.
 
-### mTLS
+### TLS
 
-Cluster connections support mutual TLS using rustls + tokio-rustls:
+Cluster links are always TLS (rustls + tokio-rustls); a plaintext link is refused. By default both nodes prove the cluster secret: TLS 1.3 with raw public keys derived from it. Instead, certificates from a CA of your own:
 
 - **P-256 certificates** with WebPKI validation.
 - A single node certificate and key is used for both server (accept) and client (connect) roles.
@@ -364,7 +386,7 @@ Cluster connections support mutual TLS using rustls + tokio-rustls:
 | Circuit breaker        | 10 failures to open, 60s reset, 3 half-open calls |
 | Exponential backoff    | 1s initial, 1.5x multiplier, 60s max, 20% jitter |
 | Heartbeat              | 5s interval, 15s timeout                         |
-| Graceful shutdown      | SHUTDOWN frame sent to all peers before exit     |
+| Graceful shutdown      | After the last publish it took, each link writes what it had, SHUTDOWN last (at most 2 s); see [SHUTDOWN](CLUSTER_PROTOCOL.md#shutdown-0x05---graceful-shutdown) |
 | Dead letter queue      | 1000-entry ring for failed cluster sends         |
 
 ### Cluster Metrics
@@ -391,19 +413,26 @@ WSE provides automatic message recovery for clients that temporarily disconnect.
 ### Ring Buffer Design
 
 ```
-TopicRecoveryBuffer
-  +-- entries: Box<[Option<RecoveryEntry>]>   (power-of-2 sized)
-  +-- mask: u64                                (capacity - 1, for bitmask indexing)
-  +-- head_offset: u64                         (next write position)
-  +-- tail_offset: u64                         (oldest valid position)
+TopicRecoveryBuffer                            (this node's own stream of a topic)
+  +-- entries: VecDeque<(Bytes, u64)>          (payload and arrival number, oldest first)
+  +-- capacity: usize                          (power of two; grows up to it)
+  +-- head_offset: u64                         (next write position; the tail is head - len)
+  +-- evicted_through: u64                     (latest arrival number evicted)
   +-- epoch: u32                               (unique per buffer creation)
   +-- total_bytes: usize                       (current memory usage)
   +-- last_write: Instant                      (for TTL eviction)
+
+ForeignRecoveryBuffer                          (another node's stream, keyed by topic and its epoch)
+  +-- entries: Box<[Option<RecoveryEntry>]>    (fixed ring, power-of-2 sized)
+  +-- mask: u64                                (capacity - 1, for bitmask indexing)
+  +-- head_offset / tail_offset: u64
+  +-- epoch: u32                               (the origin's epoch)
 ```
 
-- Ring buffer capacity is a power of two (default: 128 slots, configurable via `buffer_size_bits`).
-- Indexing uses bitmask: `offset & mask` instead of modulo, which compiles to a single AND instruction.
-- When the buffer is full, the oldest entry is evicted by advancing `tail_offset`.
+- Capacity is a power of two (default: 128 messages, `recovery_buffer_size`). A topic that has seen a handful of messages does not pay for all of them: its own buffer grows as messages come.
+- The foreign ring indexes with a bitmask: `offset & mask` instead of modulo.
+- When a buffer is full, the oldest entry is evicted.
+- What this node publishes to its own subscribers only (`broadcast_local`) is a second stream of the topic, in a buffer of its own with an epoch of its own.
 
 ### Epoch
 
@@ -412,8 +441,12 @@ Each buffer gets a unique epoch generated from: `timestamp_nanos + PID + atomic_
 ### Recovery Flow
 
 ```
-Client reconnects with (topic, epoch, offset)
-  -> RecoveryManager.recover(topic, epoch, offset)
+Client reconnects with (topic, epoch, offset), and from 3.1 every stream it heard of
+  -> RecoveryManager.recover_streams(topic, anchor, streams), or recover(topic, epoch, offset)
+     for a client that names no streams
+     |
+     +-- A history of the topic removed, or a message not kept (no room, a link too full,
+     |   LOST, a node gone without SHUTDOWN), after the client's last one -> NotRecovered
      |
      +-- No buffer exists      -> NoHistory
      +-- Epoch mismatch        -> NotRecovered { current_epoch, current_offset }
@@ -453,7 +486,7 @@ These are the `RustWSEServer` constructor parameters (internally, `recovery_buff
 
 Recovery works across nodes for any topic the new node has interest in. Inter-node MSG frames carry a 12-byte recovery trailer with the origin `(epoch, offset)` (see [Cluster Protocol](CLUSTER_PROTOCOL.md#msg-0x01---application-message)); the receiving node stores those payloads in **foreign recovery buffers** keyed by `(topic, origin_epoch)`. So a client that reconnects to a *different* node can still recover with its original `(epoch, offset)` — provided that node had local subscribers for the topic (and therefore received its MSG frames under interest routing).
 
-A link between two nodes that drops and comes back loses nothing either: on the new link each node says where it stands in the other's streams (RESUME), and the other sends what came after from its own recovery buffer before anything live, so the subscribers get the missed messages in order and the foreign buffers have no hole ([Cluster Protocol](CLUSTER_PROTOCOL.md#resume-0x0e---catch-up-after-a-lost-link)).
+A link between two nodes that drops and comes back loses nothing either node still holds: on the new link each node says where it stands in the other's streams and which topics it has (RESUME), and the other sends what came after from its own recovery buffer before anything live, so the subscribers get the missed messages in order and the foreign buffers have no hole. Between 3.2 nodes the catch-up starts after the last arrival the node heard of (MSG frames carry an 8-byte arrival number after the 12-byte trailer), covers streams begun while the link was down, tells LOST for what the origin no longer holds (a client's recovery from before it then says `recovered: false`), and ends with CAUGHT_UP. A node that went without SHUTDOWN and comes up again at its address took what it published meanwhile with it: the other nodes take every topic as not kept from then on ([Cluster Protocol](CLUSTER_PROTOCOL.md#resume-0x0e---catch-up-after-a-lost-link)).
 
 If the new node never had interest in the topic, it has no buffer for it and recovery returns `NoHistory`; the client re-subscribes from scratch. **Sticky sessions** (e.g., HAProxy `stick-table`, or consistent hashing by user ID) are therefore an optimization that *guarantees* recovery, no longer a requirement for it to work at all.
 
@@ -544,9 +577,9 @@ The Rust binary uses mimalloc as the global allocator. This provides better perf
 
 ### Deduplication
 
-`send_event()` maintains an `AHashSet` with a 50,000-entry FIFO eviction window. Events with duplicate IDs are dropped before serialization, preventing redundant work and bandwidth waste in multi-path delivery scenarios.
+`send_event()` keeps one server-wide window of the last 50,000 (connection, id) pairs, oldest out first. Events with duplicate IDs are dropped before serialization, preventing redundant work and bandwidth waste in multi-path delivery scenarios.
 
-What clients send is kept apart per producer (a client's outbox) and user: one number per producer, the highest message the application took, not a window of ids. A repeat is confirmed and not handed on, at the cost of an atomic compare-and-swap per message and about a hundred bytes per producer, whatever the message rate. A producer silent for a day is forgotten. A client that moves to another node names its last node, which hands the producer over (cluster `PRODUCER_QUERY`); see [the client's outbox](PROTOCOL.md#the-clients-outbox).
+What clients send is kept apart per producer (a client's outbox) and user: one number per producer, the highest message decided (taken or refused), not a window of ids, with the refusals its client has not heard of yet (at most 1024 runs). Each producer's slot has a lock, held while a message of it is decided, the application's handler included, so a connection that comes back meanwhile is answered once the decision is in. A repeat is confirmed and not handed on, whatever the message rate. A producer silent for a day is forgotten. A client that moves to another node names its last node, which hands the producer over (cluster `PRODUCER_QUERY`); see [the client's outbox](PROTOCOL.md#the-clients-outbox).
 
 ### Rate Limiting
 
@@ -558,7 +591,7 @@ The messages a client sends, per connection, go through a token bucket in the re
 | Refill rate  | 10,000/s|
 
 When a connection exceeds its rate limit:
-1. The message is dropped and counted in `wse_rate_limited_total`.
+1. The message is dropped and counted in `wse_rate_limited_total`; a numbered message of a 3.2 client's outbox is refused at once (`nack`, `rate_limited`), its number read from the frame's first bytes.
 2. An error event with `RATE_LIMITED` code and `retry_after` hint is sent to the client, at most once a second. A `rate_limit_warning` goes out at 20% remaining capacity, also at most once a second.
 3. A client that keeps sending into the empty bucket for 10 seconds is closed with code 4429.
 
@@ -571,7 +604,7 @@ Per-connection byte-based backpressure via `max_outbound_queue_bytes` (default 1
 - Each connection tracks pending outbound bytes in an `AtomicUsize` counter
 - Before fan-out, the counter is checked: if `pending >= max_outbound_queue_bytes`, the message is dropped for that connection (others still receive it)
 - The counter uses `saturating_sub` on flush to prevent underflow wraparound
-- Replies the server makes on its own (PONG, server_hello, protocol pongs, rate-limit notices) obey the same budget: a client that sends but does not read cannot grow its queue with them
+- Replies the server makes on its own (PONG, server_hello, protocol pongs, rate-limit notices) obey the same budget: a client that sends but does not read cannot grow its queue with them. The outbox answers (`outbox`, `ack`, `nack`) are never dropped for it: a client waits for them, and is owed no more of them than its outbox holds
 - Two-phase slow consumer detection: a connection whose queue is over the budget on one ping tick is suspected; still over it on the next, it is closed with code 1013 (and dropped 5 seconds later if it does not answer)
 
 ### Subscription Limits
@@ -608,7 +641,9 @@ ts-client/
 |   +-- ConnectionPool.ts          Multi-endpoint connection pooling
 |   +-- NetworkMonitor.ts          Online/offline detection
 |   +-- RateLimiter.ts             Client-side rate limiting
-|   +-- OfflineQueue.ts            IndexedDB persistence for offline messages
+|   +-- Session.ts                 One connection and its services, the outbox among them
+|   +-- Outbox.ts                  The outbox: messages until the server answers for them
+|   +-- IndexedDbOutbox.ts         The outbox's IndexedDB store, so that it outlives the page
 |   +-- EventSequencer.ts          Per-topic (epoch, offset) dedup + gap detection
 |   +-- AdaptiveQualityManager.ts  Dynamic quality adjustment
 +-- protocols/
@@ -669,10 +704,13 @@ interface WSEConfig {
     batchTimeout?: number;          // default: 500
     maxQueueSize?: number;          // default: 10000
   };
-  offline?: {
+  offline?: {                       // the outbox
     enabled?: boolean;              // default: true
-    maxSize?: number;               // default: 1000
-    persistToStorage?: boolean;     // default: true
+    maxSize?: number;               // default: 100,000 messages
+    maxAge?: number;                // default: 3600000 (an hour)
+    maxBytes?: number;              // default: 16 MiB
+    persistToStorage?: boolean;     // default: true (IndexedDB)
+    store?: OutboxStore;            // e.g. fileOutbox(path) in Node
   };
   diagnostics?: {
     enabled?: boolean;              // default: false
@@ -713,6 +751,9 @@ python-client/wse_client/
 +-- circuit_breaker.py     CLOSED/OPEN/HALF_OPEN state machine
 +-- rate_limiter.py        Token bucket
 +-- event_sequencer.py     Id dedup + per-topic (epoch, offset) gap detection
++-- outbox.py              The outbox: messages until the server answers for them
++-- delivery.py            Recover-or-resync: topic states, checkpoints
++-- signing.py             Signed messages: the client's own, and checking the server's
 +-- connection_pool.py     Multi-endpoint, health scoring, 3 LB strategies
 +-- network_monitor.py     Latency/jitter/quality analysis
 +-- types.py               Enums, dataclasses (WSEEvent, ConnectionState)
@@ -768,8 +809,8 @@ A single WSE server handles all connections locally. Topic fan-out goes through 
 
 When `broadcast(topic, data)` is called:
 
-1. Local fan-out to subscribers on this instance (same as `broadcast_local`).
-2. `ClusterCommand::Publish` sent to the cluster manager task.
+1. The message is stamped in the topic's cluster stream, and fanned out to subscribers on this instance.
+2. `ClusterCommand::Publish` (the stamped payload, its position and arrival number) sent to the cluster manager task.
 3. Cluster manager checks each peer's interest table.
 4. MSG frame sent only to peers with matching topic subscriptions.
 5. Receiving peers hand the message to the lanes holding their local subscribers.
@@ -791,7 +832,7 @@ When `broadcast(topic, data)` is called:
 | conn_formats      | DashMap<String, bool>       | Per-connection read/write  |
 | conn_rates        | DashMap                     | Per-connection write       |
 | conn_last_activity| DashMap                     | Per-connection write       |
-| inbound channel   | crossbeam bounded channel   | MPSC, lock-free           |
+| inbound channel   | crossbeam unbounded channel, counted | MPSC, lock-free  |
 | connection channel| tokio mpsc::unbounded       | SPSC per connection       |
 | cluster peer data | tokio mpsc::bounded(10K)    | Per-peer backpressure     |
 | cluster command   | tokio mpsc::unbounded       | MPSC                      |

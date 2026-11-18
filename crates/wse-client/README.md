@@ -9,7 +9,7 @@ servers: [`wse`](https://crates.io/crates/wse) in Rust and
 
 ```toml
 [dependencies]
-wse-client = "3"
+wse-client = "3.2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
@@ -97,7 +97,8 @@ async fn main() -> Result<(), wse_client::Error> {
   server for what is missing, and after a reconnect subscribes again from
   where it left off. What cannot be recovered is reported as a `Gap`.
 - **Reconnects** with backoff and jitter, a fresh token from a
-  `TokenProvider` each time; an expired or refused token, a server that
+  `TokenProvider` each time: a refused or expired token is fetched again,
+  three times in a row at most. A fixed token that is refused, a server that
   refuses the session, and the application's own close end the client.
 - **Heartbeats** both ways, and a connection silent for too long is made
   again.
@@ -116,9 +117,10 @@ async fn main() -> Result<(), wse_client::Error> {
   connection that is ready now, or not at all: one the connection did not
   write is dropped, never sent on a later connection. For commands that
   must not run late (a valve, a door, an order).
-- **The outbox.** Every message sent waits until the server answers for
-  it, goes again after a reconnect, and reaches the server's application
-  once; the application hears what became of each. In memory, or in a file
+- **The outbox.** Every message sent, except a live or signed one, waits
+  until the server answers for it and goes again after a reconnect; a 3.2
+  server takes each once where it can tell, and marks it a possible repeat
+  where it cannot. The application hears what became of each. In memory, or in a file
   that outlives the application (see below). Every message carries an
   `id` (a UUID, or the application's own), as from the TypeScript and
   Python clients.
@@ -203,8 +205,8 @@ A handler works the same, and may call `resynced` itself: what was held comes
 once it returns. `Event::Continuity` says how a topic's continuity changes and
 `Client::topic_states()` where each topic stands; without a delivery (best
 effort) nothing is held, and the states and the checkpoint are kept all the
-same. It is the delivery of the TypeScript client and of the Swift, Kotlin
-and Dart packages, natively and in the browser.
+same. It is the delivery of the TypeScript and Python clients and of the Swift,
+Kotlin, Java and Dart packages, natively and in the browser.
 
 A send can wait for its topics: `client.send_requiring("cancel", &order,
 ["orders"])` goes once each of them is continuous on the connection, and
@@ -340,7 +342,8 @@ whatever ids the windows chose. After a reconnect, a window's send that
 requires topics waits in the outbox until that window resynced them. It
 connects while a window, or the application (`Owner::retain`), shares the
 connection. The token, the keys and the outbox stay with the owner; no frame
-carries them.
+carries them. Not in the browser. [`tauri-plugin-wse`](https://github.com/silvermpx/wse/blob/main/bindings/tauri/plugin/README.md)
+is a Tauri application's owner, ready made on it.
 
 ```rust,ignore
 use wse_client::bridge::{Options, Owner, Window};
@@ -369,8 +372,8 @@ owner.frame(window, r#"{"k":"hello","v":1,"agent":"main"}"#); // each frame the 
   and Go).
 - `bridge`: the `bridge` module, one connection for every window of an
   application (with `aws-lc`).
-- `native`: the `native` module the Swift, Kotlin and Dart packages are
-  built on: plain types, one shared runtime, cancellable calls, events read
+- `native`: the `native` module the Swift, Kotlin, Java and Dart packages
+  are built on: plain types, one shared runtime, cancellable calls, events read
   in bounded batches, and `wss://` checked by the system's certificate
   verifier. Not in the browser.
 

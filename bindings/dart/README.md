@@ -90,8 +90,11 @@ client.clear();
 
 `sendWith` also names a request's `correlationId`, which the reply names
 back (the message item's `correlationId`), and its `priority` (10 critical,
-8 high, 5 normal, 3 low, 1 background), for the server's app; `live: true`
-sends on the connection that is ready now, or not at all.
+8 high, 5 normal, 3 low, 1 background), for the server's app;
+`requires: ['orders']` waits until those topics are continuous, as
+`sendRequiring` does, under the app's own id; `live: true` sends on the
+connection that is ready now, or not at all. A message item carries its
+sender's `priority` and `timestamp` too.
 
 The outbox is in memory by default. With `offline: wseOffline(path: file)`
 (a file in the app's own storage) it outlives the app. At most

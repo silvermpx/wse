@@ -106,6 +106,8 @@ server.connect_cluster(
 )
 ```
 
+Turn recovery on (`recovery_enabled=True`) on every node: it is what lets a link that drops catch up without loss. An IPv6 link-local peer or `cluster_addr` gives its zone by number (`[fe80::1%2]:9999`).
+
 The links between nodes are TLS, always. Every node derives the same key from the cluster's secret and proves it when a link opens: a node without the secret cannot join, and nothing between the nodes can read or change their traffic. Make the secret once and give it to every node like a password:
 
 ```bash
@@ -132,7 +134,7 @@ New nodes only need one reachable seed address. The gossip protocol (PeerAnnounc
 
 ### Load Balancer Configuration
 
-Recovery works on any node that has subscribers for the topic: nodes keep each other's messages for it under their original positions (see [Cluster Recovery](ARCHITECTURE.md#cluster-recovery)). A node that never had interest in the topic has no history for it, so sticky sessions are what guarantees recovery after a reconnect:
+Recovery works on any node that has subscribers for the topic: nodes keep each other's messages for it under their original positions (see [Cluster Recovery](ARCHITECTURE.md#cluster-recovery)). A node that never had interest in the topic has no history for it, so sticky sessions are what guarantees recovery after a reconnect. They also keep a client's outbox on its node: a client that comes back on another node makes that node ask its last one (up to 2 s), and if that one is gone or slow, the messages it sends again reach the application marked `possible_repeat`. Stick on a cookie that lasts (a session's or the user's): the token's changes at every refresh.
 
 **HAProxy:**
 
@@ -144,7 +146,7 @@ frontend websocket
 backend wse_nodes
     balance roundrobin
     stick-table type string len 64 size 100k expire 30m
-    stick on req.cook(access_token)
+    stick on req.cook(session_id)
     server node-a 10.0.0.1:5007 check
     server node-b 10.0.0.2:5007 check
     server node-c 10.0.0.3:5007 check
@@ -401,8 +403,10 @@ For rolling deployments, the sequence per pod is:
 1. Kubernetes sends SIGTERM
 2. preStop hook calls `drain(timeout=10)` -- clients receive close code 4300 and reconnect to other pods
 3. Drain wait runs as a separate task; health checks and cluster protocol continue to work during the window
-4. After timeout, `server.stop()` cleans up remaining resources
+4. After timeout, `server.stop()` answers each client's outbox and leaves the cluster: each link writes what it had, then SHUTDOWN, in at most 2 s
 5. Kubernetes replaces the pod
+
+A pod killed without `stop()` (past `terminationGracePeriodSeconds`, or out of memory) says no SHUTDOWN: once its replacement comes up at the same address, the other nodes' clients hear `recovered: false` for what it had published meanwhile, and the messages its clients send again reach the application marked `possible_repeat`. Give the grace period room for the drain timeout and `stop()`.
 
 In cluster mode, the draining node notifies peers via `ClusterCommand::Drain`. Peers update their routing tables so new messages are not forwarded to the draining node.
 
@@ -412,8 +416,11 @@ Configure clients to detect close code 4300 and reconnect immediately:
 
 ```python
 # Python client -- automatic reconnect handles this by default
+from wse_client import connect
+
 async with connect("ws://host/wse", token="...") as client:
-    # On close code 4300, the client reconnects to the next endpoint in the pool
+    # On close code 4300 the client reconnects with backoff: to another of its
+    # endpoints (by load_balancing) when it was given several
     async for event in client:
         process(event)
 ```
@@ -430,11 +437,11 @@ async with connect("ws://host/wse", token="...") as client:
 | 100,000 | 4 GB | 8 | 512 MB |
 | 500,000 | 16 GB | 16+ | 1 GB+ |
 
-Memory usage depends on message sizes, presence data, and recovery buffer configuration. The numbers above assume typical workloads with 1 KB average message size. Per-connection outbound buffers are capped at `max_outbound_queue_bytes` (default 16 MB); slow consumers that exceed this limit have messages dropped (recoverable via reconnect). When most clients fall behind, the server slows delivery down to the pace they read, and the application's sends wait once 65,536 commands are queued, so a fast publisher does not grow memory without limit.
+Memory usage depends on message sizes, presence data, and recovery buffer configuration. The numbers above assume typical workloads with 1 KB average message size. Per-connection outbound buffers are capped at `max_outbound_queue_bytes` (default 16 MB); slow consumers that exceed this limit have messages dropped (recoverable via reconnect), and one still over it at the next ping is closed (1013). When most clients fall behind, the server slows delivery down to the pace they read, and the application's sends wait once 65,536 commands are queued, so a fast publisher does not grow memory without limit.
 
-Set `max_subscriptions_per_connection` to limit how many topics each connection can subscribe to (default 0 = unlimited). This prevents a single client from creating millions of unique topics and exhausting server memory. Both regular subscriptions and queue group memberships count against the same budget.
+Set `max_subscriptions_per_connection` to limit how many topics each connection can subscribe to (default 0: no limit on the application's subscriptions; a client's own requests hold at most 1024 topics). This prevents a single client from creating millions of unique topics and exhausting server memory. Both regular subscriptions and queue group memberships count against the same budget.
 
-Separately from `max_connections` (which counts only registered connections — those past the WebSocket upgrade and JWT), the server caps concurrent **pre-handshake** connections at 512 (slowloris protection, not configurable). TCP connects beyond this are dropped before the upgrade, so a flood of half-open sockets can't exhaust tasks/file descriptors ahead of the connection limit.
+Separately from `max_connections` (which counts only registered connections — those past the WebSocket upgrade and JWT), the server caps concurrent **pre-handshake** connections at 4096, each for at most 5 s (slowloris protection, not configurable). TCP connects beyond this are dropped before the upgrade, so a flood of half-open sockets can't exhaust tasks/file descriptors ahead of the connection limit.
 
 ---
 
@@ -454,6 +461,8 @@ async def metrics():
         media_type="text/plain; version=0.0.4; charset=utf-8",
     )
 ```
+
+A service that already serves `/metrics` from a `prometheus_client` registry registers the server there instead: `REGISTRY.register(WSECollector(server))`, with `from wse_server.prometheus import WSECollector` (`pip install wse-server[prometheus]`).
 
 Prometheus scrape config:
 
@@ -495,7 +504,7 @@ async def health():
 ### Alerts
 
 - `wse_inbound_dropped_total` increasing - drain loop is too slow, increase batch size or add processing capacity.
-- `wse_cluster_peers < expected` - peer disconnected, check network and mTLS certificates.
+- `wse_cluster_peers < expected` - peer disconnected, check the network and that every node has the same `WSE_CLUSTER_SECRET` (or its certificates).
 - `wse_recovery_bytes > 80% budget` - consider increasing `recovery_memory_budget` or reducing `recovery_ttl`.
 - `wse_auth_failures_total` spike - possible brute force attempt or client misconfiguration.
 - `wse_slow_consumer_drops_total` increasing - clients can't consume fast enough. Increase `max_outbound_queue_bytes` or investigate slow subscribers.
@@ -504,7 +513,7 @@ async def health():
 
 ## Configuration
 
-All configuration is passed programmatically through the `RustWSEServer` constructor and `connect_cluster()` method; the server reads only `RUST_LOG` and, as a fallback for `connect_cluster()`'s TLS paths, `WSE_CLUSTER_TLS_CERT`, `WSE_CLUSTER_TLS_KEY` and `WSE_CLUSTER_TLS_CA` from the environment. Origin validation: `allowed_origins`, or your reverse proxy (see [SECURITY.md](SECURITY.md#origin-validation)).
+All configuration is passed programmatically through the `RustWSEServer` constructor and `connect_cluster()` method; the server reads only `RUST_LOG` and, as fallbacks for `connect_cluster()`, `WSE_CLUSTER_SECRET` and the TLS paths `WSE_CLUSTER_TLS_CERT`, `WSE_CLUSTER_TLS_KEY` and `WSE_CLUSTER_TLS_CA` from the environment. Origin validation: `allowed_origins`, or your reverse proxy (see [SECURITY.md](SECURITY.md#origin-validation)).
 
 ### Logging
 

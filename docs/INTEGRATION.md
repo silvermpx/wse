@@ -10,7 +10,7 @@ Complete reference for integrating `wse-server` into your application. Covers se
 pip install wse-server
 ```
 
-The package includes the Python server module and the prebuilt Rust engine (`wse-accel`). No separate compilation step required.
+The package includes the Python server module and the prebuilt Rust engine (`wse_server._wse_accel`). No separate compilation step required.
 
 ---
 
@@ -152,7 +152,7 @@ Configure `jwt_secret`, `jwt_issuer`, `jwt_audience`, and optionally `jwt_cookie
 - With JWT configured: `auth_connect` event fires with the validated `user_id`
 - Without JWT configured: `connect` event fires with the raw cookies string
 
-**Authenticating in Python:** without `jwt_secret`, check the cookies of the `connect` event yourself, then call `server.accept_connection(conn_id, user_id)`. It sends the client `server_ready`, the message both clients wait for before they send anything, and makes `user_id` the connection's user for presence. Until then the connection gets no broadcasts and, with `client_subscriptions=True`, the server refuses every topic it asks for. Set its topic ACL (`set_topic_acl`) before accepting it: from then on the client may subscribe. Reject with `server.disconnect(conn_id)`. An application that knows the client's public key accepts with `accept_connection(conn_id, user_id, client_key=key)`: the connection is admitted only once the client proves that key inside its E2E session, so a cookie copied on the way opens nothing ([SECURITY.md](SECURITY.md#binding-a-session-to-the-clients-key)).
+**Authenticating in Python:** without `jwt_secret`, check the cookies of the `connect` event yourself, then call `server.accept_connection(conn_id, user_id)`. It sends the client `server_ready`, the message every client waits for before it sends anything, and makes `user_id` the connection's user for presence. Until then the connection gets no broadcasts and, with `client_subscriptions=True`, the server refuses every topic it asks for. Set its topic ACL (`set_topic_acl`) before accepting it: from then on the client may subscribe. Reject with `server.disconnect(conn_id)`. An application that knows the client's public key accepts with `accept_connection(conn_id, user_id, client_key=key)`: the connection is admitted only once the client proves that key inside its E2E session, so a cookie copied on the way opens nothing ([SECURITY.md](SECURITY.md#binding-a-session-to-the-clients-key)).
 
 ```python
 for kind, conn_id, data in server.drain_inbound(256, 50):
@@ -243,9 +243,25 @@ while True:
 | `"msg"` | Client sent WSE-prefixed JSON | parsed dict |
 | `"raw"` | Client sent non-JSON text | raw string |
 | `"bin"` | Client sent binary frame | bytes |
+| `"signed"` | A signed message that passed every check | its fields, and `signature` (`body`, `sig`, `kid`): the proof to keep |
 | `"disconnect"` | Connection closed | None |
 | `"presence_join"` | User's first connection joined a topic | dict: topic, user_id, data |
 | `"presence_leave"` | User's last connection left a topic | dict: topic, user_id, data |
+
+### Messages of a client's outbox
+
+A 3.2 client numbers the messages of its outbox: the `"msg"` dict (and
+`on_message`'s data) keeps their number (`s`) and `id`. The server confirms a
+message once drain mode's queue or the connection's callbacks have taken it,
+and takes each once. When it cannot tell whether it took one already (the
+client's last node is gone or does not answer within 2 s, its producer was
+silent for more than a day, a handler panicked), the message comes with
+`"possible_repeat": True`: the application checks its `id` against what it
+applied. A message the application has no room for is refused (`busy`), and
+the client hears it was not delivered: drain mode's queue is over
+`max_inbound_queue_size` or `max_inbound_queue_bytes`, 256 callbacks of its
+connection wait, or the server has neither drain mode nor `on_message`. Each
+producer's state is kept for a day.
 
 ### Callback Mode (alternative)
 
@@ -266,6 +282,10 @@ def on_disconnect(conn_id):
 server.set_callbacks(on_connect, on_message, on_disconnect)
 server.start()
 ```
+
+`set_callbacks(..., on_signed_message=None)` takes a fourth callback for the
+signed messages that passed every check, with their proof as in the
+`"signed"` event.
 
 The callbacks of one connection run one after another in the order of its events: `on_connect` first, its messages in order, `on_disconnect` last. Different connections run in parallel on the server's worker threads (truly in parallel on free-threaded Python), so state shared between connections needs a lock.
 
@@ -483,7 +503,7 @@ Message recovery allows clients to catch up on missed messages after a reconnect
 server = RustWSEServer(
     "0.0.0.0", 5007,
     recovery_enabled=True,
-    recovery_buffer_size=256,    # slots per topic (power-of-2)
+    recovery_buffer_size=256,    # messages kept per topic (a power of two)
     recovery_ttl=300,            # 5 minutes
     recovery_max_messages=500,
     recovery_memory_budget=268435456,  # 256 MB
@@ -511,12 +531,14 @@ and send the reply described in [PROTOCOL.md](PROTOCOL.md#recovery-reply). The r
 
 | Parameter | Description |
 |-----------|-------------|
-| `recovery_buffer_size` | Ring buffer slots per topic. Must be a power of 2. |
-| `recovery_ttl` | Maximum age (seconds) of recoverable messages. |
+| `recovery_buffer_size` | Messages kept per topic: raised to at least 16, rounded up to a power of two, at most 65,536. |
+| `recovery_ttl` | How long (seconds) an idle topic's history lives after its last message; a busy topic keeps its messages until newer ones take their place. |
 | `recovery_max_messages` | Most messages one recovery replays; a longer gap is reported as not recovered. |
 | `recovery_memory_budget` | Hard cap on total memory used by all recovery buffers. |
 
 When recovery is enabled, every topic broadcast is stamped with `tp` (topic), `e` (the epoch of its stream, 8-hex) and `o` (offset) fields injected into the JSON payload, so the clients track their position in each stream from the messages themselves and drop duplicates idempotently by `(epoch, offset)`. On an offset gap in a live stream the clients ask for the missing messages themselves, and report what cannot be replayed (`wseGap` in TypeScript, `Event::Gap` in Rust, the `recovery_gap` event in Python).
+
+A client can also hold a topic it could not recover until the application has reloaded its state, and recover from what the application committed it applied (recover-or-resync: `delivery: 'recover-or-resync'` in TypeScript, `Config::delivery` in Rust and its packages, `DeliveryConfig` in Python); a send can wait until its topics are continuous again (`sendRequiring`, `send_requiring`, `send(requires=...)`).
 
 ---
 
@@ -546,7 +568,7 @@ server.connect_cluster(
 )
 ```
 
-Without `cluster_port` or `single_port=True`, `connect_cluster()` raises `ValueError`; a port that cannot be bound raises `OSError`.
+Without `cluster_port` or `single_port=True`, `connect_cluster()` raises `ValueError`, as it does for `cluster_port` together with `single_port=True`, `cluster_host` without `cluster_port`, a secret together with certificates, and an IPv6 zone given by an interface's name in `peers`, `seeds` or `cluster_addr` (give its number: `[fe80::1%2]:9999`). It raises `RuntimeError` for `seeds` without `cluster_addr`, part of the certificate files, a server not started, or a cluster already joined; a port that cannot be bound raises `OSError`.
 
 **Cluster with certificates** (mutual TLS, from a CA of your own) instead of the secret:
 
@@ -586,12 +608,14 @@ server.cluster_peers_count()    # int - number of active peer connections
 ```python
 peers = server.cluster_info()
 # [
-#     {"address": "10.0.0.2:9999", "instance_id": "a1b2c3...", "capabilities": 15, "connected_at": 1731470000123},
-#     {"address": "10.0.0.3:41822", "instance_id": "d4e5f6...", "capabilities": 15, "connected_at": 1731470000456},
+#     {"address": "10.0.0.2:9999", "instance_id": "a1b2c3...", "capabilities": 255, "connected_at": 1731470000123},
+#     {"address": "10.0.0.3:41822", "instance_id": "d4e5f6...", "capabilities": 255, "connected_at": 1731470000456},
 # ]
 ```
 
-`cluster_info()` returns one entry per live link: the address this node dialed (or, for a link the peer dialed, the socket address it came from), the peer's instance ID (assigned at startup), the negotiated capabilities and when the link came up. Useful for monitoring dashboards and verifying that dynamic peer discovery is working correctly.
+`cluster_info()` returns one entry per live link: the address this node dialed (or, for a link the peer dialed, the socket address it came from), the peer's instance ID (assigned at startup), the negotiated capabilities (255 between two 3.2 nodes with recovery, 47 without) and when the link came up. Useful for monitoring dashboards and verifying that dynamic peer discovery is working correctly.
+
+**When a link drops.** With recovery on every node, a link that drops and comes back catches up: each node gets what it missed of the other's streams, in order, before anything new, and is told what the other no longer holds, so a client's recovery from before that says `recovered: false`. Without recovery, a message for a link too full to take it is dropped. `stop()` leaves the cluster after its last publishes: each link writes what it had, then SHUTDOWN, in at most 2 s. A node that went without SHUTDOWN (killed, out of memory) and comes up again at its address took what it published meanwhile with it: the other nodes' clients hear `recovered: false`. Addresses are compared as places: an IPv4 address and its IPv4-mapped IPv6 form are one, a host name is one whatever its case, a port is a number, and a link-local IPv6 address keeps its zone.
 
 ---
 
@@ -607,6 +631,7 @@ Returns a dict with the current server state:
 {
     "connections": 150,
     "inbound_queue_depth": 0,
+    "command_queue_depth": 0,
     "inbound_dropped": 0,
     "uptime_secs": 3600.5,
     "recovery_enabled": True,
@@ -623,8 +648,9 @@ Returns a dict with the current server state:
     "cluster_unknown_message_types": 0,
     "cluster_dlq_size": 0,
     "presence_enabled": True,
-    "presence_topics": 3,
+    "presence_topics": 3,          # presence_* only with presence on
     "presence_total_users": 25,
+    "crypto": "aws-lc-rs",         # this build's crypto library
 }
 ```
 
@@ -701,6 +727,16 @@ See [DEPLOYMENT.md](DEPLOYMENT.md) for Kubernetes preStop hook and rolling resta
 
 ## 12. Client SDKs
 
+### The outbox
+
+From 3.2 every message a client sends, except a live or signed one, waits in
+its outbox until the server confirms it, and goes again after a reconnect, in
+order, only as the user whose connection first wrote it. At most 100,000
+messages and 16 MiB wait; one not sent within an hour, or its `ttl`, runs out.
+What became of each comes by its id: delivered, or not delivered (`expired`,
+`user_changed`, `cleared`, `closed`). The outbox is in memory by default, or
+in a file, IndexedDB or React Native's storage, so that it outlives the app.
+
 ### Commands that must not run late
 
 A client keeps what it could not send yet and sends it once the connection
@@ -708,9 +744,9 @@ is back. For a command that acts on the world (open a valve, unlock a door,
 place an order) that can be wrong: it would run minutes later, after the
 person who gave it saw nothing happen. Send such commands live: a live
 message goes on the connection that is ready when it is sent, or not at
-all (TypeScript `{ live: true }`, Rust `send_live`, Swift, Kotlin and Dart
-`sendLive`, Python `send(..., live=True)`; signed messages always go this
-way). The application still gives each command its own id, a time after
+all (TypeScript `{ live: true }`, Rust `send_live`, Swift, Kotlin, Java and
+Dart `sendLive`, Python `send(..., live=True)`; signed messages always go
+this way). The application still gives each command its own id, a time after
 which it no longer counts, and checks on the server that the user may give
 it.
 
@@ -828,7 +864,7 @@ export function registerAllHandlers(messageProcessor: {
 
 Frontend never maps domain event names. It receives ready `"t"` + `"p"` from the backend publisher. See Section 14 for the publishing architecture.
 
-Both clients handle reconnection with exponential backoff, automatic resubscription, and message recovery (when enabled on the server).
+Every client (TypeScript, Python, Rust and its Swift, Kotlin, Java and Dart packages) handles reconnection with exponential backoff, automatic resubscription, and message recovery (when enabled on the server).
 
 ---
 
@@ -843,21 +879,21 @@ Both clients handle reconnection with exponential backoff, automatic resubscript
 ### TLS Termination
 
 - Run behind a reverse proxy (nginx, HAProxy, Caddy) for TLS on client-facing connections. WSE serves WebSocket over plain TCP.
-- Use mTLS for cluster peer connections in production. Configure `tls_ca`, `tls_cert`, `tls_key` in `connect_cluster()`.
+- Cluster links are TLS, always: the same `cluster_secret` (or `WSE_CLUSTER_SECRET`, at least 32 random bytes) on every node is enough. Certificates from a CA of your own (`tls_ca`, `tls_cert`, `tls_key`) are the alternative.
 - Always use `wss://` in production. The `access_token` cookie has `Secure` flag, which requires HTTPS.
 
 ### Recovery Configuration
 
 - Enable recovery for topics where missed messages matter (chat, order updates, notifications).
 - Set `recovery_memory_budget` to cap total memory across all topic buffers. Default 256 MB is suitable for most workloads.
-- Choose `recovery_buffer_size` as a power of 2 based on message rate and expected reconnect window. For example: 1000 msg/s with 30s reconnect window needs at least 32768 slots.
-- Recovery works on any node that has subscribers for the topic: nodes keep each other's messages for it under their original positions (see [Cluster Recovery](ARCHITECTURE.md#cluster-recovery)). A node that never had interest in the topic has no history for it, so sticky sessions are what guarantees recovery after a reconnect (HAProxy `stick-table`, consistent hashing by user ID).
+- Choose `recovery_buffer_size` from the message rate and the reconnect window, and `recovery_max_messages` to match: 1000 msg/s with a 30 s reconnect window needs at least 32768 slots, and a recovery of up to 30,000 messages (the default replays 500; a longer gap is reported as not recovered).
+- Recovery works on any node that has subscribers for the topic: nodes keep each other's messages for it under their original positions (see [Cluster Recovery](ARCHITECTURE.md#cluster-recovery)). A node that never had interest in the topic has no history for it, so sticky sessions are what guarantees recovery after a reconnect (HAProxy `stick-table`, consistent hashing by user ID). They also keep a client's outbox on its node: a client that comes back on another node makes that node ask its last one (up to 2 s), and if that node is gone or slow, the messages it sends again arrive marked `possible_repeat`. What a node publishes with `broadcast_local` is its own stream, never sent to another node: it is recovered only on that node.
 
 ### Cluster Scaling
 
 - Start with cluster mode when a single instance cannot handle the connection count or you need geographic distribution.
 - Gossip discovery reduces configuration overhead. New nodes only need one seed address to join.
-- Interest-based routing reduces inter-node bandwidth. Only topics with active subscribers on both nodes generate cross-node traffic.
+- Interest-based routing reduces inter-node bandwidth. A node forwards a topic only to the nodes that have subscribers for it.
 - Monitor cluster health via `cluster_peers_count()` and the `cluster_messages_sent`/`cluster_messages_delivered` counters in `health_snapshot()`.
 
 ### Presence in Production
@@ -874,7 +910,7 @@ Key metrics to watch:
 |--------|--------|-----------------|
 | `inbound_dropped` | `health_snapshot()` | > 0 |
 | `inbound_queue_depth` | `health_snapshot()` | > 50% of `max_inbound_queue_size` |
-| `slow_consumer_drops` | `prometheus_metrics()` | > 0 (clients can't keep up) |
+| `wse_slow_consumer_drops_total` | `prometheus_metrics()` | > 0 (clients can't keep up) |
 | `cluster_peer_count` | `health_snapshot()` | < expected peer count |
 | `recovery_total_bytes` | `health_snapshot()` | > 80% of `recovery_memory_budget` |
 | Connection count | `get_connection_count()` | > 90% of `max_connections` |
@@ -1081,7 +1117,9 @@ async def metrics():
 | `wse_inbound_queue_depth` | Pending events in drain queue |
 | `wse_uptime_seconds` | Server uptime |
 | `wse_topics` | Active topic count |
+| `wse_command_queue_depth` | Commands from the application waiting for the server |
 | `wse_cluster_peers` | Connected cluster peers |
+| `wse_build_info{version,crypto}` | Always 1: the version and the crypto library as labels |
 
 **Counters** (cumulative):
 
@@ -1098,13 +1136,13 @@ async def metrics():
 | `wse_inbound_dropped_total` | Drain queue events dropped (queue full) |
 | `wse_slow_consumer_drops_total` | Messages dropped due to slow consumer backpressure |
 
-**Cluster counters** (when clustering is enabled):
+**Cluster counters** (always present; zero without a cluster):
 
 | Metric | Description |
 |---|---|
 | `wse_cluster_messages_sent_total` | Messages forwarded to peers |
-| `wse_cluster_messages_delivered_total` | Messages received from peers |
-| `wse_cluster_messages_dropped_total` | Cluster messages dropped |
+| `wse_cluster_messages_delivered_total` | Messages from peers delivered to this node's subscribers, one per subscriber |
+| `wse_cluster_messages_dropped_total` | Cluster messages dropped: for a link too full to take them, or for a subscriber of this node too slow to read |
 | `wse_cluster_bytes_sent_total` | Bytes sent to peers |
 | `wse_cluster_bytes_received_total` | Bytes received from peers |
 | `wse_cluster_reconnects_total` | Peer reconnections |
@@ -1113,7 +1151,7 @@ async def metrics():
 
 | Metric | Description |
 |---|---|
-| `wse_topic_messages_total{topic="..."}` | Messages broadcast to a topic (top 50 topics by volume) |
+| `wse_topic_messages_total{topic="..."}` | Messages published to a topic on this node or received for it from peers (top 50 topics by volume) |
 
 The per-topic counter tracks the 50 highest-volume topics. When the internal map exceeds 10K entries, stale topics are evicted automatically to prevent unbounded memory growth.
 
@@ -1125,6 +1163,11 @@ The per-topic counter tracks the 50 highest-volume topics. When the internal map
 | `wse_recovery_bytes` | Bytes in recovery buffers |
 | `wse_presence_topics` | Topics with presence tracking |
 | `wse_presence_users` | Total tracked users |
+
+A service that already serves `/metrics` from a `prometheus_client` registry
+can put the server's metrics there instead: `REGISTRY.register(WSECollector(server))`
+with `from wse_server.prometheus import WSECollector` (`pip install
+wse-server[prometheus]`).
 
 ### Prometheus Config
 
@@ -1151,9 +1194,12 @@ cargo add wse serde_json tokio --features tokio/full
 ```
 
 What the application hears comes to its `Handler`: `connect` (return the
-connection's own state, or `None` to refuse it; subscribe it to its topics
-there with `Connect::subscribe`), `message`, `signed`, `disconnect` and
-`presence`. What it sends goes through a `Publisher` (`server.publisher()`,
+connection's own state, or `None` when it has no room for it now: the client
+is told to come back later, 1013; subscribe it to its topics there with
+`Connect::subscribe`, and see how it speaks with `Connect::msgpack` and
+`Connect::sealed`), `message` (false when there is no room: a message of a
+3.2 client's outbox is then refused, `busy`), `signed`, `disconnect` and
+`presence`. To refuse a client, `Publisher::disconnect` it. What it sends goes through a `Publisher` (`server.publisher()`,
 cheap to clone):
 
 | Python (`RustWSEServer`) | Rust (`wse`) |
@@ -1183,14 +1229,16 @@ cheap to clone):
 Sends never wait: past 65,536 queued sends they fail with `Error::Full`,
 and a publisher that may outrun its clients awaits `Publisher::ready()`
 before each send. Handler calls run on the runtime's worker threads, in
-order for each connection; one that panics closes its connection (1011).
+order for each connection; one that panics closes its connection (1011), and a message of a client's outbox it was handling comes again, marked `possible_repeat`.
 The application sets up its own tracing subscriber; the server's log target
-is `wse`.
+is `wse`. `Server::connect_cluster` reads no `WSE_CLUSTER_*` environment
+variable: the settings come from the application.
 
 The Rust client is [`wse-client`](https://crates.io/crates/wse-client): a
 `Handler` that reads each message in place from its frame, or a stream of
-owned messages; topics with recovery, reconnects, msgpack, E2E encryption
-and signed messages. It runs on tokio and in the browser (WebAssembly), where
+owned messages; topics with recovery, the outbox, recover-or-resync,
+reconnects, msgpack, E2E encryption and signed messages; `start` returns at
+once and connects in the background. It runs on tokio and in the browser (WebAssembly), where
 the page's cookie carries the token, as with the TypeScript client.
 
 ```bash

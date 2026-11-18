@@ -1,5 +1,61 @@
 # Migration Guide
 
+## Migrating from v3.1 to v3.2
+
+3.2 adds an outbox to every client, which a 3.2 server answers for; servers
+and clients of 3.1 and 3.2 talk to each other in either combination. What can
+change for an application:
+
+### Every client
+
+- A message sent with no connection waits in the outbox (in memory, unless
+  the application keeps it in a file or the browser's storage) and goes once
+  the client is connected, instead of failing: the Rust client's `send` (and
+  Swift, Kotlin, Java, Dart) no longer fails with `NotConnected`, and
+  Python's `send()` returns `QUEUED`. Each message's outcome comes by its id
+  (`delivered`, `not_delivered`). To keep the 3.1 behaviour: `offline = None`
+  in the Rust client's config, `offline=None` in Python, `offline: { enabled:
+  false }` in TypeScript.
+- Every message of the Rust client (and Swift, Kotlin, Java, Dart) carries
+  an `id`, a random UUID, as the TypeScript and Python clients' did.
+
+### TypeScript client
+
+- The outbox replaces the offline queue and takes over what it kept, in
+  order; `clearOfflineQueue()` clears the outbox, and a message's `offline:
+  true` changes nothing.
+- The npm package needs Node 22 or newer.
+
+### Python client
+
+- The initial `topics` are subscribed on the first connection only; a
+  connection for another user starts the topics over and drops the last
+  user's queue. The stream and the handlers hear `continuity`.
+- `offline_queue=True` applies only without the outbox (`offline=None`).
+
+### Server
+
+- A 3.2 client's message carries its number in the outbox (`s`) and its
+  `id`. One the server cannot tell it took already is handed on with
+  `"possible_repeat": true`: the application checks its `id` against what it
+  applied.
+- A numbered message nobody takes is refused, and its client hears so
+  (`busy`): a Rust `Handler::message` that returns false, a Python server
+  whose inbound queue is full, or one with neither drain mode nor
+  `on_message`.
+- A client's newer connection holds its outbox: an older one of the same
+  client is closed with 4409.
+- `connect_cluster()` refuses an IPv6 zone given by an interface's name: give
+  its number (`[fe80::1%2]:9999`).
+
+### Mixed versions
+
+- A 3.2 client on a 3.1 server gets no answers for its outbox: a message
+  counts as delivered once it is written. A 3.1 client on a 3.2 server is
+  served as before.
+
+---
+
 ## Migrating from v3.0 to v3.1
 
 3.1 adds clients and recovery per stream; servers and clients of 3.0 and 3.1
@@ -84,7 +140,7 @@ With encryption on, a 3.x client refuses to start without a pinned key, `e2e_una
 ### Python client
 
 - `encryption=True` needs a pinned key, `e2e_unauthenticated` or `e2e_legacy` (above).
-- `send()` returns `SendResult` (`SENT`, `QUEUED`, `FAILED`); the offline queue is opt-in (`offline_queue=True`).
+- `send()` returns `SendResult` (`SENT`, `QUEUED`, `FAILED`); the offline queue is opt-in (`offline_queue=True`). From 3.2 the outbox takes its place, on by default (above).
 - Every close except an auth rejection reconnects; `connect()` raises `WSEAuthError` at once on a rejected token.
 - `wire_format="msgpack"` now sends msgpack too.
 - Nothing is sent before the server takes the connection (`server_ready`); with encryption, a session the server does not confirm within 10 s fails with `WSEEncryptionError` instead of going on.

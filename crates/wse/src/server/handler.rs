@@ -48,7 +48,8 @@ pub trait Handler: Send + Sync + 'static {
     fn connect(&self, connect: &Connect<'_>) -> Option<Self::Connection>;
 
     /// A client's message; `size` is its size on the wire. False when there
-    /// is no room for it: it is dropped.
+    /// is no room for it: it is dropped, and one of a 3.2 client's outbox is
+    /// refused (`busy`), which its client hears.
     fn message(&self, conn: &mut Self::Connection, message: Inbound, size: usize) -> bool;
 
     /// A signed message that passed every check: its body, as the client

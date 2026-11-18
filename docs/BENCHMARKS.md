@@ -121,21 +121,53 @@ Rust validates JWT during WebSocket handshake -> receive `server_ready` -> send
 
 ### Reproducing
 
-Python client:
+From the checkout's root, with the `wse-server` package installed. The server
+(drain mode on; `--no-drain` drops clients' messages in Rust instead):
 ```bash
-python benchmarks/bench_server.py
-python benchmarks/bench_wse.py
-python benchmarks/bench_wse_multiprocess.py --workers 64
-python benchmarks/bench_brutal.py --token <JWT> --tiers 100,500,1000 --duration 5
+ulimit -n 500000
+python benchmarks/bench_server.py --max-connections 500000
 ```
 
-Rust client:
+Python client:
+```bash
+python benchmarks/bench_wse_multiprocess.py --workers 64 \
+  --token "$(python benchmarks/bench_server.py --token-only)"
+python benchmarks/bench_brutal.py --token "$(python benchmarks/bench_server.py --token-only)" \
+  --tiers 100,500,1000 --duration 5
+```
+
+`bench_wse.py` takes no token: it logs in through an application's own login
+endpoint (`--port`, `--login-url`, `--email`, `--password`), so it runs against
+an application, not `bench_server.py`.
+
+Rust client, one test at a time (`connection-storm`, `ping-latency`, `throughput`,
+`size-matrix`, `format-comparison`, `sustained-hold`, `connection-limit`):
 ```bash
 cd benchmarks/rust-bench && cargo build --release
-./target/release/wse-bench --host 127.0.0.1 --port 5006 \
+./target/release/wse-bench --test throughput --host 127.0.0.1 --port 5006 \
   --secret "bench-secret-key-for-testing-only" \
   --tiers 100,500,1000,5000,10000,50000,100000 --duration 10
 ```
+
+With no `--test`, `wse-bench` runs these seven and the two fan-out tests, which need
+`bench_fanout_server.py` in place of `bench_server.py` ([Fan-out Results](BENCHMARKS_FANOUT.md#reproducing)).
+A tier that connects fewer clients than it asked for, or measures nothing, fails the run.
+
+### Battle tests
+
+`wse-bench` also checks features end to end against `bench_battle_server.py`: `battle-standalone`,
+`battle-cluster`, `battle-load`, `battle-caps`, `battle-tls`, `battle-discovery`,
+`battle-compression`, `battle-presence`, `battle-recovery`, `battle-encryption`,
+`battle-queue-groups`, `battle-topic-acl`, `battle-drain`, `battle-metrics` and
+`battle-topology`. Each test's source (`benchmarks/rust-bench/src/tests/battle_*.rs`)
+names the servers it needs. The server takes `--message-size`,
+`--random-padding` (large messages zstd cannot compress), `--no-publish`, `--recovery`,
+`--seeds`, `--cluster-port`, `--cluster-addr` and the TLS flags (`--tls-cert`, `--tls-key`,
+`--tls-ca`, `--generate-tls`); every message it publishes names its port in `"from"`.
+`wse-bench` finds the second and third servers at `--port2` and `--port3` (default: the
+ports after `--port`) and their metrics at `--metrics-port` and `--metrics-port2` (default:
+each server's port + 1000, so cluster ports go elsewhere, 7006 and up), and prints its
+report as `--output json` or `markdown`.
 
 ---
 

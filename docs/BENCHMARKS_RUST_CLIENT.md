@@ -267,17 +267,23 @@ Memory at 500K: server + client consumed ~123 GB of the 128 GB available, with
 cd benchmarks/rust-bench
 cargo build --release
 
-# Start the server (separate terminal)
-cd /root/wse && source venv/bin/activate
-DRAIN_MODE=1 python benchmarks/bench_server.py --max-connections 500000
-
-# Run the full suite (all 7 tests)
+# Start the server (separate terminal), from the checkout's root with the
+# wse-server package installed
 ulimit -n 500000
-./target/release/wse-bench \
-  --host 127.0.0.1 --port 5006 \
-  --secret "bench-secret-key-for-testing-only" \
-  --tiers 100,500,1000,2000,5000,10000,20000,30000,50000,75000,100000 \
-  --duration 10
+python benchmarks/bench_server.py --max-connections 500000
+
+# Run the seven tests, one at a time (connection-storm, ping-latency, throughput,
+# size-matrix, format-comparison, sustained-hold, connection-limit)
+ulimit -n 500000
+for test in connection-storm ping-latency throughput size-matrix format-comparison sustained-hold connection-limit; do
+  ./target/release/wse-bench --test "$test" \
+    --host 127.0.0.1 --port 5006 \
+    --secret "bench-secret-key-for-testing-only" \
+    --tiers 100,500,1000,2000,5000,10000,20000,30000,50000,75000,100000 \
+    --duration 10
+done
+# With no --test the suite also runs the two fan-out tests, which need
+# bench_fanout_server.py (see BENCHMARKS_FANOUT.md)
 
 # Single test
 ./target/release/wse-bench --test throughput --tiers 100,1000 --duration 3

@@ -6,13 +6,15 @@ servers that form a cluster without a broker, JWT validation, end-to-end
 encryption and signed messages, delivered on every CPU core. The same
 engine runs the Python package
 [`wse-server`](https://pypi.org/project/wse-server/); the clients are
-[`wse-client`](https://crates.io/crates/wse-client) for Rust,
-[`wse-client`](https://www.npmjs.com/package/wse-client) for TypeScript and
-React, and [`wse-client`](https://pypi.org/project/wse-client/) for Python.
+[`wse-client`](https://crates.io/crates/wse-client) for Rust (with Swift,
+Kotlin, Java and Dart packages on it),
+[`wse-client`](https://www.npmjs.com/package/wse-client) for TypeScript
+(React, Vue, Svelte, Angular, Solid, React Native, Electron and Tauri), and
+[`wse-client`](https://pypi.org/project/wse-client/) for Python.
 
 ```toml
 [dependencies]
-wse = "3"
+wse = "3.2"
 serde_json = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal"] }
 ```
@@ -84,14 +86,25 @@ with, and the `wse-client` crate's `chat_client` example talks to it.
   claim or set by the application.
 - **Recovery.** Topics keep their last messages; a client that comes back
   with its position gets what it missed, or learns that it must reload.
+- **The outbox.** A 3.2 client numbers what it sends, and the server
+  takes each message once and confirms it: a repeat is confirmed and
+  dropped, a refusal said (`busy` when `Handler::message` returns false;
+  `not_ready`, `rate_limited`, `missing`). One it cannot tell it took
+  already is handed on with `"possible_repeat": true`, and the application
+  checks its `id`. Each producer's state is kept for a day, across the
+  cluster too; a newer connection of the producer closes the older one
+  (4409).
 - **Presence.** Who is on a topic, with their data, across the cluster.
 - **Users.** `send_to_user` reaches every tab and device of a user,
   `disconnect_user` closes them all.
-- **Cluster.** Nodes link over a binary protocol in TLS, from the cluster's
-  secret (`ClusterSettings::secret`) or from certificates, and
-  forward each topic only where it has subscribers. With recovery on, a
-  link that drops and comes back loses nothing: each node gets what it
-  missed from the other, in order, before anything new.
+- **Cluster.** `Server::connect_cluster` links nodes over a binary
+  protocol in TLS, from the cluster's secret (`ClusterSettings::secret`) or
+  from certificates, and forwards each topic only where it has subscribers.
+  With recovery on, a link that drops and comes back loses nothing that
+  either node still holds: each gets what it missed from the other, in
+  order, before anything new, and a client whose recovery reaches past what
+  is gone is told so. Addresses are `host:port`, an IPv6 address with its
+  zone by number.
 - **Security.** JWT validation in the handshake (HS*, RS*, PS*, ES*, EdDSA,
   key rotation), origin checks, rate limits, end-to-end encryption with the
   server's identity key, signed messages both ways. A token that names the

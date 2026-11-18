@@ -19,7 +19,7 @@ In the browser, the TypeScript client keeps the connection, its subscriptions an
 
 - **Topics.** The backend publishes to topics such as `prices:BTC`, `orders:user-42` or `chat:room-7`, and clients subscribe by name or by pattern (`prices:*`). A message can also go to a single connection, or to one worker of a queue group. Each client chooses JSON or MessagePack.
 - **Nothing lost on reconnect.** Topics keep their latest messages, and every message carries its position. A client that loses its connection comes back with that position and receives what it missed, in order and without duplicates; if the gap is too old, it is told so and reloads. The clients track positions, drop duplicates and ask for what is missing by themselves.
-- **Clients that look after themselves.** They reconnect with backoff, get a fresh token, and report anything they could not recover. Every client can also keep what the user sends while offline and deliver it once the connection is back; the TypeScript, Rust, Swift, Kotlin and Dart clients can keep it on the device, so that it outlives the app. Where every fact counts, every client (TypeScript, Python, Rust, Swift, Kotlin, Dart) can hold a topic after a reconnect until the application has reloaded its state, and recover from what it committed it applied; a send can wait until the topics it depends on are continuous again.
+- **Clients that look after themselves.** They reconnect with backoff, get a fresh token, and report anything they could not recover. Every client keeps what the user sends in an outbox until the server confirms it, and sends it again after a reconnect, offline meanwhile too; a 3.2 server takes each message once (one it cannot tell it took comes marked a possible repeat), and the application hears what became of each by its id. Every client can keep the outbox on the device, so that it outlives the app. Where every fact counts, every client (TypeScript, Python, Rust, Swift, Kotlin, Dart) can hold a topic after a reconnect until the application has reloaded its state, and recover from what it committed it applied; a send can wait until the topics it depends on are continuous again.
 - **Presence.** Who is on a topic right now, with each user's status or other data, and an event when someone joins or leaves. Several tabs of one user count as one.
 - **Several instances.** In production a backend usually runs as several copies behind a load balancer, each with its own WSE server. The servers link to each other directly: an event published on one copy reaches the subscribers connected to any other, presence covers all of them, and one copy can be drained for a deploy while its clients move to the others. No Redis or other broker sits in between, and each topic goes only to the servers that have subscribers for it.
 - **Access.** Users sign in with a JWT checked during the WebSocket handshake: from a cookie in browsers, from the `Authorization` header elsewhere. Each connection can be limited to its own topics, by its token or by the application. The server can refuse pages from other sites, and it limits how much and how fast each client may send.
@@ -162,7 +162,7 @@ export function Price() {
 }
 ```
 
-A browser cannot put headers on a WebSocket, so it signs in with the cookie your login endpoint sets (`access_token`); `'cookie'` tells the hook to connect. Every `useWSE()` on a page shares one connection. Without React, `createWSEClient` from `wse-client/core` makes a client of its own, which `wse-client/react`, `wse-client/vue` and `wse-client/svelte` hand to components and `wse-client/react-native` sets up for an app. More in the [TypeScript client's README](https://github.com/silvermpx/wse/blob/main/ts-client/README.md).
+A browser cannot put headers on a WebSocket, so it signs in with the cookie your login endpoint sets (`access_token`); `'cookie'` tells the hook to connect. Every `useWSE()` on a page shares one connection. Without React, `createWSEClient` from `wse-client/core` makes a client of its own, which `wse-client/react`, `wse-client/vue`, `wse-client/svelte`, `wse-client/angular` and `wse-client/solid` hand to components and `wse-client/react-native` sets up for an app. `wse-client/bridge` keeps one connection for every window of an application, with owners ready for Electron (`wse-client/electron`) and Tauri (`wse-client/tauri` with the `tauri-plugin-wse` crate). More in the [TypeScript client's README](https://github.com/silvermpx/wse/blob/main/ts-client/README.md).
 
 ### Python
 
@@ -281,7 +281,7 @@ Sizes are in bytes, times in seconds.
 | `rate_limit_capacity` | 100000 | Messages a client may send in a burst (`float("inf")`: no limit) |
 | `rate_limit_refill` | 10000 | Messages per second a client may send after the burst |
 | `max_outbound_queue_bytes` | 16 MB | Data waiting to be written to one client. Past it the client misses messages, and one over it for two pings is closed (code 1013) |
-| `max_inbound_queue_size` | 131072 | Client messages waiting for the application before new ones are dropped. Connect, disconnect and presence events are never dropped |
+| `max_inbound_queue_size` | 131072 | Client messages waiting for the application before new ones are dropped (a message of a 3.2 client's outbox is refused instead, as `busy`, and its client hears so). Connect, disconnect and presence events are never dropped |
 | `max_inbound_queue_bytes` | 64 MB | The same limit in bytes |
 | `ping_interval` | 25 | Time between the server's pings |
 | `idle_timeout` | 60 | A client silent this long is closed (code 4408) |
@@ -313,6 +313,8 @@ Each event is a tuple `(kind, conn_id, data)`:
 | `"disconnect"` | The connection closed | `None` |
 | `"presence_join"` | A user's first connection joined a topic | `user_id`, `topic` and `data` |
 | `"presence_leave"` | A user's last connection left a topic | `user_id`, `topic` and `data` |
+
+A message from a 3.2 client's outbox carries its number there (`s`) and its `id`. The server takes each once; one it cannot tell it took already comes with `possible_repeat: True`, and the application checks its `id` against what it applied.
 
 Instead of polling, `set_callbacks(on_connect, on_message, on_disconnect, on_signed_message=None)` has the server call the application on its worker threads, each connection's callbacks in the order of its events.
 
@@ -384,7 +386,7 @@ server.connect_cluster(
 server.broadcast("prices", text)   # reaches the subscribers on every server
 ```
 
-The links between servers are TLS, always. Each server derives the same key from the secret and proves it when a link opens, so a server without the secret cannot join, and nothing between them can read or change the traffic. No certificates to make; a company CA can sign them instead (`tls_cert`, `tls_key`, `tls_ca`). A new server can also join through one seed address (`seeds=[...]`, `cluster_addr=...`), and the links can share the WebSocket port (`single_port=True`). `cluster_info()` lists the linked peers. With recovery on, a link between two servers that drops and comes back loses nothing: each gets what it missed from the other, in order, before anything new. The protocol is described in [CLUSTER_PROTOCOL.md](https://github.com/silvermpx/wse/blob/main/docs/CLUSTER_PROTOCOL.md).
+The links between servers are TLS, always. Each server derives the same key from the secret and proves it when a link opens, so a server without the secret cannot join, and nothing between them can read or change the traffic. No certificates to make; a company CA can sign them instead (`tls_cert`, `tls_key`, `tls_ca`). A new server can also join through one seed address (`seeds=[...]`, `cluster_addr=...`), and the links can share the WebSocket port (`single_port=True`). `cluster_info()` lists the linked peers. With recovery on, a link between two servers that drops and comes back loses nothing that either server still holds: each gets what it missed from the other, in order, before anything new, and a client whose recovery reaches back past what is gone is told so (`recovered: false`). Addresses are `host:port`; an IPv6 address gives its zone by number (`[fe80::1%2]:9999`). The protocol is described in [CLUSTER_PROTOCOL.md](https://github.com/silvermpx/wse/blob/main/docs/CLUSTER_PROTOCOL.md).
 
 ### Running it
 
@@ -464,8 +466,9 @@ The full list, with the client changes: [MIGRATION.md](https://github.com/silver
 ## Documentation
 
 - [Integration guide](https://github.com/silvermpx/wse/blob/main/docs/INTEGRATION.md): setup and the complete API
-- Clients: [TypeScript](https://github.com/silvermpx/wse/blob/main/ts-client/README.md), [Python](https://github.com/silvermpx/wse/blob/main/python-client/README.md), [Rust](https://github.com/silvermpx/wse/blob/main/crates/wse-client/README.md), [Swift](https://github.com/silvermpx/wse/blob/main/bindings/swift/README.md), [Kotlin](https://github.com/silvermpx/wse/blob/main/bindings/kotlin/README.md), [Dart](https://github.com/silvermpx/wse/blob/main/bindings/dart/README.md)
-- [Migration guide](https://github.com/silvermpx/wse/blob/main/docs/MIGRATION.md): from 2.x to 3.0, and from 3.0 to 3.1
+- Clients: [TypeScript](https://github.com/silvermpx/wse/blob/main/ts-client/README.md), [Python](https://github.com/silvermpx/wse/blob/main/python-client/README.md), [Rust](https://github.com/silvermpx/wse/blob/main/crates/wse-client/README.md), [Swift](https://github.com/silvermpx/wse/blob/main/bindings/swift/README.md), [Kotlin and Java](https://github.com/silvermpx/wse/blob/main/bindings/kotlin/README.md), [Dart](https://github.com/silvermpx/wse/blob/main/bindings/dart/README.md), [Tauri](https://github.com/silvermpx/wse/blob/main/bindings/tauri/plugin/README.md)
+- [Conformance](https://github.com/silvermpx/wse/blob/main/tests/conformance/README.md): the cases every client is checked against
+- [Migration guide](https://github.com/silvermpx/wse/blob/main/docs/MIGRATION.md): from 2.x to 3.0, from 3.0 to 3.1, and from 3.1 to 3.2
 - [Wire protocol](https://github.com/silvermpx/wse/blob/main/docs/PROTOCOL.md): messages, close codes, end-to-end encryption
 - [Cluster protocol](https://github.com/silvermpx/wse/blob/main/docs/CLUSTER_PROTOCOL.md)
 - [Security](https://github.com/silvermpx/wse/blob/main/docs/SECURITY.md)

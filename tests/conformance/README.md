@@ -14,8 +14,13 @@ the same way.
   server for the server's steps in their place, and records what its client saw and did (its
   trace). The judge holds the trace and what the server published and took to the case's rules.
   A driver asserts nothing.
-- The drivers: `ts-client/__tests__/conformance.test.ts` (TypeScript), `crates/wse-client/tests/conformance.rs`
-  (Rust), `python-client/tests/test_conformance.py` (Python). The packages' drivers run on the
+- The drivers: `ts-client/__tests__/conformance.test.ts` (TypeScript; with `WSE_CONFORMANCE_BRIDGE=1`
+  it runs the cases as a window of a TypeScript owner, agent `ts-bridge`, and with
+  `WSE_CONFORMANCE_BRIDGE=rust` as a window of the Rust owner the conformance server serves at
+  `/bridge`, as a Tauri app's Rust side holds it, agent `rust-bridge`),
+  `crates/wse-client/tests/conformance.rs` (Rust; `conformance_browser.rs` runs its cases compiled
+  for the browser, agent `rust-browser`, with `WSE_CONFORMANCE` given at build time:
+  `cargo xtask check rust-browser`), `python-client/tests/test_conformance.py` (Python). The packages' drivers run on the
   systems apps run on: Swift's (`bindings/swift/Tests`) on the Mac and an iOS simulator, Kotlin's
   (`bindings/kotlin/src/conformance`) on the JVM and an Android emulator, Dart's
   (`bindings/dart/test/conformance`) on the desktop and, in the example app, on an iOS simulator and
@@ -27,13 +32,20 @@ the same way.
 ```bash
 cargo run -p wse-conformance -- serve --out target/conformance   # prints {"ready":true,"control":"ws://..."}
 WSE_CONFORMANCE=ws://127.0.0.1:P/control npx vitest run --project client ts-client/__tests__/conformance.test.ts
+WSE_CONFORMANCE=ws://127.0.0.1:P/control WSE_CONFORMANCE_BRIDGE=1 npx vitest run --project client ts-client/__tests__/conformance.test.ts
+WSE_CONFORMANCE=ws://127.0.0.1:P/control WSE_CONFORMANCE_BRIDGE=rust npx vitest run --project client ts-client/__tests__/conformance.test.ts
 WSE_CONFORMANCE=ws://127.0.0.1:P/control cargo test -p wse-client --test conformance
 WSE_CONFORMANCE=ws://127.0.0.1:P/control pytest python-client/tests/test_conformance.py
 cargo run -p wse-conformance -- check --manifest tests/conformance/agents.json --reports target/conformance
 ```
 
-`cargo xtask check conformance` does all of it. A driver runs the cases one at a time;
-`WSE_CONFORMANCE_CASES=a,b` runs those alone, and `WSE_CONFORMANCE_TRACE=1` prints each trace.
+`cargo xtask check conformance` does all of it. `serve --control ADDR` picks the control channel's
+address (default `127.0.0.1:0`), and `cargo run -p wse-conformance -- cases` prints the built-in
+catalog. A driver runs the cases one at a time and skips them all when `WSE_CONFORMANCE` is not set;
+`WSE_CONFORMANCE_REQUIRED=1` makes that a failure (every driver). The TypeScript and Python
+drivers also read `WSE_CONFORMANCE_CASES=a,b`, which runs those alone, and
+`WSE_CONFORMANCE_TRACE=1`, which prints each trace; the Rust driver runs every case its features
+reach.
 
 ## The control channel
 
@@ -47,7 +59,9 @@ A WebSocket of JSON requests, `{id, op, ...}`, each answered `{id, ok, ...}`:
   `await_subscribers {topic, count}`, `kick`, `stop`, `restart` (a new server on the same port:
   a new history and epoch), `sleep {ms}`;
 - `trace {events}`: what the client saw, in pieces;
-- `end`: the verdict, and the case's server goes;
+- `end`: the verdict, and the case's server goes. A failed case's trace is kept in the `--out`
+  folder as `<agent>.<case>.trace.jsonl`: one event a line, the last holding the failures and the
+  server's log;
 - `bye`: the report, `<agent>.json` and `<agent>.junit.xml` (also written when the channel
   closes): what the driver said it is, the commit the server was started in (`source`, git's
   `HEAD`) and the server's version, and each case's verdict. `check` fails a report that names
@@ -59,8 +73,9 @@ A WebSocket of JSON requests, `{id, op, ...}`, each answered `{id, ok, ...}`:
 ## The trace
 
 In the order the client saw things, each with `t`, the milliseconds since the case began:
-`ready`; `message {type, topic, n, payload}`; `break {topic, kind}` (a gap, a continuity broken);
-`resync {topics}` and `resynced {topics}`; `sent {id, type, live, ok}`; `delivered {ids}` and
+`ready`; `message {type, topic, n, payload, cid}` (`cid`: the correlation id it names);
+`break {topic, kind}` (a gap, a continuity broken); `resync {topics}` and `resynced {topics}`;
+`sent {id, type, live, ok, error}` (`error` when the send failed); `delivered {ids}` and
 `not_delivered {reason, ids}`; `step {server}`; `timeout {step, waiting}` and `error {message}`
 when the driver could not go on.
 
@@ -68,7 +83,9 @@ when the driver could not go on.
 
 `connections`, `echoed`, `order`, `no_duplicates`, `all_published_delivered`, `no_silent_loss`,
 `break_said`, `no_break`, `taken_once`, `taken_in_order`, `delivered_all`, `never_taken`,
-`signed_taken`, `held_until_resynced`, `back_within` (the client is back within a time after
+`signed_taken`, `held_until_resynced`, `correlated` (the server's application took a message of
+the type with the rule's correlation id, and its priority when the rule names one, and the client
+heard a reply naming that id), `back_within` (the client is back within a time after
 the server cut or restarted), `unanswered_at_cut` (the server cut the connection while a send was
 not answered yet, and the client came back after it), and `taken_msgpack` and `taken_sealed` (the
 messages of a type came in MessagePack, or in an end-to-end session, as the server took them,

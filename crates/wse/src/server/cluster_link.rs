@@ -38,7 +38,8 @@ impl ClusterTls {
 #[derive(Clone, Default)]
 #[non_exhaustive]
 pub struct ClusterSettings {
-    /// Peers to link to (`host:port`).
+    /// Peers to link to (`host:port`; an IPv6 address with its zone by
+    /// number, `[fe80::1%2]:9999`).
     pub peers: Vec<String>,
     /// Seed nodes instead of a full peer list: the rest is learned from them.
     /// Needs `cluster_addr`.

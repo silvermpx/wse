@@ -1,6 +1,6 @@
 # wse-client
 
-Python client for [WSE](https://github.com/silvermpx/wse), the WebSocket engine for reactive user interfaces: topics with message recovery, reconnects, MessagePack, an offline queue, end-to-end encryption and signed messages.
+Python client for [WSE](https://github.com/silvermpx/wse), the WebSocket engine for reactive user interfaces: topics with message recovery, reconnects, MessagePack, an outbox that keeps what is sent until the server confirms it, end-to-end encryption and signed messages.
 
 [![PyPI](https://img.shields.io/pypi/v/wse-client)](https://pypi.org/project/wse-client/)
 [![Python](https://img.shields.io/pypi/pyversions/wse-client)](https://pypi.org/project/wse-client/)
@@ -72,7 +72,7 @@ client.connect()
 client.run_forever()
 ```
 
-Handlers also hear the connection itself: `connected` (`connection_id`, `user_id`, `reconnected`, `recovery`) each time the server takes a connection, `disconnected` (`code`, `reason`, `reconnecting`) when one is lost, and the server's `subscription_update` replies (`success_topics`, `failed_topics`, `recovery`). The event stream (`async for`, `recv()`) carries the server's messages only.
+Handlers also hear the connection itself: `connected` (`connection_id`, `user_id`, `reconnected`, `recovery`) each time the server takes a connection, `disconnected` (`code`, `reason`, `reconnecting`) when one is lost, and the server's `subscription_update` replies (`success_topics`, `failed_topics`, `recovery`). The event stream (`async for`, `recv()`) carries the server's messages and what the client says of them, with category `"WSE"`: `recovery_gap`, and with a delivery `resync`, `continuity` and `checkpoint_rejected`. `connected`, `disconnected`, `subscription_update`, `delivered`, `not_delivered`, `paused` and `storage_failed` reach the handlers only.
 
 ## Constructor Parameters
 
@@ -83,7 +83,7 @@ Handlers also hear the connection itself: `connected` (`connection_id`, `user_id
 | `url` | str | required | WebSocket server URL |
 | `token` | str | None | JWT token, sent as `access_token` cookie and `Authorization: Bearer` header |
 | `token_provider` | callable | None | Sync or async callable returning the token; called before every connect and reconnect attempt (overrides `token`) |
-| `topics` | list[str] | None | Topics to subscribe to after connecting |
+| `topics` | list[str] | None | Topics to subscribe to on the first connection; from then on the topics are the application's, subscribed again after a reconnect as it left them |
 | `reconnect` | ReconnectConfig | default config | Reconnection strategy |
 | `extra_headers` | dict[str, str] | None | Additional HTTP headers for the handshake |
 | `queue_size` | int | 1000 | Events buffered for the iterator / `recv()`. Once the application reads them, a full buffer stops reading the socket until it has room, so nothing is dropped (the server holds back, or closes a client that stays behind, which then recovers); before that, with handlers only, the oldest is dropped |
@@ -104,7 +104,6 @@ Handlers also hear the connection itself: `connected` (`connection_id`, `user_id
 | `wire_format` | str | `"json"` | `"msgpack"`: the server sends this connection MessagePack and the client sends in it too, except inside E2E frames (needs the `[msgpack]` extra) |
 | `signing_key` | EC key or PEM/DER bytes | None | This client's ECDSA P-256 key for `send(..., signed=True)` (needs the `[crypto]` extra) |
 | `server_signing_keys` | list[str] | None | The server's signing public keys (`signing_public_key()`, base64) its signed messages are checked against |
-| `cookie_name` | str | `"access_token"` | The cookie the token goes in at the upgrade, besides the `Authorization` header |
 | `delivery` | DeliveryConfig \| None | None | recover-or-resync (see below); None: best effort |
 
 The `connect(url, **kwargs)` factory returns an `AsyncWSEClient` (not connected yet) to use as an async context manager.
@@ -119,9 +118,10 @@ The `connect(url, **kwargs)` factory returns an `AsyncWSEClient` (not connected 
 | `start()` | Return at once and connect in the background: a failed first attempt is made again as any later one, the initial topics are subscribed once the server took the connection, and what is sent meanwhile waits in the outbox (for an application that may start without a network) |
 | `pause(reason)` / `resume(reason)` | End the connection while any reason holds (`background`, `offline`, ...) and connect again at once when the last is cleared; topics, positions and the outbox stay. Handlers hear `paused` with the reasons; `paused` (the property) lists them |
 | `disconnect()` / `close()` | Close the connection; iteration ends after the queued events |
-| `send(type, payload, priority=NORMAL, correlation_id=None)` | Send a message; returns a `SendResult` |
-| `send_with_retry(type, payload, priority=NORMAL, correlation_id=None, max_retries=5)` | Send with exponential backoff; one message id across all attempts |
-| `send_batch(messages)` | Send multiple messages in a single frame |
+| `send(type, payload=None, *, priority=NORMAL, correlation_id=None, signed=False, nonce=None, live=False, requires=None, id=None, ttl=None)` | Send a message; returns a `SendResult` |
+| `send_with_retry(type, payload=None, *, priority=NORMAL, correlation_id=None, max_retries=5)` | Send with exponential backoff; one message id across all attempts |
+| `send_batch(messages)` | Send `(type, payload)` pairs in a single frame, outside the outbox: `False` without a connection, and no `delivered` / `not_delivered` |
+| `clear()` | The user signs out: every message in the outbox, and every send waiting for its topics, goes (`not_delivered`, `cleared`) |
 | `subscribe(topics, recover=False)` | Subscribe to topics, optionally recovering missed messages; while disconnected the topics are subscribed on the next connection |
 | `unsubscribe(topics)` | Unsubscribe from topics (and forget their recovery positions), connected or not |
 | `request_snapshot(topics)` | Request a state snapshot; an identical request within 5 s is not resent |
@@ -133,6 +133,8 @@ The `connect(url, **kwargs)` factory returns an `AsyncWSEClient` (not connected 
 | `change_endpoint(url)` | Switch to a different server URL; subscribed topics are subscribed again there |
 | `set_token(token)` | Use a new token for the next connect / reconnect |
 | `get_stats()` | Connection statistics, message counts, network quality, recovery counters |
+| `commit(event)` / `checkpoint()` | Recover-or-resync: the application applied a message / what to save with its state (see below) |
+| `resynced(round)` / `resync(topics)` | Answer a `resync` round / say the application brought topics up to date itself |
 
 `send()` returns a `SendResult` (an `IntEnum`, truthy when the message was accepted):
 
@@ -142,7 +144,7 @@ The `connect(url, **kwargs)` factory returns an `AsyncWSEClient` (not connected 
 | `SendResult.QUEUED` | Waits in the outbox (or the offline queue), and goes on its own - do not retry it |
 | `SendResult.FAILED` | Neither sent nor kept (the outbox full, rate limited; without an outbox, not connected); the caller decides whether to retry |
 
-`send(..., live=True)` sends only on the connection that is open now: the offline queue never holds
+`send(..., live=True)` sends only on the connection that is open now: the outbox never holds
 it for a later one. Use it for commands that must not run late (a valve, a door, an order); signed
 messages (`signed=True`) are always sent this way.
 
@@ -160,6 +162,9 @@ messages (`signed=True`) are always sent this way.
 | `queue_size` | int | Events waiting in the receive queue |
 | `recovery_enabled` | bool | Whether the server announced message recovery |
 | `recovery_state` | dict | Per-topic recovery anchor `{topic: (epoch, offset)}`: the last offset delivered in order |
+| `topic_states` | dict[str, TopicState] | Each topic held: whether the server took it, and whether its messages run without a break |
+| `kept` | int | Messages waiting in the outbox for the server's answer |
+| `paused` | list[str] | The reasons the client is paused for (`pause()`); empty when it is not |
 
 **Context manager and async iterator:**
 
@@ -238,7 +243,7 @@ Which closes are reconnected:
 | A failed reconnect attempt | Next attempt with backoff (never terminal); only `max_attempts` ends the client |
 | Any close before the first handshake of `connect()` completed | `connect()` raises; nothing reconnects in the background |
 
-On every new connection the client subscribes again to all subscribed topics (with recovery positions when the server supports recovery) and, with `offline_queue=True`, sends the queued messages.
+On every new connection the client subscribes again to all subscribed topics (with recovery positions when the server supports recovery) and, once the server answered its hello, sends what waits in the outbox (without an outbox, with `offline_queue=True`, the queued messages).
 
 ### Authentication
 
@@ -267,7 +272,7 @@ await client.send("log", {"msg": "debug"}, priority=MessagePriority.BACKGROUND) 
 
 ### The outbox
 
-Every message sent, except a live or signed one, waits in the outbox until the server answers for it, goes again after a reconnect, and is numbered: a 3.2 server drops a repeat of one it took. What the server cannot tell (the client comes from a cluster node that is gone, or its handler panicked on the message) reaches the server's application marked `possible_repeat`, and an application that must apply an order once checks the message's `id` against what it applied. The handlers of `delivered` (`{"ids": [...]}`) and `not_delivered` (`{"reason": ..., "ids": [...]}`) hear what became of each, by its id - the application's own with `send(..., id=...)`, a random UUID without one. They are handlers' events, as `connected` is, never on the stream `recv()` reads.
+Every message sent, except a live or signed one or a `send_batch()`, waits in the outbox until the server answers for it, goes again after a reconnect, and is numbered: a 3.2 server drops a repeat of one it took. What the server cannot tell (the client comes from a cluster node that is gone, or its handler panicked on the message) reaches the server's application marked `possible_repeat`, and an application that must apply an order once checks the message's `id` against what it applied. The handlers of `delivered` (`{"ids": [...]}`) and `not_delivered` (`{"reason": ..., "ids": [...]}`) hear what became of each, by its id - the application's own with `send(..., id=...)`, a random UUID without one. They are handlers' events, as `connected` is, never on the stream `recv()` reads.
 
 ```python
 @client.on("delivered")
@@ -403,7 +408,7 @@ async with AsyncWSEClient(url, token=token, topics=["orders"], delivery=delivery
         if event.type == "resync":
             await reload(event.payload["topics"])  # reasons, committed: per topic
             client.resynced(event.payload["round"])
-        elif event.topic == "orders":
+        elif event.topic == "orders" and event.category != "WSE":  # not the client's own events
             apply(event)
             client.commit(event)
             save_checkpoint(client.checkpoint())

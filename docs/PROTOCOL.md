@@ -63,8 +63,11 @@ from their last-seen position:
   needed to attribute each `(epoch, offset)` to the right per-topic sequence.
 - `e` — the epoch of the message's stream, as an 8-hex string. Each server
   that publishes to a topic stamps its own stream with its own epoch, so in a
-  cluster one topic interleaves several streams. A server begins a new epoch
-  when it restarts, or when the topic's history was dropped and begins again.
+  cluster one topic interleaves several streams. What a server publishes to
+  its own subscribers only (`publish_local`, Python `broadcast_local`) is a
+  second stream of the topic, with an epoch of its own. A server begins a new
+  epoch when it restarts, or when the topic's history was dropped and begins
+  again.
 - `o` — the message's offset within its stream, monotonically increasing. The
   same `(tp, e, o)` is stamped on the live message and on any recovery replay
   of it, giving each message a stable identity across both.
@@ -192,7 +195,8 @@ Sent after authentication succeeds (from Rust when JWT is configured, from Pytho
       "circuit_breaker": true,
       "rust_transport": true,
       "rust_jwt": true,
-      "recovery": true
+      "recovery": true,
+      "acks": true
     },
     "connection_id": "rs_f186cd9d_019c53c4",
     "server_time": "2026-02-28T12:00:00.000Z",
@@ -210,7 +214,7 @@ Encryption key exchange happens separately, in `client_hello` / `server_hello` (
 Two ways, often both:
 
 - The application subscribes a connection with `subscribe_connection(conn_id, topics)` (for example from its `auth_connect` handler).
-- The client asks itself: both SDKs send `subscription_update` requests for the topics their application subscribes to, and again for all of them after every reconnect, with their recovery positions (see [Subscribe / Unsubscribe](#subscribe--unsubscribe)). A server created with `client_subscriptions=True` answers those requests itself, checking each topic against the connection's topic ACL; otherwise they reach the application as ordinary messages.
+- The client asks itself: every client (TypeScript, Python, and Rust with its packages) sends `subscription_update` requests for the topics its application subscribes to, and again for all of them after every reconnect, with their recovery positions (see [Subscribe / Unsubscribe](#subscribe--unsubscribe)). A server created with `client_subscriptions=True` answers those requests itself, checking each topic against the connection's topic ACL; otherwise they reach the application as ordinary messages.
 
 ### 5. Updates
 
@@ -343,7 +347,7 @@ A subscribe gets one reply; an unsubscribe gets none. The missed messages of eac
 | `failed_topics` | Topics refused: denied by the connection's topic ACL, invalid names, or over its subscription limits |
 | `recovery[topic].epoch` | The topic's epoch, 8 hex digits; `null` when the topic has no history yet |
 | `recovery[topic].offset` | Inclusive: the last offset the client now has. When `recovered` is `false`, where the client starts: everything after it arrives live, and a message at or before it published once the subscription began was sent before this reply, so a client may take it as its position without skipping anything |
-| `recovery[topic].recovered` | `true` when every missed message was replayed. `false` when there was no position, the epoch changed (a server restart), the history was evicted or too long (`recovery_max_messages`), a message came after the position that no node kept (its node had no room left for history), or the connection's outbound budget cut the replay short (then `offset` is the last one replayed) |
+| `recovery[topic].recovered` | `true` when every missed message was replayed. `false` when there was no position, the epoch changed (a server restart), the history was evicted or too long (`recovery_max_messages`), a message came after the position that no node kept (its node had no room left for history, a link too full to take it, or a node told of its loss after a lost link), every topic of a node that went without SHUTDOWN once another comes up at its address, or the connection's outbound budget cut the replay short (then `offset` is the last one replayed) |
 | `recovery[topic].count` | Messages replayed |
 | `recovery[topic].streams` | Each stream of the topic the server holds, epoch to the offset the client starts from in it: everything after it arrives live, and what was published at or before it once the subscription began was sent before this reply. A client takes, per stream, the larger of its own offset and this one, and forgets a stream it named that is missing here (this server cannot replay it, so naming it again fails every later recovery). From 3.1 |
 
@@ -495,7 +499,9 @@ Sent by the server in response to `client_hello`:
     "batching": true,
     "priority_queue": true,
     "msgpack": true,
-    "encryption": true
+    "encryption": true,
+    "signing": false,
+    "acks": true
   },
   "limits": {
     "max_message_size": 1048576,
@@ -519,7 +525,7 @@ Sent by the server in response to `client_hello`:
 |-------|------|-------------|
 | `server_version` | `string` | WSE server version |
 | `protocol_version` | `int` | Negotiated protocol version (minimum of client and server) |
-| `features` | `object` | `compression`, `recovery`, `cluster`, `msgpack` and `encryption` describe this server; `acks` (3.2, also in `server_ready`) says it answers the client's outbox; `batching` and `priority_queue` are always `true`, kept for older clients. With recovery, `history_ttl` is how many seconds a stream that receives nothing stays recoverable here (from 3.1; also in `server_ready`): a client forgets a stream it heard nothing of for longer while the connection's frames showed it alive, instead of naming it |
+| `features` | `object` | `compression`, `recovery`, `cluster`, `msgpack`, `encryption` and `signing` (it has a signing key) describe this server; `acks` (3.2, also in `server_ready`) says it answers the client's outbox; `batching` and `priority_queue` are always `true`, kept for older clients. With recovery, `history_ttl` is how many seconds a stream that receives nothing stays recoverable here (from 3.1; also in `server_ready`): a client forgets a stream it heard nothing of for longer while the connection's frames showed it alive, instead of naming it |
 | `limits` | `object` | Server-enforced limits for this connection |
 | `ping_interval` | `int` | Server ping interval in milliseconds |
 | `connection_id` | `string` | Unique connection identifier |
@@ -531,9 +537,9 @@ The negotiated protocol version is the minimum of both sides.
 
 ## The client's outbox
 
-From 3.2 a client keeps each message it sends, except one sent live, until the server answers for it, and sends what was not answered again after a reconnect. The server confirms what its application took, drops a repeat of a message it took already and says what it refused; what it cannot tell reaches the application marked as a possible repeat (see below).
+From 3.2 a client keeps each message it sends, except one sent live or signed (a signed message has a receipt of its own), until the server answers for it, and sends what was not answered again after a reconnect. The server confirms what its application took, drops a repeat of a message it took already and says what it refused; what it cannot tell reaches the application marked as a possible repeat (see below).
 
-**Numbers.** Each outbox is a producer with a random id, and each of its messages carries its number, `s`, from 1 up, first in the object: `{"s":42,"t":"order","p":{...},"id":"..."}`. A client sends its messages in the order of their numbers; a number may be skipped (a message that expired before it was sent). The number comes first so that the server can read it from the first bytes of a frame it does not parse (one its rate limit drops).
+**Numbers.** Each outbox is a producer with a random id, and each of its messages carries its number, `s`, from 1 up, first in the object: `{"s":42,"t":"order","p":{...},"id":"..."}`. A client sends its messages in the order of their numbers; a number may be skipped (a message that expired before it was sent). The number comes first so that the server can read it from the first bytes of a frame it does not parse (one its rate limit drops). `s` is an outbox number only on a connection whose `client_hello` named an outbox (below), once the server answered with `outbox`; before that, or without such a hello, it is the application's own field, handed on as it is. So a client numbers its messages only after the `outbox` answer, and to a server without `features.acks` it sends them unnumbered and takes a message as delivered once it is written.
 
 **Hello.** The client names its outbox in `client_hello`:
 
@@ -568,7 +574,7 @@ Once the connection is admitted (`server_ready`), the server answers what it dec
 
 `ack` confirms every message up to and with `s`; `nack` refuses `s` (or `from` to `s`) for good, and the client tells its application. The codes: `busy` (the application had no room for it), `rate_limited` (dropped by the client's rate limit: refused at once, its number read from the frame's first bytes), `missing` (a number skipped on the connection), `not_ready` (before the application took the connection). A repeat of a message taken already is confirmed again and not handed on; a repeat of one refused is refused again. The answers are never dropped for the connection's outbound budget: a client waits for them, and is owed no more of them than its outbox holds.
 
-**What the server cannot tell.** A client that comes to another node names its last node: the new node asks it once what it decided, what it refused and what it could not tell (the cluster's `PRODUCER_QUERY`), and that node stops taking messages of the producer. The server cannot tell whether it took a message when the last node is gone or did not answer within 2 seconds, or the producer was silent for more than a day (the messages up to `written`), when the message's handler never ended (it panicked), and when its refusal was let go because the producer held 1024 runs of refusals its client had not heard of. `acked` stops short of the first such message the client still waits for; sent again, it reaches the application with `"possible_repeat": true`, and the application checks the message's `id` against what it applied. These are the only cases in which an application can see a message twice.
+**What the server cannot tell.** A client that comes to another node names its last node: when the hello's `written` is above 0 and the new node has a link to that node that takes the question (`CAP_PRODUCERS`), it asks it once what it decided, what it refused and what it could not tell (the cluster's `PRODUCER_QUERY`), and that node stops taking messages of the producer. The server cannot tell whether it took a message when the last node is gone or did not answer within 2 seconds, or the producer was silent for more than a day, or the new node has no such link to ask over (the messages up to `written`), when the message's handler never ended (it panicked), and when its refusal was let go because the producer held 1024 runs of refusals its client had not heard of. `acked` stops short of the first such message the client still waits for; sent again, it reaches the application with `"possible_repeat": true`, and the application checks the message's `id` against what it applied. These are the only cases in which an application can see a message twice.
 
 **A planned stop.** On `drain`, stop and `disconnect`, each connection stops taking messages, answers what it took and only then closes.
 
