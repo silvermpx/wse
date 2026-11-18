@@ -315,20 +315,20 @@ async fn load_receive_loop(
                 }
 
                 if let Some(parsed) = parse_wse_message(&msg) {
-                    // Channel categorization
-                    let ch_name = parsed
+                    // Channel categorization: a message without one is no
+                    // topic's; a topic may be called anything.
+                    let ch = parsed
                         .get("p")
                         .and_then(|p| p.get("ch"))
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("unknown");
+                        .and_then(|v| v.as_str());
 
-                    match ch_name {
-                        "all" => local_ba += 1,
+                    match ch {
+                        Some("all") => local_ba += 1,
                         // The one topic it subscribed to.
-                        "battle_all" => local_topic += 1,
-                        "unknown" => {}
+                        Some("battle_all") => local_topic += 1,
                         // A topic it never asked for reached it.
-                        _ => local_other += 1,
+                        Some(_) => local_other += 1,
+                        None => {}
                     }
 
                     // Latency
@@ -345,17 +345,24 @@ async fn load_receive_loop(
                         local_hist.record_us(lat_us.max(1));
                     }
 
-                    // Per-channel sequence gap tracking
-                    if let Some(seq) = parsed
+                    // Per-channel sequence gap tracking: a channel's name is
+                    // kept once, at its first message.
+                    let seq = parsed
                         .get("p")
                         .and_then(|p| p.get("seq"))
-                        .and_then(|v| v.as_i64())
-                    {
-                        let last = last_seq_by_ch.entry(ch_name.to_string()).or_insert(-1);
-                        if *last >= 0 && seq > *last + 1 {
-                            local_gaps += (seq - *last - 1) as u64;
+                        .and_then(|v| v.as_i64());
+                    if let (Some(ch), Some(seq)) = (ch, seq) {
+                        match last_seq_by_ch.get_mut(ch) {
+                            Some(last) => {
+                                if seq > *last + 1 {
+                                    local_gaps += (seq - *last - 1) as u64;
+                                }
+                                *last = seq;
+                            }
+                            None => {
+                                last_seq_by_ch.insert(ch.to_owned(), seq);
+                            }
                         }
-                        *last = seq;
                     }
                 }
             }

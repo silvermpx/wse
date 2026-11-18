@@ -277,9 +277,15 @@ async fn load_counts_only_the_channel_it_subscribed_to() {
     const ALL: &str = r#"{"t":"battle","p":{"ch":"all"}}"#;
     const OWN: &str = r#"{"t":"battle","p":{"ch":"battle_all"}}"#;
     const OTHER: &str = r#"{"t":"battle","p":{"ch":"battle_half"}}"#;
-    let cases: [(&'static [&'static str], bool); 3] = [
+    // A topic may be called anything, "unknown" too.
+    const NAMED_UNKNOWN: &str = r#"{"t":"battle","p":{"ch":"unknown"}}"#;
+    // No channel at all: not a delivery of any topic.
+    const NO_CHANNEL: &str = r#"{"t":"battle","p":{}}"#;
+    let cases: [(&'static [&'static str], bool); 5] = [
         (&[ALL, OTHER], false),
         (&[ALL, OWN, OTHER], false),
+        (&[ALL, OWN, NAMED_UNKNOWN], false),
+        (&[ALL, OWN, NO_CHANNEL], true),
         (&[ALL, OWN], true),
     ];
     let runs = cases.map(|(messages, passes)| {

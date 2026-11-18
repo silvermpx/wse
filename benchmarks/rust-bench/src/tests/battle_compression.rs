@@ -7,17 +7,28 @@ use futures_util::SinkExt;
 use std::time::Duration;
 use tokio_tungstenite::tungstenite::protocol::Message;
 
-/// What Server B has taken off the cluster link: the wire bytes, and the
-/// messages they carried as its one subscriber took them, delivered or
-/// dropped as too slow. What Server B publishes itself counts in neither.
-/// Read from its metrics endpoint: a WebSocket of a node that publishes
-/// itself is flooded.
-async fn link_in(cli: &Cli, port: u16) -> Option<(u64, u64)> {
-    let metrics = protocol::metrics_text(&cli.host, cli.metrics_port_for(port)).await?;
-    let bytes = protocol::counter(&metrics, "wse_cluster_bytes_received_total")?;
-    let messages = protocol::counter(&metrics, "wse_cluster_messages_delivered_total")?
-        + protocol::counter(&metrics, "wse_cluster_messages_dropped_total")?;
-    Some((bytes, messages))
+/// The link from Server A to Server B, as their metrics endpoints count it
+/// (a WebSocket of a node that publishes is flooded): what Server A put on
+/// its links, bytes and messages, each message once however many clients
+/// of Server B take it; how many peers Server A has; and the bytes Server B
+/// took off its links.
+#[derive(Clone, Copy, Debug, Default)]
+struct Link {
+    sent_bytes: u64,
+    sent_messages: u64,
+    peers: u64,
+    received_bytes: u64,
+}
+
+async fn link(cli: &Cli, port2: u16) -> Option<Link> {
+    let a = protocol::metrics_text(&cli.host, cli.metrics_port_for(cli.port)).await?;
+    let b = protocol::metrics_text(&cli.host, cli.metrics_port_for(port2)).await?;
+    Some(Link {
+        sent_bytes: protocol::counter(&a, "wse_cluster_bytes_sent_total")?,
+        sent_messages: protocol::counter(&a, "wse_cluster_messages_sent_total")?,
+        peers: protocol::counter(&a, "wse_cluster_peers")?,
+        received_bytes: protocol::counter(&b, "wse_cluster_bytes_received_total")?,
+    })
 }
 
 /// The port of the server that published a battle message, as the battle
@@ -34,17 +45,19 @@ fn origin(msg: &Message) -> Option<u16> {
 
 /// Battle Test: Inter-Peer zstd Compression
 ///
-/// Measures what the cluster link carries per message on Server B: the wire
-/// bytes it took off the link over the messages that came in on it, against
-/// the size of Server A's messages as Server B's subscriber gets them. Each
-/// message names the server that published it, so one published on Server B
-/// itself is never taken for one that crossed the link. The 1 KiB messages
-/// of `--message-size 1024` are padded, so zstd takes them to a fraction of
-/// their size; uncompressed, a message costs more than itself.
+/// Measures what the cluster link carries per message: the bytes Server A
+/// put on it over the messages it sent (its one peer being Server B, which
+/// took those bytes off), against the size of Server A's messages as
+/// Server B's subscriber gets them. Each message names the server that
+/// published it, so one published on Server B itself is never taken for one
+/// that crossed the link, and a message counts once however many clients of
+/// Server B take it. The 1 KiB messages of `--message-size 1024` are
+/// padded, so zstd takes them to a fraction of their size; uncompressed (or
+/// with `--random-padding`), a message costs more than half of itself.
 ///
-/// Server B's counters come from its metrics endpoint (port + 1000, as the
-/// battle server serves it, or --metrics-port); its subscriber counts on a
-/// task of its own.
+/// The counters come from the servers' metrics endpoints (port + 1000, as
+/// the battle server serves them); the subscriber counts on a task of its
+/// own.
 ///
 /// Requires: 2 cluster servers with --message-size 1024
 ///   python benchmarks/bench_battle_server.py --mode cluster --port 5006 --peers 127.0.0.1:5007 --message-size 1024
@@ -152,7 +165,7 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
         }
     }
     let before = if flowing {
-        link_in(cli, port2).await
+        link(cli, port2).await
     } else {
         None
     };
@@ -167,7 +180,7 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
         checks.finish();
         return Vec::new();
     }
-    let (bytes_before, messages_before) = before.unwrap_or_default();
+    let before = before.unwrap_or_default();
 
     // =========================================================================
     // Phase 3: Count messages on subscriber for duration
@@ -209,11 +222,12 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
     // =========================================================================
     say!("\n  Phase 4: Verify compression on the wire");
 
-    let after = link_in(cli, port2).await;
+    let after = link(cli, port2).await;
     checks.check(&format!("Counters read again ({after:?})"), after.is_some());
-    let (bytes_after, messages_after) = after.unwrap_or((bytes_before, messages_before));
-    let wire = bytes_after.saturating_sub(bytes_before);
-    let carried = messages_after.saturating_sub(messages_before);
+    let after = after.unwrap_or(before);
+    let wire = after.sent_bytes.saturating_sub(before.sent_bytes);
+    let carried = after.sent_messages.saturating_sub(before.sent_messages);
+    let taken = after.received_bytes.saturating_sub(before.received_bytes);
     let message_size = size.checked_div(received).unwrap_or(0);
     let per_message = wire.checked_div(carried).unwrap_or(u64::MAX);
     say!(
@@ -223,9 +237,24 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
         per_message
     );
 
+    // Server A's sends are the link's alone with Server B its one peer.
+    checks.check(
+        &format!(
+            "Server A has one peer (got {} and {})",
+            before.peers, after.peers
+        ),
+        before.peers == 1 && after.peers == 1,
+    );
     checks.check(
         &format!("The link carried messages (got {carried} in {wire} bytes)"),
         carried > 0 && wire > 0,
+    );
+    // Sampled a moment apart, and some bytes in flight: half is plenty.
+    checks.check(
+        &format!(
+            "Server B took off the link what Server A put on it (got {taken} of {wire} bytes)"
+        ),
+        taken.saturating_mul(2) >= wire && wire > 0,
     );
     checks.check(
         &format!("Subscriber received Server A's messages (got {received})"),

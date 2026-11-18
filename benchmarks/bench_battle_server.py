@@ -48,6 +48,7 @@ Usage:
 """
 
 import argparse
+import base64
 import os
 import signal
 import subprocess
@@ -307,7 +308,9 @@ def drain_loop(server, origin: int, stop_event: threading.Event):
             time.sleep(0.1)
 
 
-def publish_loop(server, mode: str, message_size: int, origin: int, stop_event: threading.Event):
+def publish_loop(
+    server, mode: str, message_size: int, random_padding: bool, origin: int, stop_event: threading.Event
+):
     """Broadcast to all channels in round-robin."""
     seq = 0
     published = 0
@@ -316,11 +319,18 @@ def publish_loop(server, mode: str, message_size: int, origin: int, stop_event: 
     interval_count = 0
     num_channels = len(TOPICS) + 1  # +1 for broadcast_all
 
-    # Build padding for large messages
-    padding = ""
+    # Build padding for large messages: one that compresses to nothing, or
+    # random text zstd cannot take much off (a control for battle-compression)
+    paddings = [""]
     if message_size > 100:
-        padding_len = message_size - 90  # approximate base message size
-        padding = ',"pad":"' + "x" * max(0, padding_len) + '"'
+        padding_len = max(0, message_size - 90)  # approximate base message size
+        if random_padding:
+            paddings = [
+                ',"pad":"' + base64.b64encode(os.urandom(padding_len)).decode()[:padding_len] + '"'
+                for _ in range(256)
+            ]
+        else:
+            paddings = [',"pad":"' + "x" * padding_len + '"']
 
     while not stop_event.is_set():
         # cluster-subscribe mode: no publishing, just handle subscriptions
@@ -330,6 +340,7 @@ def publish_loop(server, mode: str, message_size: int, origin: int, stop_event: 
 
         ts_us = int(time.time() * 1_000_000)
         cycle = seq % num_channels
+        padding = paddings[seq % len(paddings)]
 
         try:
             if cycle == 0:
@@ -398,6 +409,9 @@ def main():
                         help="Cluster peer addresses, e.g. 127.0.0.1:5007")
     parser.add_argument("--message-size", type=int, default=100,
                         help="Approximate message size in bytes (default: 100)")
+    parser.add_argument("--random-padding", action="store_true",
+                        help="Pad large messages with random text zstd cannot compress "
+                             "(a control for battle-compression)")
     parser.add_argument("--no-publish", action="store_true",
                         help="Disable publish loop (for feature-only tests like presence/recovery)")
     parser.add_argument("--recovery", action="store_true",
@@ -498,7 +512,7 @@ def main():
     if not args.no_publish:
         pub_thread = threading.Thread(
             target=publish_loop,
-            args=(server, args.mode, args.message_size, args.port, stop),
+            args=(server, args.mode, args.message_size, args.random_padding, args.port, stop),
             daemon=True,
         )
         pub_thread.start()
