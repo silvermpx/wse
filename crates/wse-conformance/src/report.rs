@@ -61,22 +61,26 @@ fn xml(text: &str) -> String {
         .replace('\'', "&apos;")
 }
 
+/// A name a driver gave, as part of a file's name: letters, digits, `-` and
+/// `_` only, so it names a file in the folder it is written to and nowhere
+/// else (`../x` is `___x`).
+pub fn file_name(name: &str) -> String {
+    name.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
 impl Report {
     /// `<dir>/<agent>.json` and `<dir>/<agent>.junit.xml`.
     pub fn write(&self, dir: &Path) -> std::io::Result<()> {
         std::fs::create_dir_all(dir)?;
-        let name: String = self
-            .agent
-            .agent
-            .chars()
-            .map(|c| {
-                if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
-                    c
-                } else {
-                    '_'
-                }
-            })
-            .collect();
+        let name = file_name(&self.agent.agent);
         let json = serde_json::to_string_pretty(self).map_err(std::io::Error::other)?;
         std::fs::write(dir.join(format!("{name}.json")), json + "\n")?;
         let failed = self.cases.iter().filter(|c| c.verdict == "fail").count();

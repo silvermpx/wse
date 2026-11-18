@@ -17,7 +17,7 @@ use tokio_tungstenite::tungstenite::Message;
 
 use crate::cases::{Case, Catalog};
 use crate::oracle;
-use crate::report::{Agent, Report, Verdict};
+use crate::report::{Agent, Report, Verdict, file_name};
 use crate::stand::{Log, Stand, lock_log};
 
 /// The case a session runs now.
@@ -262,17 +262,20 @@ impl Session {
     /// it last), so it can be read where it ran, an emulator's case too.
     fn keep_trace(&self, case: &str, trace: &[Value], log: &Log, failures: &[String]) {
         use std::fmt::Write as _;
+        // The driver names itself: its name, as the report's, names a file
+        // in the folder and nowhere else.
         let agent = self
             .agent
             .as_ref()
             .map_or("driver", |agent| agent.agent.as_str());
+        let file = format!("{}.{}.trace.jsonl", file_name(agent), file_name(case));
         let mut lines = String::new();
         for event in trace {
             let _ = writeln!(lines, "{event}");
         }
         let server = json!({"failures": failures, "server": log});
         let _ = writeln!(lines, "{server}");
-        let path = self.out.join(format!("{agent}.{case}.trace.jsonl"));
+        let path = self.out.join(file);
         if let Err(why) = std::fs::write(&path, lines) {
             eprintln!("wse-conformance: {}: {why}", path.display());
         }
@@ -312,6 +315,46 @@ impl Session {
 mod tests {
     use super::*;
     use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+
+    /// The driver names itself, and a case by its name: the trace of a case
+    /// that failed is written in the folder of the reports, whatever names
+    /// they gave.
+    #[test]
+    fn a_trace_names_a_file_in_its_folder_whatever_the_driver_is_called() {
+        let root =
+            std::env::temp_dir().join(format!("wse-conformance-trace-{}", std::process::id()));
+        let out = root.join("reports");
+        std::fs::create_dir_all(&out).unwrap();
+        let session = Session {
+            catalog: Arc::new(crate::cases::catalog()),
+            out: out.clone(),
+            source: Arc::from("test"),
+            host: "127.0.0.1".to_owned(),
+            agent: Some(Agent {
+                agent: "../escaped".to_owned(),
+                ..Agent::default()
+            }),
+            running: None,
+            verdicts: Vec::new(),
+        };
+        session.keep_trace(
+            "../../case",
+            &[json!({"ev": "ready"})],
+            &Log::default(),
+            &[],
+        );
+        let written: Vec<String> = std::fs::read_dir(&out)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(written, ["___escaped.______case.trace.jsonl"]);
+        let beside: Vec<String> = std::fs::read_dir(&root)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(beside, ["reports"]);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
 
     #[test]
     fn the_host_is_the_authority_without_its_port() {
