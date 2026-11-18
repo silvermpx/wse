@@ -48,7 +48,7 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
             say!("OK");
         }
         Err(e) => {
-            eprintln!("FAILED: {e}");
+            fail_err!("FAILED: {e}");
             crate::report::failed();
             eprintln!(
                 "\n    Start servers with TLS (separate cluster ports):\n    \

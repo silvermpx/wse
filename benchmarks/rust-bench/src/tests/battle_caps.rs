@@ -77,7 +77,7 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
     {
         Ok(ws) => ws,
         Err(e) => {
-            eprintln!("    Failed to connect to Server B (:{}) -- {}", port2, e);
+            fail_err!("    Failed to connect to Server B (:{}) -- {}", port2, e);
             return Vec::new();
         }
     };

@@ -93,7 +93,7 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
     {
         Ok(ws) => ws,
         Err(e) => {
-            eprintln!("    Failed to connect to Server C (:{}) -- {}", port3, e);
+            fail_err!("    Failed to connect to Server C (:{}) -- {}", port3, e);
             eprintln!(
                 "\n  Start 3 servers (in this order):\n    \
                 python benchmarks/bench_battle_server.py --mode cluster --port {} \

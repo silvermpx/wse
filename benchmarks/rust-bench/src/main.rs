@@ -19,6 +19,14 @@ macro_rules! fail {
     }};
 }
 
+/// An error to stderr that fails the run, as [`fail!`] does.
+macro_rules! fail_err {
+    ($($arg:tt)*) => {{
+        crate::report::failed();
+        eprintln!($($arg)*)
+    }};
+}
+
 /// [`say!`] without the end of the line.
 macro_rules! say_on {
     ($($arg:tt)*) => {
@@ -105,7 +113,17 @@ async fn main() {
     }
 }
 
+/// A test's results: a measurement that measured nothing (it could not
+/// connect, say) fails the run; a battle test says what failed in its checks.
 async fn run_single_test(cli: &Cli, test: TestName) -> Vec<TierResult> {
+    let results = run_test(cli, test).await;
+    if results.is_empty() && !format!("{test:?}").starts_with("Battle") {
+        fail_err!("{test:?}: no measurement came out of it");
+    }
+    results
+}
+
+async fn run_test(cli: &Cli, test: TestName) -> Vec<TierResult> {
     match test {
         TestName::ConnectionStorm => tests::connection_storm::run(cli).await,
         TestName::PingLatency => tests::ping_latency::run(cli).await,

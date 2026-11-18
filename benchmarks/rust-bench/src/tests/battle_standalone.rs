@@ -103,7 +103,7 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
     );
 
     if connections.len() < BATTLE_CLIENTS / 2 {
-        say!("    ABORT: too few connections, cannot continue");
+        fail!("    ABORT: too few connections, cannot continue");
         protocol::close_all(connections).await;
         return Vec::new();
     }

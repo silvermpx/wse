@@ -47,7 +47,7 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
             .await;
 
             if connections.is_empty() {
-                eprintln!("FAILED");
+                fail_err!("FAILED");
                 continue;
             }
 

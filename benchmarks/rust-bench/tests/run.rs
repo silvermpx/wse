@@ -85,3 +85,24 @@ async fn every_test_that_cannot_connect_fails_the_run() {
         );
     }
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_measurement_that_cannot_connect_fails_the_run() {
+    for test in ["battle-compression", "format-comparison", "size-matrix"] {
+        let port = one_connection().await;
+        let out = tokio::task::spawn_blocking(move || {
+            Command::new(env!("CARGO_BIN_EXE_wse-bench"))
+                .args(["--test", test, "--duration", "1", "--port"])
+                .arg(port.to_string())
+                .output()
+                .unwrap()
+        })
+        .await
+        .unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            !out.status.success(),
+            "{test} measured nothing and exited 0: {stderr}"
+        );
+    }
+}

@@ -134,7 +134,7 @@ async fn run_format(
         protocol::connect_batch(&cli.host, cli.port, token, n, cli.batch_size, uri_params).await;
 
     if connections.is_empty() {
-        eprintln!("FAILED");
+        fail_err!("FAILED");
         return None;
     }
 
@@ -207,7 +207,7 @@ async fn run_format_binary(
         protocol::connect_batch(&cli.host, cli.port, token, n, cli.batch_size, uri_params).await;
 
     if connections.is_empty() {
-        eprintln!("FAILED");
+        fail_err!("FAILED");
         return None;
     }
 

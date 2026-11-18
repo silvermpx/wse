@@ -85,7 +85,7 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
     {
         Ok(ws) => ws,
         Err(e) => {
-            eprintln!("    Failed to connect health conn to Server B -- {}", e);
+            fail_err!("    Failed to connect health conn to Server B -- {}", e);
             return Vec::new();
         }
     };
@@ -103,7 +103,7 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
     {
         Ok(ws) => ws,
         Err(e) => {
-            eprintln!("    Failed to connect subscriber to Server B -- {}", e);
+            fail_err!("    Failed to connect subscriber to Server B -- {}", e);
             protocol::close_all(vec![ws_health]).await;
             return Vec::new();
         }

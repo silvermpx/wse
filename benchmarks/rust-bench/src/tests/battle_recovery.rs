@@ -161,7 +161,7 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
     );
 
     if seeded == 0 {
-        say!("    ABORT: Could not seed recovery buffer");
+        fail!("    ABORT: Could not seed recovery buffer");
         let _ = ws.close(None).await;
         return Vec::new();
     }
@@ -208,7 +208,7 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
     );
 
     if !has_recovery_info {
-        say!("    ABORT: No recovery info from server. Is --recovery enabled?");
+        fail!("    ABORT: No recovery info from server. Is --recovery enabled?");
         let _ = ws.close(None).await;
         return Vec::new();
     }

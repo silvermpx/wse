@@ -109,7 +109,7 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
             say!("OK");
         }
         Err(e) => {
-            eprintln!("FAILED: {e}");
+            fail_err!("FAILED: {e}");
             crate::report::failed();
             eprintln!(
                 "\n  Start servers:\n    \
@@ -150,7 +150,7 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
     );
 
     if connections.len() < BATTLE_CLIENTS / 2 {
-        say!("    ABORT: too few connections");
+        fail!("    ABORT: too few connections");
         protocol::close_all(connections).await;
         return Vec::new();
     }

@@ -111,7 +111,7 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
             say!("OK");
         }
         Err(e) => {
-            eprintln!("FAILED: {e}");
+            fail_err!("FAILED: {e}");
             crate::report::failed();
             eprintln!(
                 "\n  Start servers with TLS (separate cluster ports):\n    \
@@ -143,7 +143,7 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
     {
         Ok(ws) => ws,
         Err(e) => {
-            eprintln!("    Failed to connect to Server B for health -- {}", e);
+            fail_err!("    Failed to connect to Server B for health -- {}", e);
             return Vec::new();
         }
     };
@@ -202,7 +202,7 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
     );
 
     if connections.len() < BATTLE_CLIENTS / 2 {
-        say!(
+        fail!(
             "    ABORT: too few connections ({}/{})",
             connections.len(),
             BATTLE_CLIENTS

@@ -48,7 +48,7 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
             say!("OK");
         }
         Err(e) => {
-            eprintln!("FAILED: {e}");
+            fail_err!("FAILED: {e}");
             crate::report::failed();
             return Vec::new();
         }
@@ -69,7 +69,7 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
             say!("OK");
         }
         Err(e) => {
-            eprintln!("FAILED: {e}");
+            fail_err!("FAILED: {e}");
             crate::report::failed();
             eprintln!(
                 "\n    Start Server B: python benchmarks/bench_fanout_server.py --mode cluster --port {port2} --peers 127.0.0.1:{}", cli.port
