@@ -44,6 +44,12 @@ pub struct Verdict {
 pub struct Report {
     #[serde(flatten)]
     pub agent: Agent,
+    /// What the run came from: the commit the conformance server was started
+    /// in (empty when it could not tell), and the server's own version.
+    #[serde(default)]
+    pub source: String,
+    #[serde(default)]
+    pub server: String,
     pub cases: Vec<Verdict>,
 }
 
@@ -135,7 +141,12 @@ struct Needed {
 /// Every agent the manifest names has a report, claims at least the
 /// features named for it, and passed every case those features reach.
 /// What fails, one line each; none: the run holds.
-pub fn check(manifest: &Path, reports: &Path, catalog: &Catalog) -> Result<Vec<String>, String> {
+pub fn check(
+    manifest: &Path,
+    reports: &Path,
+    catalog: &Catalog,
+    source: Option<&str>,
+) -> Result<Vec<String>, String> {
     let manifest: Manifest = serde_json::from_str(
         &std::fs::read_to_string(manifest).map_err(|e| format!("{}: {e}", manifest.display()))?,
     )
@@ -157,6 +168,30 @@ pub fn check(manifest: &Path, reports: &Path, catalog: &Catalog) -> Result<Vec<S
             problems.push(format!("{agent}: no report"));
             continue;
         };
+        // What ran: a report that does not say is no evidence.
+        let named = &report.agent;
+        for (field, value) in [
+            ("version", &named.version),
+            ("runtime", &named.runtime),
+            ("os", &named.os),
+            ("arch", &named.arch),
+        ] {
+            if value.trim().is_empty() {
+                problems.push(format!("{agent}: the report names no {field}"));
+            }
+        }
+        if let Some(source) = source
+            && report.source != source
+        {
+            problems.push(format!(
+                "{agent}: the report comes from {}, not {source}",
+                if report.source.is_empty() {
+                    "an unnamed source"
+                } else {
+                    &report.source
+                }
+            ));
+        }
         let claimed: HashSet<&str> = report.agent.features.iter().map(String::as_str).collect();
         for feature in &needed.features {
             if !claimed.contains(feature.as_str()) {
@@ -184,4 +219,62 @@ pub fn check(manifest: &Path, reports: &Path, catalog: &Catalog) -> Result<Vec<S
         }
     }
     Ok(problems)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The reports in a directory of their own, checked against a manifest
+    /// that needs `agent` with no features: what the check says.
+    fn checked(report: serde_json::Value, source: Option<&str>) -> Vec<String> {
+        let dir = std::env::temp_dir().join(format!(
+            "wse-conformance-report-{}-{}",
+            std::process::id(),
+            report["agent"].as_str().unwrap_or_default()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let manifest = dir.join("manifest.json");
+        let agent = report["agent"].as_str().unwrap_or_default().to_owned();
+        std::fs::write(
+            &manifest,
+            serde_json::json!({"agents": {agent: {"features": []}}}).to_string(),
+        )
+        .unwrap();
+        let reports = dir.join("reports");
+        std::fs::create_dir_all(&reports).unwrap();
+        std::fs::write(reports.join("r.json"), report.to_string()).unwrap();
+        let catalog = Catalog { cases: Vec::new() };
+        let problems = check(&manifest, &reports, &catalog, source).unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+        problems
+    }
+
+    fn whole(agent: &str) -> serde_json::Value {
+        serde_json::json!({
+            "agent": agent, "version": "3.2.0", "runtime": "swift", "os": "iOS 27.2",
+            "arch": "aarch64", "features": [], "source": "4398651abc", "server": "3.2.0", "cases": []
+        })
+    }
+
+    #[test]
+    fn a_report_names_what_ran_it() {
+        assert!(checked(whole("whole"), None).is_empty());
+        for field in ["version", "runtime", "os", "arch"] {
+            let mut report = whole(&format!("no-{field}"));
+            report.as_object_mut().unwrap().remove(field);
+            let problems = checked(report, None);
+            assert_eq!(problems.len(), 1, "{field}: {problems:?}");
+            assert!(problems[0].contains(field), "{problems:?}");
+        }
+    }
+
+    #[test]
+    fn a_report_comes_from_the_source_asked_for() {
+        assert!(checked(whole("this-source"), Some("4398651abc")).is_empty());
+        assert_eq!(checked(whole("other-source"), Some("1e2d7fd")).len(), 1);
+        let mut unnamed = whole("no-source");
+        unnamed.as_object_mut().unwrap().remove("source");
+        assert_eq!(checked(unnamed, Some("4398651abc")).len(), 1);
+    }
 }

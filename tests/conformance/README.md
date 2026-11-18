@@ -47,7 +47,10 @@ A WebSocket of JSON requests, `{id, op, ...}`, each answered `{id, ok, ...}`:
 - `trace {events}`: what the client saw, in pieces;
 - `end`: the verdict, and the case's server goes;
 - `bye`: the report, `<agent>.json` and `<agent>.junit.xml` (also written when the channel
-  closes).
+  closes): what the driver said it is, the commit the server was started in (`source`, git's
+  `HEAD`) and the server's version, and each case's verdict. `check` fails a report that names
+  no version, runtime, system or architecture, and with `--source COMMIT` one from another
+  commit.
 
 ## The trace
 

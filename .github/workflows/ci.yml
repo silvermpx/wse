@@ -438,7 +438,7 @@ jobs:
           WSE_CONFORMANCE_BRIDGE=rust npx vitest run --project client ts-client/__tests__/conformance.test.ts
           cargo test --locked -p wse-client --test conformance
           pytest python-client/tests/test_conformance.py -q
-          target/debug/wse-conformance check --manifest tests/conformance/agents.json --reports "$out"
+          target/debug/wse-conformance check --manifest tests/conformance/agents.json --reports "$out" --source "$GITHUB_SHA"
 
       - name: The reports
         if: always()
@@ -507,7 +507,7 @@ jobs:
           display=
           if [ "$RUNNER_OS" = Linux ]; then display='xvfb-run -a'; fi
           $display bindings/electron/node_modules/.bin/electron bindings/electron/conformance/out/main.mjs "$control"
-          target/debug/wse-conformance check --manifest tests/conformance/electron.json --reports "$out"
+          target/debug/wse-conformance check --manifest tests/conformance/electron.json --reports "$out" --source "$GITHUB_SHA"
 
       - name: The example application, against the example server
         run: |
@@ -611,7 +611,7 @@ jobs:
           display=
           if [ "$RUNNER_OS" = Linux ]; then display='xvfb-run -a'; fi
           $display bindings/tauri/target/debug/wse-tauri-conformance "$control"
-          target/debug/wse-conformance check --manifest tests/conformance/tauri.json --reports "$out"
+          target/debug/wse-conformance check --manifest tests/conformance/tauri.json --reports "$out" --source "$GITHUB_SHA"
 
       - name: The example application, against the example server
         env:
@@ -860,7 +860,7 @@ jobs:
           WSE_CONFORMANCE="$(sed -n 's/.*"control":"\([^"]*\)".*/\1/p' conformance.log)" WSE_CONFORMANCE_REQUIRED=1 \
           CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER=wasm-bindgen-test-runner \
             cargo test -p wse-client --locked --target wasm32-unknown-unknown --test conformance_browser
-          target/debug/wse-conformance check --manifest tests/conformance/rust-browser.json --reports "$out"
+          target/debug/wse-conformance check --manifest tests/conformance/rust-browser.json --reports "$out" --source "$GITHUB_SHA"
 
       - name: The pure-Rust crypto, natively
         env:

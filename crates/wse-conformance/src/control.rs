@@ -31,6 +31,8 @@ struct Running {
 struct Session {
     catalog: Arc<Catalog>,
     out: PathBuf,
+    /// The commit the server was started in.
+    source: Arc<str>,
     /// The name the driver reached this machine by.
     host: String,
     agent: Option<Agent>,
@@ -63,13 +65,14 @@ fn host_of(authority: &str) -> &str {
 /// Serves drivers on `listener` until the process ends.
 // The handshake's callback answers with tungstenite's own error response.
 #[allow(clippy::result_large_err)]
-pub async fn serve(listener: TcpListener, catalog: Arc<Catalog>, out: PathBuf) {
+pub async fn serve(listener: TcpListener, catalog: Arc<Catalog>, out: PathBuf, source: Arc<str>) {
     loop {
         let Ok((stream, _)) = listener.accept().await else {
             continue;
         };
         let catalog = Arc::clone(&catalog);
         let out = out.clone();
+        let source = Arc::clone(&source);
         tokio::spawn(async move {
             let mut path = String::new();
             let mut host = String::new();
@@ -85,7 +88,7 @@ pub async fn serve(listener: TcpListener, catalog: Arc<Catalog>, out: PathBuf) {
             .await;
             let served = match accepted {
                 Ok(ws) if path == "/bridge" => crate::bridge::host(ws).await,
-                Ok(ws) => session(ws, catalog, out, host).await,
+                Ok(ws) => session(ws, catalog, out, host, source).await,
                 Err(e) => Err(e.to_string()),
             };
             if let Err(why) = served {
@@ -100,10 +103,12 @@ async fn session(
     catalog: Arc<Catalog>,
     out: PathBuf,
     host: String,
+    source: Arc<str>,
 ) -> Result<(), String> {
     let mut session = Session {
         catalog,
         out,
+        source,
         host,
         agent: None,
         running: None,
@@ -253,6 +258,8 @@ impl Session {
         let agent = self.agent.clone().ok_or("hello first")?;
         let report = Report {
             agent,
+            source: self.source.to_string(),
+            server: env!("CARGO_PKG_VERSION").to_owned(),
             cases: self.verdicts.clone(),
         };
         report.write(&self.out).map_err(|e| e.to_string())?;
@@ -305,6 +312,7 @@ mod tests {
             listener,
             Arc::new(crate::cases::catalog()),
             out.clone(),
+            Arc::from("test"),
         ));
         let stream = TcpStream::connect(addr).await.unwrap();
         let request = format!("ws://10.0.2.2:{}/control", addr.port())

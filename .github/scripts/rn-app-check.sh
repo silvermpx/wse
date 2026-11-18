@@ -75,7 +75,7 @@ npm install --no-audit --no-fund "$tarball" "${crypto_packages[@]}" > /dev/null
 # The emulator reaches the host's loopback at 10.0.2.2: the example server,
 # and the conformance server's control channel and the cases' servers.
 cat > wse-check.json <<JSON
-{ "url": "ws://10.0.2.2:$port/wse", "control": "ws://10.0.2.2:$control/control" }
+{ "url": "ws://10.0.2.2:$port/wse", "control": "ws://10.0.2.2:$control/control", "arch": "${ABI:-x86_64}" }
 JSON
 # The TypeScript driver of the conformance cases; its imports are types only.
 cp "$root/ts-client/__tests__/conformance/driver.ts" conformance.ts
@@ -127,7 +127,7 @@ function conformance() {
     agent: 'react-native',
     runtime: typeof (globalThis as { HermesInternal?: unknown }).HermesInternal === 'object' ? 'hermes' : 'react-native',
     os: `${Platform.OS} ${Platform.Version}`,
-    arch: '',
+    arch: config.arch,
     make,
     bridged: false,
   }).then(

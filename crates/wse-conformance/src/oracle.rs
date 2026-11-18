@@ -108,14 +108,25 @@ pub fn judge(case: &Case, events: &[Value], log: &Log) -> Vec<String> {
         }
     }
     for rule in &case.rules {
-        if let Err(why) = hold(rule, &trace, log) {
+        if let Err(why) = hold(rule, case, &trace, log) {
             failures.push(format!("{}: {why}", rule.rule));
         }
     }
     failures
 }
 
-fn hold(rule: &Rule, trace: &Trace<'_>, log: &Log) -> Result<(), String> {
+/// How many messages of `kind` the case's steps send into the client (not
+/// live).
+fn asked(case: &Case, kind: Option<&str>) -> u64 {
+    case.steps
+        .iter()
+        .filter(|step| step["client"] == "send" && step["live"] != true)
+        .filter(|step| kind.is_none_or(|k| step["type"] == k))
+        .map(|step| step["count"].as_u64().unwrap_or(1))
+        .sum()
+}
+
+fn hold(rule: &Rule, case: &Case, trace: &Trace<'_>, log: &Log) -> Result<(), String> {
     let topic = || {
         rule.topic
             .as_deref()
@@ -297,9 +308,19 @@ fn hold(rule: &Rule, trace: &Trace<'_>, log: &Log) -> Result<(), String> {
             }
         }
         "delivered_all" => {
+            // Every send the case makes: taken by the client, and said
+            // delivered.
+            let sent = trace.sent(kind);
+            let asked = asked(case, kind);
+            if (sent.len() as u64) < asked {
+                return Err(format!(
+                    "the client took {} of the {asked} sends the case made",
+                    sent.len()
+                ));
+            }
             let delivered = trace.ids("delivered");
             let not = trace.ids("not_delivered");
-            for id in trace.sent(kind) {
+            for id in sent {
                 if not.contains(&id) {
                     return Err(format!("{id} was said not delivered"));
                 }
@@ -617,6 +638,23 @@ mod tests {
         );
         let not = json!({"ev": "not_delivered", "reason": "busy", "ids": ["a"]});
         assert_eq!(judged(rules, &[sent("a"), not], &log).len(), 1);
+    }
+
+    #[test]
+    fn every_send_the_case_makes_is_taken_by_the_client_and_said_delivered() {
+        let rules = json!([{"rule": "delivered_all", "type": "order"}]);
+        let steps = json!([{"client": "send", "type": "order", "count": 2}]);
+        let case: Case =
+            serde_json::from_value(json!({"case": "c", "steps": steps, "rules": rules})).unwrap();
+        let log = Log::default();
+        let refused =
+            json!({"ev": "sent", "id": "order-2", "type": "order", "live": false, "ok": false});
+        let delivered = json!({"ev": "delivered", "ids": ["order-1"]});
+        // One of the two the client did not take: what it took was delivered.
+        let trace = [sent("order-1"), refused, delivered];
+        assert_eq!(judge(&case, &trace, &log).len(), 1);
+        let both = json!({"ev": "delivered", "ids": ["order-1", "order-2"]});
+        assert!(judge(&case, &[sent("order-1"), sent("order-2"), both], &log).is_empty());
     }
 
     #[test]

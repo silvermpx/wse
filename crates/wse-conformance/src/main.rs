@@ -6,10 +6,13 @@
 //! and serves drivers until it is stopped; each driver's report goes to
 //! `--out` as `<agent>.json` and `<agent>.junit.xml`.
 //!
-//!     wse-conformance check --manifest tests/conformance/agents.json --reports target/conformance
+//!     wse-conformance check --manifest tests/conformance/agents.json --reports target/conformance [--source COMMIT]
 //!
 //! fails (exit 1) unless every agent the manifest names passed every case
-//! its features reach. `wse-conformance cases` prints the built-in catalog.
+//! its features reach, its report naming what ran it (version, runtime,
+//! system, architecture) and, with `--source`, coming from that commit (the
+//! one the server was started in). `wse-conformance cases` prints the
+//! built-in catalog.
 //!
 //! Beside the control channel, `/bridge` serves a window of the bridge's
 //! Rust owner: the TypeScript driver runs the cases through it.
@@ -28,7 +31,7 @@ use std::sync::Arc;
 fn usage() -> ExitCode {
     eprintln!(
         "usage: wse-conformance serve [--control ADDR] [--out DIR]\n       \
-         wse-conformance check --manifest FILE --reports DIR\n       \
+         wse-conformance check --manifest FILE --reports DIR [--source COMMIT]\n       \
          wse-conformance cases"
     );
     ExitCode::from(2)
@@ -40,6 +43,19 @@ fn option(args: &[String], name: &str) -> Option<String> {
         .position(|a| a == name)
         .and_then(|at| args.get(at + 1))
         .cloned()
+}
+
+/// The commit the server is started in (git's HEAD where it runs), empty
+/// when there is none to tell.
+fn source_commit() -> String {
+    std::process::Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .ok()
+        .filter(|out| out.status.success())
+        .and_then(|out| String::from_utf8(out.stdout).ok())
+        .map(|commit| commit.trim().to_owned())
+        .unwrap_or_default()
 }
 
 #[tokio::main]
@@ -66,8 +82,9 @@ async fn main() -> ExitCode {
                 "{}",
                 serde_json::json!({"ready": true, "control": format!("ws://{addr}/control")})
             );
+            let source = Arc::<str>::from(source_commit());
             tokio::select! {
-                () = control::serve(listener, catalog, out) => {}
+                () = control::serve(listener, catalog, out, source) => {}
                 _ = tokio::signal::ctrl_c() => {}
             }
             ExitCode::SUCCESS
@@ -78,7 +95,13 @@ async fn main() -> ExitCode {
             else {
                 return usage();
             };
-            match report::check(manifest.as_ref(), reports.as_ref(), &catalog) {
+            let source = option(&args, "--source");
+            match report::check(
+                manifest.as_ref(),
+                reports.as_ref(),
+                &catalog,
+                source.as_deref(),
+            ) {
                 Ok(problems) if problems.is_empty() => {
                     println!("conformance: every agent passed what it must");
                     ExitCode::SUCCESS
