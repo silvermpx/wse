@@ -59,9 +59,13 @@ pub struct Cli {
     #[arg(long)]
     pub port3: Option<u16>,
 
-    /// Metrics HTTP port (for querying Prometheus metrics from bench server)
+    /// The first server's (--port) metrics HTTP port (default: its port + 1000)
     #[arg(long)]
     pub metrics_port: Option<u16>,
+
+    /// The second server's (--port2) metrics HTTP port (default: its port + 1000)
+    #[arg(long)]
+    pub metrics_port2: Option<u16>,
 }
 
 impl Cli {
@@ -87,10 +91,19 @@ impl Cli {
         })
     }
 
-    /// Metrics port for a given server port. Defaults to port + 1000; a
-    /// port with no room for that above it has none.
+    /// The metrics port of the server at `server_port`: the one given for
+    /// it (--metrics-port for the first server, --metrics-port2 for the
+    /// second), or its port + 1000; a port with no room for that above it
+    /// has none.
     pub fn metrics_port_for(&self, server_port: u16) -> Option<u16> {
-        self.metrics_port.or(server_port.checked_add(1000))
+        let given = if server_port == self.port {
+            self.metrics_port
+        } else if Some(server_port) == self.port2.or(self.port.checked_add(1)) {
+            self.metrics_port2
+        } else {
+            None
+        };
+        given.or(server_port.checked_add(1000))
     }
 }
 
@@ -180,7 +193,26 @@ mod tests {
         assert_eq!(cli.metrics_port_for(64_535), Some(65_535));
         assert_eq!(cli.metrics_port_for(64_536), None);
         let given = Cli::parse_from(["wse-bench", "--metrics-port", "9100"]);
-        assert_eq!(given.metrics_port_for(65_000), Some(9100));
+        assert_eq!(given.metrics_port_for(given.port), Some(9100));
+    }
+
+    #[test]
+    fn each_server_has_a_metrics_port_of_its_own() {
+        let ports = ["wse-bench", "--port", "5006", "--port2", "5007"];
+        let cli = Cli::parse_from(ports);
+        assert_eq!(cli.metrics_port_for(5006), Some(6006));
+        assert_eq!(cli.metrics_port_for(5007), Some(6007));
+        let given = Cli::parse_from(ports.into_iter().chain([
+            "--metrics-port",
+            "9100",
+            "--metrics-port2",
+            "9200",
+        ]));
+        assert_eq!(given.metrics_port_for(5006), Some(9100));
+        assert_eq!(given.metrics_port_for(5007), Some(9200));
+        // The first server's given, the second's is its own default.
+        let first = Cli::parse_from(ports.into_iter().chain(["--metrics-port", "9100"]));
+        assert_eq!(first.metrics_port_for(5007), Some(6007));
     }
 
     #[test]
