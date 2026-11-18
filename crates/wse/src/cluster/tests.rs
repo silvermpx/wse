@@ -23,6 +23,7 @@ fn test_encode_decode_msg() {
             topic: "chat.general".into(),
             payload: Bytes::from("hello world"),
             recovery: None,
+            arrival: None,
         }
     );
 }
@@ -39,6 +40,7 @@ fn test_encode_decode_msg_compressed() {
             topic: "chat".into(),
             payload: Bytes::from("hello"),
             recovery: None,
+            arrival: None,
         }
     );
 
@@ -58,6 +60,7 @@ fn test_encode_decode_msg_compressed() {
             topic: "events.user".into(),
             payload: Bytes::from(big_payload),
             recovery: None,
+            arrival: None,
         }
     );
 }
@@ -75,6 +78,7 @@ fn test_decode_uncompressed_msg_with_zero_flags() {
             topic: "topic".into(),
             payload: Bytes::from("payload"),
             recovery: None,
+            arrival: None,
         }
     );
 }
@@ -154,6 +158,7 @@ fn test_incompressible_payload_falls_back_to_uncompressed() {
             topic: "test".into(),
             payload: Bytes::from(payload),
             recovery: None,
+            arrival: None,
         }
     );
 }
@@ -471,6 +476,7 @@ fn test_encode_decode_msg_empty() {
             topic: "".into(),
             payload: Bytes::from(""),
             recovery: None,
+            arrival: None,
         }
     );
 }
@@ -488,6 +494,7 @@ fn test_encode_decode_msg_large_payload() {
             topic: topic.into(),
             payload: Bytes::from(payload),
             recovery: None,
+            arrival: None,
         }
     );
 }
@@ -593,6 +600,7 @@ async fn test_msg_roundtrip() {
             topic: "chat.general".into(),
             payload: Bytes::from(r#"{"text":"hello"}"#),
             recovery: None,
+            arrival: None,
         }
     );
 
@@ -1254,6 +1262,7 @@ fn test_encode_decode_msg_with_recovery() {
             topic,
             payload,
             recovery,
+            ..
         } => {
             assert_eq!(topic, "events.topic");
             assert_eq!(&payload[..], br#"{"data":"test"}"#);
@@ -1299,6 +1308,7 @@ fn test_msg_recovery_flag_with_compression() {
             topic,
             payload: decoded_payload,
             recovery,
+            ..
         } => {
             assert_eq!(topic, "big.topic");
             assert_eq!(recovery, Some((epoch, offset)));
@@ -1315,13 +1325,14 @@ fn test_msg_recovery_flag_with_compression() {
 #[test]
 fn a_resume_request_round_trips_in_frames_under_the_limit() {
     // None held: one frame, the last, naming nothing.
-    let frames = encode_resume(&[], &[]);
+    let frames = encode_resume(&[], &[], None);
     assert_eq!(frames.len(), 1);
     assert_eq!(
         decode_frame(frames[0].clone()),
         Some(ClusterFrame::Resume {
             points: Vec::new(),
             topics: Vec::new(),
+            heard: None,
             last: true
         })
     );
@@ -1330,7 +1341,7 @@ fn a_resume_request_round_trips_in_frames_under_the_limit() {
     let points: Vec<ResumePoint> = (0..3000u64)
         .map(|i| (format!("{topic}{i}"), i as u32, i * 7))
         .collect();
-    let frames = encode_resume(&points, &[]);
+    let frames = encode_resume(&points, &[], None);
     assert!(frames.len() > 1);
     let mut got = Vec::new();
     for (i, frame) in frames.into_iter().enumerate() {
@@ -1348,13 +1359,14 @@ fn a_resume_request_round_trips_in_frames_under_the_limit() {
 fn a_resume_request_names_the_topics_after_the_streams() {
     let points = vec![("news".to_owned(), 7, 41)];
     let topics = vec![("news".to_owned(), 30_000), ("room".to_owned(), 5)];
-    let frames = encode_resume(&points, &topics);
+    let frames = encode_resume(&points, &topics, None);
     assert_eq!(frames.len(), 2);
     assert_eq!(
         decode_frame(frames[0].clone()),
         Some(ClusterFrame::Resume {
             points,
             topics: Vec::new(),
+            heard: None,
             last: false
         })
     );
@@ -1363,6 +1375,7 @@ fn a_resume_request_names_the_topics_after_the_streams() {
         Some(ClusterFrame::Resume {
             points: Vec::new(),
             topics,
+            heard: None,
             last: true
         })
     );
@@ -1370,7 +1383,7 @@ fn a_resume_request_names_the_topics_after_the_streams() {
 
 #[test]
 fn a_truncated_resume_request_does_not_decode() {
-    let mut frame = encode_resume(&[("topic".to_owned(), 1, 2)], &[]).remove(0);
+    let mut frame = encode_resume(&[("topic".to_owned(), 1, 2)], &[], None).remove(0);
     let len = frame.len();
     frame.truncate(len - 3);
     let short = (frame.len() - 8) as u32;
@@ -1596,6 +1609,85 @@ async fn test_cluster_queue_group_dispatch() {
 }
 
 #[test]
+fn a_relayed_message_carries_its_arrival_number() {
+    let mut buf = BytesMut::new();
+    assert!(super::protocol::encode_msg_full(
+        &mut buf,
+        "news",
+        "{}",
+        Some((7, 3)),
+        Some(41),
+        false
+    ));
+    assert_eq!(
+        decode_frame(buf),
+        Some(ClusterFrame::Msg {
+            topic: "news".into(),
+            payload: Bytes::from("{}"),
+            recovery: Some((7, 3)),
+            arrival: Some(41),
+        })
+    );
+    // With no position (its origin had no room to keep it), and compressed.
+    let payload = "x".repeat(4096);
+    let mut buf = BytesMut::new();
+    assert!(super::protocol::encode_msg_full(
+        &mut buf,
+        "news",
+        &payload,
+        None,
+        Some(42),
+        true
+    ));
+    let Some(ClusterFrame::Msg {
+        payload: got,
+        recovery,
+        arrival,
+        ..
+    }) = decode_frame(buf)
+    else {
+        panic!("not a MSG frame");
+    };
+    assert_eq!((recovery, arrival), (None, Some(42)));
+    assert_eq!(got, Bytes::from(payload));
+}
+
+#[test]
+fn a_catch_up_says_how_far_it_covers_and_a_request_what_was_heard() {
+    let mut buf = BytesMut::new();
+    super::protocol::encode_caught_up(&mut buf, 1234);
+    assert_eq!(
+        decode_frame(buf),
+        Some(ClusterFrame::CaughtUp { through: 1234 })
+    );
+    let frames = encode_resume(&[], &[("news".to_owned(), 5)], Some(77));
+    let heard: Vec<Option<u64>> = frames
+        .into_iter()
+        .map(|frame| match decode_frame(frame) {
+            Some(ClusterFrame::Resume { heard, .. }) => heard,
+            other => panic!("not a RESUME frame: {other:?}"),
+        })
+        .collect();
+    assert!(heard.contains(&Some(77)), "{heard:?}");
+}
+
+#[test]
+fn what_was_heard_of_a_peer_stops_at_a_shed_message_until_the_next_catch_up() {
+    let heard = Heard::default();
+    heard.live(3);
+    heard.live(5);
+    assert_eq!(heard.asked(), 5);
+    heard.shed();
+    heard.live(9);
+    heard.caught_up(9);
+    // The next catch-up starts before the one shed, and counts from there.
+    assert_eq!(heard.asked(), 5);
+    heard.caught_up(12);
+    heard.live(13);
+    assert_eq!(heard.asked(), 13);
+}
+
+#[test]
 fn lost_frame_round_trips() {
     let mut buf = BytesMut::new();
     assert!(super::protocol::encode_lost(&mut buf, "prices:*"));
@@ -1619,6 +1711,7 @@ async fn dispatch_channel_is_bounded_and_sheds_when_full() {
             tx.try_send(DispatchItem::Message(
                 "t".to_string(),
                 Bytes::from_static(b"p"),
+                None,
                 None
             ))
             .is_ok(),
@@ -1630,6 +1723,7 @@ async fn dispatch_channel_is_bounded_and_sheds_when_full() {
         tx.try_send(DispatchItem::Message(
             "t".to_string(),
             Bytes::from_static(b"p"),
+            None,
             None
         ))
         .is_err(),

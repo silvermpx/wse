@@ -127,20 +127,17 @@ pub(super) async fn process_commands(
                 // neither stamped nor stored.
                 let original = Bytes::from(data);
                 let mut position = None;
+                let mut seq = 0;
                 let stamped: Bytes = if !skip_recovery && let Some(ref recovery) = state.recovery {
                     let text = std::str::from_utf8(&original).unwrap_or("");
-                    let stamp = |epoch, offset| {
+                    // One for this server's subscribers only goes in a stream
+                    // of its own, never sent to another node.
+                    let (kept, arrival) = recovery.stamp(&topic, !publish, |epoch, offset| {
                         position = Some((epoch, offset));
                         Bytes::from(stamp_recovery_fields(text, &topic, epoch, offset))
-                    };
-                    // One for this server's subscribers only is never sent
-                    // to another node, in a catch-up either.
-                    if publish {
-                        recovery.push_stamped(&topic, stamp)
-                    } else {
-                        recovery.push_stamped_local(&topic, stamp)
-                    }
-                    .unwrap_or_else(|| original.clone())
+                    });
+                    seq = arrival;
+                    kept.unwrap_or_else(|| original.clone())
                 } else {
                     original.clone()
                 };
@@ -149,6 +146,7 @@ pub(super) async fn process_commands(
                         topic: topic.clone(),
                         payload: String::from_utf8_lossy(&stamped).into_owned(),
                         position,
+                        seq,
                     });
                 }
                 // Per-topic message count for the Prometheus top-N metrics.

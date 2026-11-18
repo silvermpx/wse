@@ -33,18 +33,20 @@ pub(crate) use producers::ProducerLinks;
 pub(crate) use protocol::encode_presence_full;
 pub(crate) use protocol::{
     ClusterFrame, PRESENCE_ROUND, PRESENCE_ROUND_FIRST, PRESENCE_ROUND_LAST, ResumePoint,
-    ResumeTopic, decode_frame, encode_drain, encode_hello, encode_msg, encode_msg_compressed,
-    encode_msg_with_recovery, encode_peer_announce, encode_peer_list, encode_ping, encode_pong,
-    encode_presence_round, encode_presence_update, encode_replayed, encode_resume, encode_resync,
-    encode_shutdown, encode_sub, encode_unsub, negotiate_capabilities, negotiate_version,
+    ResumeTopic, decode_frame, encode_drain, encode_hello, encode_msg_full, encode_peer_announce,
+    encode_peer_list, encode_ping, encode_pong, encode_presence_round, encode_presence_update,
+    encode_replayed, encode_resume, encode_resync, encode_shutdown, encode_sub, encode_unsub,
+    negotiate_capabilities, negotiate_version,
 };
+#[cfg(test)]
+pub(crate) use protocol::{encode_msg, encode_msg_compressed, encode_msg_with_recovery};
 pub(crate) use tls::{ClusterTlsConfig, build_cluster_tls, build_cluster_tls_from_secret};
 #[cfg(test)]
 use types::Links;
 pub(crate) use types::{
-    ClusterCommand, ClusterContext, ClusterDlq, ClusterDlqEntry, ClusterMetrics, InterestUpdate,
-    Link, LinkRefused, PeerInfo, PeerInterest, PeerRegistration, PresencePeerFrame, RoundPart,
-    claim_link, release_link,
+    ClusterCommand, ClusterContext, ClusterDlq, ClusterDlqEntry, ClusterMetrics, Heard,
+    InterestUpdate, Link, LinkRefused, PeerInfo, PeerInterest, PeerRegistration, PresencePeerFrame,
+    RoundPart, claim_link, release_link,
 };
 
 use std::sync::atomic::AtomicU64;
@@ -123,6 +125,13 @@ pub(crate) const CAP_PRODUCERS: u32 = 1 << 5;
 /// began, and the other sends what it published to them since (a stream
 /// begun while the link was down). Offered with CAP_RESUME.
 pub(crate) const CAP_RESUME_TOPICS: u32 = 1 << 6;
+/// The catch-up starts where the node left off: each message it relays
+/// carries its number in the arrival order of the node that published it
+/// (MSG flag `0x08`); a node names the last one it heard of the other
+/// (RESUME), and gets what came after it, what of that is no longer held
+/// (LOST), and up to where the catch-up covers (CAUGHT_UP). Offered with
+/// CAP_RESUME_TOPICS.
+pub(crate) const CAP_ARRIVAL: u32 = 1 << 7;
 
 /// Our capabilities bitmask
 pub(crate) const LOCAL_CAPABILITIES: u32 =
@@ -133,7 +142,7 @@ pub(crate) const LOCAL_CAPABILITIES: u32 =
 /// to send what came after).
 pub(crate) fn local_capabilities(ctx: &ClusterContext) -> u32 {
     if ctx.recovery.is_some() {
-        LOCAL_CAPABILITIES | CAP_RESUME | CAP_RESUME_TOPICS
+        LOCAL_CAPABILITIES | CAP_RESUME | CAP_RESUME_TOPICS | CAP_ARRIVAL
     } else {
         LOCAL_CAPABILITIES
     }
@@ -141,11 +150,13 @@ pub(crate) fn local_capabilities(ctx: &ClusterContext) -> u32 {
 
 // Per-frame flags of MSG frames (the flags byte of the frame header)
 // bit 0: compressed (zstd), bit 1: has recovery trailer, bit 2: sent again
-// for a peer that missed it (catch-up), bits 3-7: reserved.
+// for a peer that missed it (catch-up), bit 3: has the origin's arrival
+// number (8 bytes after the recovery trailer), bits 4-7: reserved.
 // PRESENCE_FULL frames carry their sync round bits there (protocol.rs).
 const FLAG_COMPRESSED: u8 = 0x01;
 const FLAG_HAS_RECOVERY: u8 = 0x02;
 const FLAG_REPLAYED: u8 = 0x04;
+const FLAG_ARRIVAL: u8 = 0x08;
 /// How long a new link waits for the peer's RESUME request.
 const RESUME_TIMEOUT: Duration = Duration::from_secs(5);
 /// Positions a RESUME request may name: more than any node's recovery
@@ -155,12 +166,16 @@ const MAX_RESUME_POINTS: usize = 1 << 20;
 /// What a peer's reader hands its dispatch task, in the order it read it.
 enum DispatchItem {
     /// A message of a topic, relayed or replayed: with its origin's
-    /// recovery position when it has one.
-    Message(String, Bytes, Option<(u32, u64)>),
+    /// recovery position when it has one, and a relayed one with its number
+    /// in the origin's arrival order (CAP_ARRIVAL).
+    Message(String, Bytes, Option<(u32, u64)>, Option<u64>),
     /// Messages of a topic (or of each topic a pattern matches) were
     /// published on the peer that no node holds: after what was replayed
     /// before it.
     Lost(String),
+    /// The peer's catch-up covers what it published up to this arrival:
+    /// once what came before it is delivered.
+    CaughtUp(u64),
 }
 
 // Minimum payload size for compression to be worthwhile (bytes).

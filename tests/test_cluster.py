@@ -15,6 +15,7 @@ import time
 import pytest
 
 from tests.conftest import _next_port
+from tests.test_transport import metric
 from wse_server import RustWSEServer
 
 # Every link is TLS: from this secret, unless a test gives certificates.
@@ -546,6 +547,266 @@ def test_a_message_published_to_one_nodes_subscribers_stays_there_through_a_catc
 
     seen = asyncio.run(scenario())
     assert "news" not in seen, seen
+
+
+def _recovered_both_ways(relay, anchor, websockets):
+    """What a client of the relay whose last message was `anchor` is told,
+    by its scalar position and by its streams: (answer, the numbers it got)."""
+
+    async def ask():
+        told = []
+        for streams in ({}, {"streams": {anchor["e"]: anchor["o"]}}):
+            async with websockets.connect(f"ws://127.0.0.1:{relay.port}/wse") as back:
+                conn_id = await next_connect(relay)
+                past = {"epoch": anchor["e"], "offset": anchor["o"], **streams}
+                answer = relay.server.subscribe_with_recovery(
+                    conn_id, ["news"], recover=True, positions={"news": past}
+                )["topics"]["news"]
+                got = await messages_of_type(back, "news", answer["count"]) if answer["count"] else []
+                told.append((answer, [m["p"]["n"] for m in got]))
+        return told
+
+    return ask()
+
+
+async def _after_an_outage(origin, relay, during, websockets, *, origin_reads=("news",)):
+    """The relay's client takes a message of its own (the anchor); the link
+    goes, `during(origin)` runs, the link comes back and a barrier says the
+    nodes talk again. The anchor, and what the relay's client got meanwhile."""
+    blink = Blink(origin)
+    await blink.start()
+    try:
+        relay.join(blink)
+        await until(lambda: origin.peers == 1 and relay.peers == 1)
+        async with (
+            websockets.connect(f"ws://127.0.0.1:{relay.port}/wse") as live,
+            websockets.connect(f"ws://127.0.0.1:{origin.port}/wse") as source,
+        ):
+            await subscribe_next_client(relay, ["news", "barrier"])
+            await subscribe_next_client(origin, list(origin_reads))
+            await asyncio.sleep(0.35)  # the SUB reaches the origin
+            relay.server.broadcast_local("news", json.dumps({"t": "news", "p": {"n": -1}}))
+            (anchor,) = await messages_of_type(live, "news", 1)
+            blink.cut()
+            await until(lambda: origin.peers == 0 and relay.peers == 0)
+            await during(origin, source)
+            blink.open = True
+            await until(lambda: origin.peers == 1 and relay.peers == 1, timeout=20.0)
+            await asyncio.sleep(0.4)
+            origin.server.broadcast("barrier", json.dumps({"t": "barrier", "p": {"n": 0}}))
+            got = []
+            while True:
+                frame = await asyncio.wait_for(live.recv(), 5)
+                text = frame if isinstance(frame, str) else frame.decode(errors="replace")
+                message = json.loads(text[text.index("{") :])
+                if message.get("t") == "barrier":
+                    break
+                if message.get("t") == "news":
+                    got.append(message["p"]["n"])
+            return anchor, got, blink
+    except BaseException:
+        blink.close()
+        raise
+
+
+def test_a_stream_begun_while_a_link_was_down_and_longer_than_its_history_is_never_said_recovered(nodes):
+    """Seventeen messages, of a stream the other node never heard of, into a
+    history of sixteen: the other node's clients get the sixteen kept, and
+    one whose last message came before them is not told it missed nothing."""
+    websockets = pytest.importorskip("websockets")
+    origin = nodes(recovery=True, recovery_buffer_size=16)
+    relay = nodes(recovery=True)
+    origin.join()
+
+    async def seventeen(origin, source):
+        for n in range(17):
+            origin.server.broadcast("news", json.dumps({"t": "news", "p": {"n": n}}))
+        await messages_of_type(source, "news", 17)
+
+    async def scenario():
+        anchor, got, blink = await _after_an_outage(origin, relay, seventeen, websockets)
+        try:
+            return got, await _recovered_both_ways(relay, anchor, websockets)
+        finally:
+            blink.close()
+
+    got, told = asyncio.run(scenario())
+    assert got == list(range(1, 17))
+    for answer, numbers in told:
+        assert answer["recovered"] is False or numbers == list(range(17)), answer
+
+
+def test_a_message_for_the_cluster_keeps_its_place_whatever_is_published_locally(nodes):
+    """While the link is down, one message for the cluster, then sixteen for
+    the origin's own subscribers, into a history of sixteen: the local ones
+    have a stream of their own, and the other node recovers the one."""
+    websockets = pytest.importorskip("websockets")
+    origin = nodes(recovery=True, recovery_buffer_size=16)
+    relay = nodes(recovery=True)
+    origin.join()
+
+    async def one_then_local(origin, source):
+        origin.server.broadcast("news", json.dumps({"t": "news", "p": {"n": 0}}))
+        for n in range(1, 17):
+            origin.server.broadcast_local("news", json.dumps({"t": "news", "p": {"n": n}}))
+        await messages_of_type(source, "news", 17)
+
+    async def scenario():
+        anchor, got, blink = await _after_an_outage(origin, relay, one_then_local, websockets)
+        try:
+            return got, await _recovered_both_ways(relay, anchor, websockets)
+        finally:
+            blink.close()
+
+    got, told = asyncio.run(scenario())
+    assert got == [0]
+    for answer, numbers in told:
+        assert answer["recovered"] is True and numbers == [0], answer
+
+
+def test_a_message_published_locally_between_two_for_the_cluster_leaves_no_hole(nodes):
+    """The other node gets the two for the cluster, and recovers the second
+    from the first: the local one is no gap in the cluster's stream."""
+    websockets = pytest.importorskip("websockets")
+    origin, relay = nodes(recovery=True), nodes(recovery=True)
+    origin.join()
+    relay.join(origin)
+
+    async def scenario():
+        await until(lambda: origin.peers == 1 and relay.peers == 1)
+        async with websockets.connect(f"ws://127.0.0.1:{relay.port}/wse") as live:
+            await subscribe_next_client(relay, ["news"])
+            await asyncio.sleep(0.35)
+            origin.server.broadcast("news", json.dumps({"t": "news", "p": {"n": 0}}))
+            (anchor,) = await messages_of_type(live, "news", 1)
+            origin.server.broadcast_local("news", json.dumps({"t": "news", "p": {"n": 1}}))
+            origin.server.broadcast("news", json.dumps({"t": "news", "p": {"n": 2}}))
+            got = await messages_of_type(live, "news", 1)
+        return anchor, [m["p"]["n"] for m in got], await _recovered_both_ways(relay, anchor, websockets)
+
+    anchor, got, told = asyncio.run(scenario())
+    assert got == [2]
+    for answer, numbers in told:
+        assert answer["recovered"] is True and numbers == [2], answer
+
+
+def test_a_second_empty_outage_tells_no_loss_again(nodes):
+    """A loss the other node was told of once is not told again after a
+    later outage in which nothing was lost: a client past it recovers."""
+    websockets = pytest.importorskip("websockets")
+    origin = nodes(recovery=True, recovery_memory_budget=1)
+    relay = nodes(recovery=True)
+    origin.join()
+
+    async def unkept(origin, source):
+        origin.server.broadcast_local("other", json.dumps({"t": "other", "p": {}}))
+        await messages_of_type(source, "other", 1)
+        origin.server.broadcast("news", json.dumps({"t": "news", "p": {"n": 2}}))
+        await messages_of_type(source, "news", 1)
+
+    async def scenario():
+        anchor, _, blink = await _after_an_outage(
+            origin, relay, unkept, websockets, origin_reads=("news", "other")
+        )
+        try:
+            first = await _recovered_both_ways(relay, anchor, websockets)
+            async with websockets.connect(f"ws://127.0.0.1:{relay.port}/wse") as live:
+                await subscribe_next_client(relay, ["news"])
+                relay.server.broadcast_local("news", json.dumps({"t": "news", "p": {"n": 4}}))
+                (later,) = await messages_of_type(live, "news", 1)
+            blink.cut()
+            await until(lambda: origin.peers == 0 and relay.peers == 0)
+            blink.open = True
+            await until(lambda: origin.peers == 1 and relay.peers == 1, timeout=20.0)
+            await asyncio.sleep(0.4)
+            return first, await _recovered_both_ways(relay, later, websockets)
+        finally:
+            blink.close()
+
+    first, second = asyncio.run(scenario())
+    assert [answer["recovered"] for answer, _ in first] == [False, False]
+    assert [answer["recovered"] for answer, _ in second] == [True, True], second
+
+
+def test_a_loss_whose_record_the_origin_let_go_is_still_never_said_recovered(nodes):
+    """The origin could not keep a message while the link was down, and the
+    link came back only after the origin let its record of that go: the
+    other node's client is not told it missed nothing."""
+    websockets = pytest.importorskip("websockets")
+    origin = nodes(recovery=True, recovery_ttl=1, recovery_memory_budget=1)
+    relay = nodes(recovery=True, recovery_ttl=1)
+    origin.join()
+
+    async def unkept_then_forgotten(origin, source):
+        origin.server.broadcast_local("other", json.dumps({"t": "other", "p": {}}))
+        await messages_of_type(source, "other", 1)
+        origin.server.broadcast("news", json.dumps({"t": "news", "p": {"n": 2}}))
+        await messages_of_type(source, "news", 1)
+        # The origin's cleanup runs every 30 s: its history and its record go.
+        deadline = time.monotonic() + 70
+        while metric(origin.server, "wse_recovery_bytes") and time.monotonic() < deadline:
+            # The relay's own history stays fresh meanwhile.
+            relay.server.broadcast_local("news", json.dumps({"t": "news", "p": {"n": 10}}))
+            await asyncio.sleep(0.5)
+        await asyncio.sleep(0.5)
+
+    async def scenario():
+        anchor, _, blink = await _after_an_outage(
+            origin, relay, unkept_then_forgotten, websockets, origin_reads=("news", "other")
+        )
+        try:
+            return await _recovered_both_ways(relay, anchor, websockets)
+        finally:
+            blink.close()
+
+    for answer, numbers in asyncio.run(scenario()):
+        assert answer["recovered"] is False or 2 in numbers, answer
+
+
+def test_a_relayed_stream_whose_history_went_is_not_delivered_again_after_a_lost_link(nodes):
+    """A client stays subscribed through a lost link while the relay lets its
+    history of the stream go: the catch-up brings what the client did not
+    have, and nothing it had a second time."""
+    websockets = pytest.importorskip("websockets")
+    origin = nodes(recovery=True, recovery_ttl=1)
+    relay = nodes(recovery=True, recovery_ttl=1)
+    origin.join()
+
+    def price(n):
+        return json.dumps({"t": "price", "p": {"n": n}})
+
+    async def scenario():
+        blink = Blink(origin)
+        await blink.start()
+        try:
+            relay.join(blink)
+            await until(lambda: origin.peers == 1 and relay.peers == 1)
+            async with websockets.connect(f"ws://127.0.0.1:{relay.port}/wse") as live:
+                await subscribe_next_client(relay, ["prices:*"])
+                await asyncio.sleep(0.35)
+                origin.server.broadcast("prices:open", price(0))
+                got = await messages_of_type(live, "price", 1)
+                blink.cut()
+                await until(lambda: origin.peers == 0 and relay.peers == 0)
+                n = 1
+                deadline = time.monotonic() + 70
+                # The relay lets its idle history of the stream go.
+                while metric(relay.server, "wse_recovery_bytes") and time.monotonic() < deadline:
+                    origin.server.broadcast("prices:open", price(n))
+                    n += 1
+                    await asyncio.sleep(0.5)
+                blink.open = True
+                await until(lambda: origin.peers == 1 and relay.peers == 1, timeout=20.0)
+                await asyncio.sleep(0.4)
+                origin.server.broadcast("prices:open", price(n))
+                while got[-1]["p"]["n"] != n:
+                    got.extend(await messages_of_type(live, "price", 1))
+            return [m["p"]["n"] for m in got], n
+        finally:
+            blink.close()
+
+    numbers, last = asyncio.run(scenario())
+    assert numbers == list(range(last + 1)), numbers
 
 
 def test_a_message_its_origin_had_no_room_to_keep_is_never_said_recovered(nodes):

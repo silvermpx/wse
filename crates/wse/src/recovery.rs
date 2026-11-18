@@ -143,11 +143,6 @@ struct TopicRecoveryBuffer {
     key_len: usize,
     /// Timestamp of the most recent push.
     last_write: Instant,
-    /// The offsets of the messages published to this node's subscribers
-    /// only, oldest first: never sent to another node.
-    local: VecDeque<u64>,
-    /// It held a message published to other nodes too.
-    shared: bool,
 }
 
 impl TopicRecoveryBuffer {
@@ -171,8 +166,6 @@ impl TopicRecoveryBuffer {
             total_bytes: 0,
             key_len,
             last_write: Instant::now(),
-            local: VecDeque::new(),
-            shared: false,
         }
     }
 
@@ -187,33 +180,22 @@ impl TopicRecoveryBuffer {
     fn footprint(&self) -> usize {
         self.total_bytes
             + self.entries.capacity() * size_of::<(Bytes, u64)>()
-            + self.local.capacity() * size_of::<u64>()
             + self.key_len
             + BUFFER_OVERHEAD
     }
 
-    /// Push a message into the buffer, one published to this node's
-    /// subscribers only or to other nodes too. Returns the assigned offset.
+    /// Push a message into the buffer. Returns the assigned offset.
     ///
     /// When the buffer is full, the oldest entry is evicted.
-    fn push(&mut self, data: Bytes, seq: u64, local_only: bool) -> u64 {
-        if self.entries.len() >= self.capacity {
-            let evicted = self.tail_offset();
-            if let Some((old, old_seq)) = self.entries.pop_front() {
-                self.total_bytes -= old.len();
-                self.evicted_through = self.evicted_through.max(old_seq);
-            }
-            if self.local.front() == Some(&evicted) {
-                self.local.pop_front();
-            }
+    fn push(&mut self, data: Bytes, seq: u64) -> u64 {
+        if self.entries.len() >= self.capacity
+            && let Some((old, old_seq)) = self.entries.pop_front()
+        {
+            self.total_bytes -= old.len();
+            self.evicted_through = self.evicted_through.max(old_seq);
         }
 
         let offset = self.head_offset;
-        if local_only {
-            self.local.push_back(offset);
-        } else {
-            self.shared = true;
-        }
         self.total_bytes += data.len();
         self.entries.push_back((data, seq));
         self.head_offset += 1;
@@ -296,20 +278,16 @@ impl TopicRecoveryBuffer {
             .map_or(self.evicted_through, |(_, seq)| *seq)
     }
 
-    /// From offset `from` on, the messages held that went to other nodes
-    /// too: each one's offset, arrival number and bytes.
-    fn shared_from(&self, from: u64) -> impl Iterator<Item = (u64, u64, &Bytes)> {
+    /// From offset `from` on, the messages held: each one's offset,
+    /// arrival number and bytes.
+    fn held_from(&self, from: u64) -> impl Iterator<Item = (u64, u64, &Bytes)> {
         let tail = self.tail_offset();
         let from = from.max(tail);
-        let first_local = self.local.partition_point(|offset| *offset < from);
-        let mut local = self.local.range(first_local..).copied().peekable();
         self.entries
             .iter()
             .skip(usize::try_from(from - tail).unwrap_or(usize::MAX))
             .zip(from..)
-            .filter_map(move |((data, seq), offset)| {
-                (local.next_if_eq(&offset).is_none()).then_some((offset, *seq, data))
-            })
+            .map(|((data, seq), offset)| (offset, *seq, data))
     }
 
     /// The messages that arrived after `seq`; None when one of them was
@@ -338,22 +316,21 @@ impl TopicRecoveryBuffer {
 // even though the messages originated elsewhere.
 
 /// What this node no longer holds of a topic: the latest arrival among it,
-/// when the last of it went, and when the last went of what this node
-/// published to other nodes (None: none of that).
+/// when the last of it went, and the latest arrival among what it published
+/// to other nodes (0: none of that).
 #[derive(Clone, Copy)]
 struct Removed {
     through: u64,
     at: Instant,
-    shared_at: Option<Instant>,
+    shared_through: u64,
 }
 
 impl Removed {
     fn note(&mut self, seq: u64, shared: bool) {
-        let now = Instant::now();
         self.through = self.through.max(seq);
-        self.at = now;
+        self.at = Instant::now();
         if shared {
-            self.shared_at = Some(now);
+            self.shared_through = self.shared_through.max(seq);
         }
     }
 
@@ -361,7 +338,7 @@ impl Removed {
         Self {
             through: 0,
             at: Instant::now(),
-            shared_at: None,
+            shared_through: 0,
         }
     }
 }
@@ -715,7 +692,13 @@ impl ForeignRecoveryBuffer {
 // ---------------------------------------------------------------------------
 
 pub(crate) struct RecoveryManager {
+    /// This node's own stream of each topic: what it publishes to the whole
+    /// cluster.
     buffers: DashMap<String, TopicRecoveryBuffer>,
+    /// And of what it publishes to its own subscribers only: a stream of its
+    /// own, never sent to another node, so the other one has neither its
+    /// offsets nor its room.
+    local_buffers: DashMap<String, TopicRecoveryBuffer>,
     /// Foreign buffers: keyed by "topic:epoch" to support multiple origin epochs.
     foreign_buffers: DashMap<String, ForeignRecoveryBuffer>,
     /// The origin epochs each topic has a foreign buffer for: a topic
@@ -743,6 +726,10 @@ pub(crate) struct RecoveryManager {
     /// The latest arrival not kept of a topic that found no room among
     /// `MAX_UNKEPT_TOPICS`, and when: it counts for every topic.
     removed_any: parking_lot::Mutex<Option<Removed>>,
+    /// The latest arrival, among what this node published to other nodes,
+    /// of the records of what it no longer holds that it let go (0: none):
+    /// what a peer that did not hear of it may have missed is not known.
+    forgotten: AtomicU64,
     /// Per relayed stream with no buffer here ("topic\0epoch"), where this
     /// node stands in it.
     relayed_unkept: DashMap<String, Delivered>,
@@ -754,6 +741,7 @@ impl RecoveryManager {
     pub(crate) fn new(config: RecoveryConfig) -> Self {
         Self {
             buffers: DashMap::new(),
+            local_buffers: DashMap::new(),
             foreign_buffers: DashMap::new(),
             foreign_epochs: DashMap::new(),
             arrival: AtomicU64::new(1),
@@ -761,6 +749,7 @@ impl RecoveryManager {
             marks: parking_lot::Mutex::new(VecDeque::new()),
             removed_through: DashMap::new(),
             removed_any: parking_lot::Mutex::new(None),
+            forgotten: AtomicU64::new(0),
             relayed_unkept: DashMap::new(),
             config,
             total_bytes: AtomicUsize::new(0),
@@ -781,29 +770,39 @@ impl RecoveryManager {
     /// new buffer allocates its slots up front, and an application may
     /// publish to any number of new topics between two cleanups. The message
     /// then goes unstamped; its topic is recoverable once there is room.
+    #[cfg(test)]
     pub(crate) fn push_stamped<F>(&self, topic: &str, build: F) -> Option<Bytes>
     where
         F: FnOnce(u32, u64) -> Bytes,
     {
-        self.push_stamped_as(topic, false, build)
+        self.stamp(topic, false, build).0
     }
 
     /// `push_stamped` for a message published to this node's subscribers
-    /// only: kept for them, never sent to another node.
+    /// only: kept for them in a stream of its own, never sent to another
+    /// node.
+    #[cfg(test)]
     pub(crate) fn push_stamped_local<F>(&self, topic: &str, build: F) -> Option<Bytes>
     where
         F: FnOnce(u32, u64) -> Bytes,
     {
-        self.push_stamped_as(topic, true, build)
+        self.stamp(topic, true, build).0
     }
 
-    fn push_stamped_as<F>(&self, topic: &str, local_only: bool, build: F) -> Option<Bytes>
+    /// `push_stamped` or `push_stamped_local`, with the message's place in
+    /// this node's arrival order: the number other nodes hear it by.
+    pub(crate) fn stamp<F>(&self, topic: &str, local_only: bool, build: F) -> (Option<Bytes>, u64)
     where
         F: FnOnce(u32, u64) -> Bytes,
     {
+        let buffers = if local_only {
+            &self.local_buffers
+        } else {
+            &self.buffers
+        };
         let mut created = false;
         // A topic that has a buffer is found without making a key.
-        let mut entry = match self.buffers.get_mut(topic) {
+        let mut entry = match buffers.get_mut(topic) {
             Some(entry) => entry,
             None if self.total_bytes.load(Ordering::Relaxed)
                 >= self.config.global_memory_budget =>
@@ -812,9 +811,9 @@ impl RecoveryManager {
                 // before it cannot be told it missed nothing.
                 let seq = self.arrival.fetch_add(1, Ordering::Relaxed);
                 self.note_removed(topic, seq, !local_only);
-                return None;
+                return (None, seq);
             }
-            None => self.buffers.entry(topic.to_owned()).or_insert_with(|| {
+            None => buffers.entry(topic.to_owned()).or_insert_with(|| {
                 created = true;
                 TopicRecoveryBuffer::new(self.config.buffer_size_bits, topic.len())
             }),
@@ -826,11 +825,8 @@ impl RecoveryManager {
         let data = build(epoch, offset);
 
         let old_bytes = if created { 0 } else { buf.footprint() };
-        buf.push(
-            data.clone(),
-            self.arrival.fetch_add(1, Ordering::Relaxed),
-            local_only,
-        );
+        let seq = self.arrival.fetch_add(1, Ordering::Relaxed);
+        buf.push(data.clone(), seq);
         let new_bytes = buf.footprint();
 
         // Update global byte counter with the delta (accounts for evictions).
@@ -846,7 +842,7 @@ impl RecoveryManager {
                     Some(cur.saturating_sub(old_bytes - new_bytes))
                 });
         }
-        Some(data)
+        (Some(data), seq)
     }
 
     /// Push a pre-built message (recovery coordinates already woven in, or none).
@@ -1012,9 +1008,44 @@ impl RecoveryManager {
         if buf.epoch != epoch {
             return Vec::new();
         }
-        buf.shared_from(after.saturating_add(1))
+        buf.held_from(after.saturating_add(1))
             .map(|(offset, _, data)| (offset, data.clone()))
             .collect()
+    }
+
+    /// This node's own stream of `topic` whose epoch is `epoch`: the one it
+    /// publishes to the cluster, or the one of what it publishes to its own
+    /// subscribers only.
+    fn own_stream(
+        &self,
+        topic: &str,
+        epoch: u32,
+    ) -> Option<dashmap::mapref::one::Ref<'_, String, TopicRecoveryBuffer>> {
+        self.buffers
+            .get(topic)
+            .filter(|buf| buf.epoch == epoch)
+            .or_else(|| {
+                self.local_buffers
+                    .get(topic)
+                    .filter(|buf| buf.epoch == epoch)
+            })
+    }
+
+    /// This node's own streams of `topic`, one at a time: `each` sees the
+    /// cluster's, then the local one.
+    fn each_own<R>(
+        &self,
+        topic: &str,
+        mut each: impl FnMut(&TopicRecoveryBuffer) -> Option<R>,
+    ) -> Option<R> {
+        for own in [&self.buffers, &self.local_buffers] {
+            if let Some(buf) = own.get(topic)
+                && let Some(found) = each(&buf)
+            {
+                return Some(found);
+            }
+        }
+        None
     }
 
     /// Attempt to recover messages for a topic after a given offset.
@@ -1028,9 +1059,7 @@ impl RecoveryManager {
         // The stream of the client's last message: the local one, or one
         // relayed from another node, by its epoch. What it missed there, and
         // where that last message stands in this node's arrival order.
-        let anchored = if let Some(buf) = self.buffers.get(topic)
-            && buf.epoch == epoch
-        {
+        let anchored = if let Some(buf) = self.own_stream(topic, epoch) {
             let missed = buf
                 .head_offset
                 .saturating_sub(after_offset.saturating_add(1)) as usize;
@@ -1063,12 +1092,9 @@ impl RecoveryManager {
         };
         let Some((own, anchor_seq, head)) = anchored else {
             // No matching buffer found at all.
-            return match self.buffers.get(topic) {
+            return match self.each_own(topic, |buf| Some((buf.epoch, buf.head_offset))) {
                 // Local buffer exists but with different epoch -- tell client to re-subscribe.
-                Some(buf) => RecoveryResult::NotRecovered {
-                    epoch: buf.epoch,
-                    offset: buf.head_offset,
-                },
+                Some((epoch, offset)) => RecoveryResult::NotRecovered { epoch, offset },
                 None => RecoveryResult::NoHistory,
             };
         };
@@ -1096,10 +1122,7 @@ impl RecoveryManager {
                 .map_or(u64::MAX, |since| since.0);
             seq.is_some_and(|seq| seq >= since)
         };
-        let anchored_relayed = !self
-            .buffers
-            .get(topic)
-            .is_some_and(|buf| buf.epoch == epoch);
+        let anchored_relayed = self.own_stream(topic, epoch).is_none();
         let relays = self
             .foreign_epochs
             .get(topic)
@@ -1112,14 +1135,15 @@ impl RecoveryManager {
         // must still hold whole. Without that message here, nothing places
         // them: a stream with anything in it then cannot be recovered.
         let mut streams: Vec<Option<Vec<Arrived>>> = Vec::new();
-        if let Some(buf) = self.buffers.get(topic)
-            && buf.epoch != epoch
-        {
-            streams.push(match anchor_seq {
-                Some(seq) => buf.arrived_after(seq),
-                None => buf.entries.is_empty().then(Vec::new),
-            });
-        }
+        self.each_own(topic, |buf| {
+            if buf.epoch != epoch {
+                streams.push(match anchor_seq {
+                    Some(seq) => buf.arrived_after(seq),
+                    None => buf.entries.is_empty().then(Vec::new),
+                });
+            }
+            None::<()>
+        });
         let others: Vec<u32> = self
             .foreign_epochs
             .get(topic)
@@ -1190,9 +1214,7 @@ impl RecoveryManager {
         // Where the client's last message stands in this node's arrival
         // order, if it is here.
         let local_anchor = self
-            .buffers
-            .get(topic)
-            .filter(|buf| buf.epoch == anchor.0)
+            .own_stream(topic, anchor.0)
             .map(|buf| buf.seq_at(anchor.1));
         let anchor_seq = match local_anchor {
             Some(seq) => seq,
@@ -1212,7 +1234,7 @@ impl RecoveryManager {
         let mut head = anchor.1.saturating_add(1);
         let mut seen: Vec<u32> = Vec::with_capacity(foreign_epochs.len() + 1);
 
-        if let Some(buf) = self.buffers.get(topic) {
+        let failed = self.each_own(topic, |buf| {
             seen.push(buf.epoch);
             if buf.epoch == anchor.0 {
                 head = head.max(buf.head_offset);
@@ -1221,16 +1243,17 @@ impl RecoveryManager {
                 Some(offset) => {
                     missed += buf.head_offset.saturating_sub(offset.saturating_add(1)) as usize;
                     if missed > max {
-                        return not_recovered;
+                        return Some(());
                     }
                     buf.recover_since(offset, max)
                 }
                 None => anchor_seq.and_then(|seq| buf.whole_after(seq)),
             };
-            let Some(more) = more else {
-                return not_recovered;
-            };
-            streams.push(more);
+            streams.push(more?);
+            None
+        });
+        if failed.is_some() {
+            return not_recovered;
         }
 
         for epoch in foreign_epochs {
@@ -1301,18 +1324,27 @@ impl RecoveryManager {
         let last = |epoch: u32| before.iter().find(|(e, _)| *e == epoch).map(|(_, o)| *o);
         let mut streams: Vec<Vec<Arrived>> = Vec::new();
         let mut total = 0u64;
-        if let Some(buf) = self.buffers.get(topic) {
+        let gone = self.each_own(topic, |buf| {
             let more = match last(buf.epoch) {
                 Some(offset) => {
                     total += buf.head_offset.saturating_sub(offset.saturating_add(1));
-                    buf.recover_since(offset, max)?
+                    buf.recover_since(offset, max)
                 }
                 None => {
                     total += buf.head_offset;
-                    buf.whole_after(0)?
+                    buf.whole_after(0)
                 }
             };
-            streams.push(more);
+            match more {
+                Some(more) => {
+                    streams.push(more);
+                    None
+                }
+                None => Some(()),
+            }
+        });
+        if gone.is_some() {
+            return None;
         }
         let foreign_epochs: Vec<u32> = self
             .foreign_epochs
@@ -1347,11 +1379,12 @@ impl RecoveryManager {
     /// connection starts in each: what comes after reaches it live.
     pub(crate) fn streams(&self, topic: &str) -> Vec<(u32, u64)> {
         let mut streams = Vec::new();
-        if let Some(buf) = self.buffers.get(topic)
-            && buf.head_offset > 0
-        {
-            streams.push((buf.epoch, buf.head_offset - 1));
-        }
+        self.each_own(topic, |buf| {
+            if buf.head_offset > 0 {
+                streams.push((buf.epoch, buf.head_offset - 1));
+            }
+            None::<()>
+        });
         let foreign_epochs: Vec<u32> = self
             .foreign_epochs
             .get(topic)
@@ -1370,9 +1403,7 @@ impl RecoveryManager {
 
     /// Get the current (epoch, head_offset) for a topic, if a buffer exists.
     pub(crate) fn get_position(&self, topic: &str) -> Option<(u32, u64)> {
-        self.buffers
-            .get(topic)
-            .map(|buf| (buf.epoch, buf.head_offset))
+        self.each_own(topic, |buf| Some((buf.epoch, buf.head_offset)))
     }
 
     /// Evict stale topic buffers based on TTL and global memory budget.
@@ -1387,21 +1418,18 @@ impl RecoveryManager {
         // Windows), and a panic here would stop all eviction for good.
         let ttl = Duration::from_secs(self.config.history_ttl_secs);
 
-        // First pass: remove TTL-expired local buffers.
-        let mut to_remove = Vec::new();
-        for entry in self.buffers.iter() {
-            if entry.value().last_write.elapsed() > ttl {
-                to_remove.push(entry.key().clone());
-            }
-        }
-        for key in &to_remove {
-            if let Some((_, removed)) = self.buffers.remove(key) {
-                self.note_removed(key, removed.last_seq(), removed.shared);
-                let _ = self
-                    .total_bytes
-                    .try_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
-                        Some(cur.saturating_sub(removed.footprint()))
-                    });
+        // First pass: remove TTL-expired own buffers, the cluster's and the
+        // local ones.
+        for (own, shared) in [(&self.buffers, true), (&self.local_buffers, false)] {
+            let expired: Vec<String> = own
+                .iter()
+                .filter(|entry| entry.value().last_write.elapsed() > ttl)
+                .map(|entry| entry.key().clone())
+                .collect();
+            for key in &expired {
+                if let Some((_, removed)) = own.remove(key) {
+                    self.removed_own(key, &removed, shared);
+                }
             }
         }
 
@@ -1423,58 +1451,64 @@ impl RecoveryManager {
             }
         }
 
-        // Second pass: if still over budget, evict LRU across both local and foreign.
+        // Second pass: if still over budget, evict LRU across own and foreign.
         if self.total_bytes.load(Ordering::Relaxed) > self.config.global_memory_budget {
-            // Collect candidates from both maps. Tag with 'L' (local) or 'F' (foreign).
-            let mut candidates: Vec<(String, Instant, usize, bool)> = Vec::new();
-
-            for e in self.buffers.iter() {
-                candidates.push((
-                    e.key().clone(),
-                    e.value().last_write,
-                    e.value().footprint(),
-                    true, // is_local
-                ));
+            /// Which map a candidate is in.
+            #[derive(Clone, Copy)]
+            enum Held {
+                Shared,
+                Local,
+                Foreign,
+            }
+            let mut candidates: Vec<(String, Instant, Held)> = Vec::new();
+            for (own, held) in [
+                (&self.buffers, Held::Shared),
+                (&self.local_buffers, Held::Local),
+            ] {
+                for e in own.iter() {
+                    candidates.push((e.key().clone(), e.value().last_write, held));
+                }
             }
             for e in self.foreign_buffers.iter() {
-                candidates.push((
-                    e.key().clone(),
-                    e.value().last_write,
-                    e.value().footprint(),
-                    false, // is_foreign
-                ));
+                candidates.push((e.key().clone(), e.value().last_write, Held::Foreign));
             }
 
             // Sort by last_write ascending (oldest first).
-            candidates.sort_by_key(|(_, lw, _, _)| *lw);
+            candidates.sort_by_key(|(_, lw, _)| *lw);
 
-            for (key, _, _, is_local) in candidates {
+            for (key, _, held) in candidates {
                 if self.total_bytes.load(Ordering::Relaxed) <= self.config.global_memory_budget {
                     break;
                 }
-                if is_local {
-                    if let Some((_, removed)) = self.buffers.remove(&key) {
-                        self.note_removed(&key, removed.last_seq(), removed.shared);
-                        let _ = self.total_bytes.try_update(
-                            Ordering::Relaxed,
-                            Ordering::Relaxed,
-                            |cur| Some(cur.saturating_sub(removed.footprint())),
-                        );
+                match held {
+                    Held::Shared | Held::Local => {
+                        let (own, shared) = match held {
+                            Held::Shared => (&self.buffers, true),
+                            _ => (&self.local_buffers, false),
+                        };
+                        if let Some((_, removed)) = own.remove(&key) {
+                            self.removed_own(&key, &removed, shared);
+                        }
                     }
-                } else if let Some(removed) = self.remove_foreign(&key) {
-                    self.note_removed(foreign_topic(&key), removed.last_seq(), false);
-                    let _ =
-                        self.total_bytes
-                            .try_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
-                                Some(cur.saturating_sub(removed.footprint()))
-                            });
+                    Held::Foreign => {
+                        if let Some(removed) = self.remove_foreign(&key) {
+                            self.note_removed(foreign_topic(&key), removed.last_seq(), false);
+                            let _ = self.total_bytes.try_update(
+                                Ordering::Relaxed,
+                                Ordering::Relaxed,
+                                |cur| Some(cur.saturating_sub(removed.footprint())),
+                            );
+                        }
+                    }
                 }
             }
         }
 
         // A topic with no buffer left recovers nothing here: what was removed
         // of it matters to a peer that asks after a lost link, within the
-        // history's lifetime.
+        // history's lifetime. One let go of what went to the cluster is
+        // remembered as forgotten: a peer that did not hear of it cannot be
+        // told what it missed.
         let gone: Vec<String> = self
             .removed_through
             .iter()
@@ -1482,21 +1516,40 @@ impl RecoveryManager {
                 let topic = entry.key();
                 entry.value().at.elapsed() > ttl
                     && !self.buffers.contains_key(topic)
+                    && !self.local_buffers.contains_key(topic)
                     && !self.foreign_epochs.contains_key(topic)
             })
             .map(|entry| entry.key().clone())
             .collect();
         for topic in gone {
-            self.removed_through.remove(&topic);
+            if let Some((_, removed)) = self.removed_through.remove(&topic) {
+                self.forgotten
+                    .fetch_max(removed.shared_through, Ordering::Relaxed);
+            }
         }
         let mut any = self.removed_any.lock();
-        if any.is_some_and(|removed| removed.at.elapsed() > ttl) {
+        if let Some(removed) = *any
+            && removed.at.elapsed() > ttl
+        {
+            self.forgotten
+                .fetch_max(removed.shared_through, Ordering::Relaxed);
             *any = None;
         }
         drop(any);
         self.relayed_unkept
             .retain(|_, delivered| delivered.at.elapsed() <= ttl);
         self.trim_marks();
+    }
+
+    /// An own buffer of `topic` went (expired, or over the budget): what it
+    /// held is no longer here, and its bytes are given back.
+    fn removed_own(&self, topic: &str, removed: &TopicRecoveryBuffer, shared: bool) {
+        self.note_removed(topic, removed.last_seq(), shared);
+        let _ = self
+            .total_bytes
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
+                Some(cur.saturating_sub(removed.footprint()))
+            });
     }
 
     /// The latest arrival of `topic` this node no longer holds, the one of
@@ -1511,32 +1564,49 @@ impl RecoveryManager {
     }
 
     /// The topics a peer that has `topic` (a name, or a pattern of them)
-    /// since `age` ago must hear this node no longer holds, or never could,
-    /// what it published to other nodes of meanwhile: none, the topic, each
-    /// topic the pattern matches, or the pattern itself for one that counts
-    /// for every topic.
-    pub(crate) fn lost_lately(&self, topic: &str, age: Duration) -> Vec<String> {
-        let since = Instant::now().checked_sub(age.saturating_add(LATELY_MARGIN));
-        let lately = |removed: &Removed| {
-            removed
-                .shared_at
-                .is_some_and(|at| since.is_none_or(|since| at >= since))
-        };
-        if self.removed_any.lock().as_ref().is_some_and(lately) {
+    /// must hear this node no longer holds, or never could, a message it
+    /// published to the cluster after arrival `after` of: none, the topic,
+    /// each topic the pattern matches, or the pattern itself when what was
+    /// let go counts for every topic.
+    pub(crate) fn lost_after(&self, topic: &str, after: u64) -> Vec<String> {
+        let any = self
+            .removed_any
+            .lock()
+            .map_or(0, |removed| removed.shared_through);
+        if any.max(self.forgotten.load(Ordering::Relaxed)) > after {
             return vec![topic.to_owned()];
         }
         if crate::server::is_pattern(topic) {
-            return self
+            let mut lost: Vec<String> = self
                 .removed_through
                 .iter()
-                .filter(|entry| lately(entry.value()))
+                .filter(|entry| entry.value().shared_through > after)
                 .filter(|entry| crate::server::glob_match(topic, entry.key()))
                 .map(|entry| entry.key().clone())
+                .chain(
+                    self.buffers
+                        .iter()
+                        .filter(|entry| entry.value().evicted_through > after)
+                        .filter(|entry| crate::server::glob_match(topic, entry.key()))
+                        .map(|entry| entry.key().clone()),
+                )
                 .collect();
+            lost.sort_unstable();
+            lost.dedup();
+            return lost;
         }
-        match self.removed_through.get(topic) {
-            Some(entry) if lately(&entry) => vec![topic.to_owned()],
-            _ => Vec::new(),
+        let removed = self
+            .removed_through
+            .get(topic)
+            .is_some_and(|removed| removed.shared_through > after);
+        let evicted = self
+            .buffers
+            .get(topic)
+            .is_some_and(|buf| buf.evicted_through > after);
+        if removed || evicted {
+            vec![topic.to_owned()]
+        } else {
+            Vec::new()
         }
     }
 
@@ -1551,6 +1621,7 @@ impl RecoveryManager {
             .buffers
             .iter()
             .map(|entry| entry.key().clone())
+            .chain(self.local_buffers.iter().map(|entry| entry.key().clone()))
             .chain(self.foreign_epochs.iter().map(|entry| entry.key().clone()))
             .chain(self.interest_since.iter().map(|entry| entry.key().clone()))
             .filter(|name| {
@@ -1664,29 +1735,41 @@ impl RecoveryManager {
             .collect()
     }
 
-    /// What this node published to `topic` in the last `age` (and a little
-    /// before), with its stream's epoch and each message's offset, for a peer
-    /// that has the topic but never heard of the stream: None when this node
-    /// publishes none to it, or the peer named it (`named`).
-    pub(crate) fn published_lately(
+    /// What this node published to the cluster of `topic` after arrival
+    /// `after`, with its stream's epoch and each message's offset, for a peer
+    /// that did not hear it: None when this node publishes none to it, or the
+    /// peer named the stream (`named`).
+    pub(crate) fn published_unheard(
         &self,
         topic: &str,
-        age: Duration,
+        after: u64,
         named: impl Fn(u32) -> bool,
     ) -> Option<(u32, Vec<(u64, Bytes)>)> {
-        let since = Instant::now()
-            .checked_sub(age.saturating_add(LATELY_MARGIN))
-            .map_or(0, |at| self.arrival_at(at));
         let buf = self.buffers.get(topic)?;
         if named(buf.epoch) {
             return None;
         }
         let messages = buf
-            .shared_from(0)
-            .filter(|(_, seq, _)| *seq >= since)
+            .held_from(0)
+            .filter(|(_, seq, _)| *seq > after)
             .map(|(offset, _, data)| (offset, data.clone()))
             .collect();
         Some((buf.epoch, messages))
+    }
+
+    /// The last arrival number given out: everything up to it is in this
+    /// node's history, or was let go of and recorded so.
+    pub(crate) fn arrived_through(&self) -> u64 {
+        self.arrival.load(Ordering::Acquire).saturating_sub(1)
+    }
+
+    /// The last arrival number given out before `age` ago (and a little
+    /// before it), to a mark: what a peer whose interest began then could
+    /// not have heard of comes after it.
+    pub(crate) fn arrived_before(&self, age: Duration) -> u64 {
+        Instant::now()
+            .checked_sub(age.saturating_add(LATELY_MARGIN))
+            .map_or(0, |at| self.arrival_at(at).saturating_sub(1))
     }
 
     /// This node no longer has `topic`: its relayed streams stop.
@@ -1826,7 +1909,7 @@ mod tests {
     fn test_push_recover_roundtrip() {
         let mut buf = TopicRecoveryBuffer::new(4, 0); // 16 slots
         for i in 0..5 {
-            buf.push(make_data(&format!("msg{i}")), i + 1, false);
+            buf.push(make_data(&format!("msg{i}")), i + 1);
         }
 
         // Recover from offset 2 (should get messages at offsets 3 and 4).
@@ -1840,7 +1923,7 @@ mod tests {
     fn test_buffer_overflow() {
         let mut buf = TopicRecoveryBuffer::new(2, 0); // 4 slots
         for i in 0..10 {
-            buf.push(make_data(&format!("msg{i}")), i + 1, false);
+            buf.push(make_data(&format!("msg{i}")), i + 1);
         }
 
         // Tail should have advanced. head=10, tail=6.
@@ -2625,9 +2708,10 @@ mod tests {
     }
 
     #[test]
-    fn a_peer_hears_what_was_not_kept_since_its_interest_began() {
+    fn a_peer_hears_what_it_did_not_hear_of_and_this_node_no_longer_holds() {
         // No room for any history.
         let mgr = with_budget(RecoveryManager::new(RecoveryConfig::default()), 0);
+        let heard = mgr.arrived_through();
         for topic in ["news", "prices:a"] {
             assert!(mgr.push_stamped(topic, |_, _| make_data("x")).is_none());
         }
@@ -2639,62 +2723,100 @@ mod tests {
         );
         mgr.push_foreign("theirs", make_data("x"), 0xf, 0);
         mgr.not_kept("told");
-        let minute = Duration::from_secs(60);
-        assert_eq!(mgr.lost_lately("news", minute), ["news"]);
-        assert_eq!(mgr.lost_lately("prices:*", minute), ["prices:a"]);
+        assert_eq!(mgr.lost_after("news", heard), ["news"]);
+        assert_eq!(mgr.lost_after("prices:*", heard), ["prices:a"]);
         for topic in ["other", "mine", "theirs", "told"] {
-            assert!(mgr.lost_lately(topic, minute).is_empty(), "{topic}");
+            assert!(mgr.lost_after(topic, heard).is_empty(), "{topic}");
         }
-        // Not kept before the interest began (and its margin): nothing to say.
-        let long_ago = Instant::now()
-            .checked_sub(Duration::from_secs(600))
-            .unwrap();
-        mgr.removed_through.get_mut("news").unwrap().shared_at = Some(long_ago);
-        assert!(mgr.lost_lately("news", minute).is_empty());
+        // A peer that heard of everything up to now: nothing to say.
+        assert!(mgr.lost_after("news", mgr.arrived_through()).is_empty());
+    }
+
+    #[test]
+    fn a_message_the_ring_let_go_before_a_peer_heard_of_it_is_told() {
+        // Two slots a topic: the first of three goes.
+        let mgr = RecoveryManager::new(RecoveryConfig {
+            buffer_size_bits: 1,
+            ..RecoveryConfig::default()
+        });
+        let heard = mgr.arrived_through();
+        for text in ["a", "b", "c"] {
+            mgr.push("news", make_data(text));
+        }
+        assert_eq!(mgr.lost_after("news", heard), ["news"]);
+        assert_eq!(mgr.lost_after("n*", heard), ["news"]);
+        // One that heard of "a": nothing it missed is gone.
+        assert!(mgr.lost_after("news", heard + 1).is_empty());
+    }
+
+    #[test]
+    fn a_record_let_go_counts_for_every_topic_a_peer_did_not_hear_of_it_by() {
+        let mgr = RecoveryManager::new(RecoveryConfig {
+            history_ttl_secs: 0,
+            global_memory_budget: 0,
+            ..RecoveryConfig::default()
+        });
+        let heard = mgr.arrived_through();
+        assert!(mgr.push_stamped("news", |_, _| make_data("x")).is_none());
+        // The history's lifetime is over: the record goes, and is forgotten.
+        std::thread::sleep(Duration::from_millis(5));
+        mgr.cleanup();
+        assert!(!mgr.removed_through.contains_key("news"));
+        assert_eq!(mgr.lost_after("other", heard), ["other"]);
+        assert!(mgr.lost_after("other", mgr.arrived_through()).is_empty());
     }
 
     #[test]
     fn a_buffer_removed_is_told_to_peers_when_they_had_some_of_it() {
         let mgr = RecoveryManager::new(RecoveryConfig::default());
+        let heard = mgr.arrived_through();
         mgr.push("news", make_data("x"));
         mgr.push_stamped_local("mine", |_, _| make_data("x"));
         let mgr = with_budget(mgr, 0);
         mgr.cleanup();
         assert_eq!(mgr.topic_count(), 0);
-        let minute = Duration::from_secs(60);
-        assert_eq!(mgr.lost_lately("news", minute), ["news"]);
-        assert!(mgr.lost_lately("mine", minute).is_empty());
+        assert_eq!(mgr.lost_after("news", heard), ["news"]);
+        assert!(mgr.lost_after("mine", heard).is_empty());
     }
 
     #[test]
-    fn what_was_published_to_this_nodes_subscribers_only_is_never_sent_to_a_peer() {
-        // Two slots a topic.
+    fn what_was_published_to_this_nodes_subscribers_only_is_a_stream_of_its_own() {
+        // Two slots a stream.
         let mgr = RecoveryManager::new(RecoveryConfig {
             buffer_size_bits: 1,
             ..RecoveryConfig::default()
         });
-        mgr.push_stamped_local("news", |_, _| make_data("l0"));
+        mgr.push("news", make_data("s0"));
+        let (shared, _) = mgr.get_position("news").unwrap();
+        // Three local ones: in their own stream, which takes none of the
+        // cluster stream's offsets or room.
+        for text in ["l0", "l1", "l2"] {
+            mgr.push_stamped_local("news", |_, _| make_data(text));
+        }
         mgr.push("news", make_data("s1"));
-        let (epoch, _) = mgr.get_position("news").unwrap();
-        let sent = |after| mgr.published_after("news", epoch, after);
-        assert_eq!(sent(0), vec![(1, make_data("s1"))]);
-        let lately = |mgr: &RecoveryManager| {
-            mgr.published_lately("news", Duration::from_secs(60), |_| false)
-                .unwrap()
-                .1
-        };
-        assert_eq!(lately(&mgr), vec![(1, make_data("s1"))]);
-        // The local one evicted, another one in: from the oldest kept.
-        mgr.push_stamped_local("news", |_, _| make_data("l2"));
-        assert_eq!(sent(0), vec![(1, make_data("s1"))]);
-        mgr.push("news", make_data("s3"));
-        assert_eq!(sent(0), vec![(3, make_data("s3"))]);
-        assert_eq!(lately(&mgr), vec![(3, make_data("s3"))]);
-        // Its own subscribers recover all of it.
-        let RecoveryResult::Recovered { publications, .. } = mgr.recover("news", epoch, 1) else {
+        let streams = mgr.streams("news");
+        assert_eq!(streams.len(), 2);
+        assert!(streams.contains(&(shared, 1)));
+        let (local, _) = *streams.iter().find(|(e, _)| *e != shared).unwrap();
+        assert_eq!(
+            mgr.published_after("news", shared, 0),
+            vec![(1, make_data("s1"))]
+        );
+        assert!(mgr.published_after("news", local, 0).is_empty());
+        let (epoch, all) = mgr.published_unheard("news", 0, |_| false).unwrap();
+        assert_eq!(epoch, shared);
+        assert_eq!(all, vec![(0, make_data("s0")), (1, make_data("s1"))]);
+        // Its own subscribers recover both streams, in the order they came:
+        // from where they stand in each; by one position, not once the
+        // local stream let "l0" go after it.
+        assert!(not_recovered(&mgr.recover("news", shared, 0)));
+        let named = [(shared, 0), (local, 1)];
+        let RecoveryResult::Recovered { publications, .. } =
+            mgr.recover_streams("news", (shared, 0), &named)
+        else {
             panic!("not recovered");
         };
-        assert_eq!(publications, vec![make_data("l2"), make_data("s3")]);
+        assert_eq!(publications, vec![make_data("l2"), make_data("s1")]);
     }
 
     #[test]
@@ -2705,17 +2827,17 @@ mod tests {
         }
         mgr.push("room", make_data("l0"));
         let (local, _) = mgr.get_position("room").unwrap();
+        let heard = mgr.arrived_through();
         mgr.not_kept("unnamed");
         assert!(!mgr.removed_through.contains_key("unnamed"));
         // Each topic a client asks of.
         assert!(not_recovered(&mgr.recover("room", local, 0)));
         // And each a peer has, of what this node published to other nodes.
-        let minute = Duration::from_secs(60);
-        assert!(mgr.lost_lately("other", minute).is_empty());
+        assert!(mgr.lost_after("other", heard).is_empty());
         let mgr = with_budget(mgr, 0);
         assert!(mgr.push_stamped("unnamed", |_, _| make_data("x")).is_none());
-        assert_eq!(mgr.lost_lately("other", minute), ["other"]);
-        assert_eq!(mgr.lost_lately("prices:*", minute), ["prices:*"]);
+        assert_eq!(mgr.lost_after("other", heard), ["other"]);
+        assert_eq!(mgr.lost_after("prices:*", heard), ["prices:*"]);
     }
 
     #[test]
@@ -2752,7 +2874,7 @@ mod tests {
     }
 
     #[test]
-    fn a_peer_gets_what_this_node_published_since_its_interest_began() {
+    fn a_peer_gets_what_this_node_published_after_what_it_heard_of() {
         let mgr = RecoveryManager::new(RecoveryConfig::default());
         mgr.push("news", make_data("old"));
         let (epoch, _) = mgr.get_position("news").unwrap();
@@ -2761,27 +2883,20 @@ mod tests {
         mgr.marks
             .lock()
             .push_back((minute_ago, mgr.arrival.load(Ordering::Relaxed)));
+        let heard = mgr.arrived_through();
         mgr.push("news", make_data("new"));
-        // An interest of 30 s: what came after the mark before it.
-        let (sent_epoch, sent) = mgr
-            .published_lately("news", Duration::from_secs(30), |_| false)
-            .unwrap();
+        // An interest of 30 s began after "old": before it, nothing was
+        // relayed; one older than every mark: everything.
+        assert_eq!(mgr.arrived_before(Duration::from_secs(30)), heard);
+        assert_eq!(mgr.arrived_before(Duration::from_secs(120)), 0);
+        let (sent_epoch, sent) = mgr.published_unheard("news", heard, |_| false).unwrap();
         assert_eq!(sent_epoch, epoch);
         assert_eq!(sent, vec![(1, make_data("new"))]);
-        // One older than every mark: all that is kept.
-        let (_, all) = mgr
-            .published_lately("news", Duration::from_secs(120), |_| false)
-            .unwrap();
+        let (_, all) = mgr.published_unheard("news", 0, |_| false).unwrap();
         assert_eq!(all.len(), 2);
         // A stream the peer named, or none here: nothing this way.
-        assert!(
-            mgr.published_lately("news", Duration::from_secs(30), |e| e == epoch)
-                .is_none()
-        );
-        assert!(
-            mgr.published_lately("other", Duration::from_secs(30), |_| false)
-                .is_none()
-        );
+        assert!(mgr.published_unheard("news", 0, |e| e == epoch).is_none());
+        assert!(mgr.published_unheard("other", 0, |_| false).is_none());
     }
 
     #[test]

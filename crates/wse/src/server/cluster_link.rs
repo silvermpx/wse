@@ -226,6 +226,7 @@ pub(crate) fn connect(
         queue_groups: shared.queue_groups.clone(),
         producers: Arc::clone(&shared.producers),
         producer_links: Arc::clone(&shared.producer_links),
+        heard: Arc::new(dashmap::DashMap::new()),
     };
 
     tokio::spawn(cluster::cluster_manager(

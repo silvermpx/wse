@@ -14,13 +14,13 @@ use tokio_util::sync::CancellationToken;
 use super::inbound::{InboundGate, InboundLinks, InboundSessionCtx, accept_cluster_links};
 use super::peer::PeerSpawnCtx;
 use super::{
-    CAP_COMPRESSION, CAP_INTEREST_ROUTING, CAP_PRESENCE, CAP_RECOVERY,
+    CAP_ARRIVAL, CAP_COMPRESSION, CAP_INTEREST_ROUTING, CAP_PRESENCE, CAP_RECOVERY,
     CLUSTER_RESYNC_INTERVAL_SECS, ClusterCommand, ClusterContext, ClusterDlq, ClusterDlqEntry,
     ClusterTlsConfig, InterestUpdate, MANAGER_QUEUE_CAP, MAX_CLUSTER_PEERS, MAX_FRAME_SIZE,
     MAX_KNOWN_PEERS, MAX_REMOTE_INTEREST_PER_PEER, PRESENCE_ROUND_FIRST, PRESENCE_ROUND_LAST,
-    PeerInterest, PeerRegistration, PresencePeerFrame, encode_drain, encode_msg,
-    encode_msg_compressed, encode_msg_with_recovery, encode_peer_announce, encode_presence_round,
-    encode_presence_update, encode_resync, encode_shutdown, encode_sub, encode_unsub,
+    PeerInterest, PeerRegistration, PresencePeerFrame, encode_drain, encode_msg_full,
+    encode_peer_announce, encode_presence_round, encode_presence_update, encode_resync,
+    encode_shutdown, encode_sub, encode_unsub,
 };
 use crate::presence::PresenceManager;
 
@@ -202,7 +202,7 @@ pub(crate) async fn cluster_manager(
     // them: (peer_addr, write channel, negotiated caps). Only these receive
     // publishes, interest and presence, so nothing queues up for a peer that
     // is not connected.
-    let mut peer_txs: Vec<(String, mpsc::Sender<Bytes>, u32)> = Vec::new();
+    let mut peer_txs: Vec<(String, mpsc::Sender<Bytes>, u32, CancellationToken)> = Vec::new();
     // Dial tasks by address, static and discovered.
     let mut dialing: HashMap<String, tokio::task::JoinHandle<()>> = HashMap::new();
 
@@ -288,91 +288,71 @@ pub(crate) async fn cluster_manager(
         tokio::select! {
             cmd = cmd_rx.recv() => {
                 match cmd {
-                    Some(ClusterCommand::Publish { topic, payload, position }) => {
-                        // The position the origin's command task reserved for this
-                        // very message (reading the head here raced with it).
-                        let rec_pos = position;
-
-                        // Pre-encode frames: with/without recovery, with/without compression
-                        let recovery_compressed = if let Some((epoch, offset)) = rec_pos {
-                            let mut buf = BytesMut::new();
-                            if encode_msg_with_recovery(&mut buf, &topic, &payload, epoch, offset, true) {
-                                Some(buf.freeze())
-                            } else {
-                                None
-                            }
-                        } else {
-                            None
-                        };
-                        let recovery_plain = if let Some((epoch, offset)) = rec_pos {
-                            let mut buf = BytesMut::new();
-                            if encode_msg_with_recovery(&mut buf, &topic, &payload, epoch, offset, false) {
-                                Some(buf.freeze())
-                            } else {
-                                None
-                            }
-                        } else {
-                            None
+                    Some(ClusterCommand::Publish { topic, payload, position, seq }) => {
+                        // The position and the arrival number the origin's
+                        // command task reserved for this very message.
+                        // Each form of the frame is made once, when a peer
+                        // first needs it: with its position, compressed, with
+                        // its arrival number, as the peer's caps say.
+                        let mut forms: [Option<Option<Bytes>>; 8] = Default::default();
+                        let mut form = |caps: u32| -> Option<Bytes> {
+                            let recovery = position.filter(|_| caps & CAP_RECOVERY != 0);
+                            let compress = caps & CAP_COMPRESSION != 0;
+                            let arrival = (caps & CAP_ARRIVAL != 0 && seq > 0).then_some(seq);
+                            let at = usize::from(recovery.is_some())
+                                | usize::from(compress) << 1
+                                | usize::from(arrival.is_some()) << 2;
+                            forms[at]
+                                .get_or_insert_with(|| {
+                                    let mut buf = BytesMut::new();
+                                    encode_msg_full(&mut buf, &topic, &payload, recovery, arrival, compress)
+                                        .then(|| buf.freeze())
+                                })
+                                .clone()
                         };
 
-                        let mut compressed_data = BytesMut::new();
-                        let has_compressed = encode_msg_compressed(&mut compressed_data, &topic, &payload);
-                        let compressed_bytes = if has_compressed { Some(compressed_data.freeze()) } else { None };
-
-                        let mut plain_data = BytesMut::new();
-                        if !encode_msg(&mut plain_data, &topic, &payload) {
-                            tracing::warn!(
-                                "[WSE-Cluster] Dropping publish: topic too long ({} bytes)",
-                                topic.len()
-                            );
-                            continue;
-                        }
-                        let plain_bytes = plain_data.freeze();
-
-                        for (peer_addr, tx, caps) in &peer_txs {
+                        for (peer_addr, tx, caps, link) in &peer_txs {
                             if draining.contains(peer_addr) {
                                 continue;
                             }
                             let interested = remote_interest
                                 .get(peer_addr)
                                 .is_none_or(|interest| interest.wants(&topic));
-                            if interested {
-                                let frame = if caps & CAP_RECOVERY != 0 {
-                                    if caps & CAP_COMPRESSION != 0 {
-                                        recovery_compressed.as_ref().unwrap_or(&plain_bytes).clone()
-                                    } else {
-                                        recovery_plain.as_ref().unwrap_or(&plain_bytes).clone()
-                                    }
-                                } else if caps & CAP_COMPRESSION != 0 {
-                                    compressed_bytes.as_ref().unwrap_or(&plain_bytes).clone()
-                                } else {
-                                    plain_bytes.clone()
-                                };
-                                // The peer drops a frame over its limit together
-                                // with the link, so an oversized one is not sent.
-                                if frame.len() > MAX_FRAME_SIZE {
-                                    ctx.metrics.messages_dropped.fetch_add(1, Ordering::Relaxed);
-                                    warn_oversized(&topic, frame.len());
-                                    continue;
+                            if !interested {
+                                continue;
+                            }
+                            // The peer drops a frame over its limit together
+                            // with the link, so an oversized one is not sent.
+                            let Some(frame) = form(*caps) else {
+                                ctx.metrics.messages_dropped.fetch_add(1, Ordering::Relaxed);
+                                warn_oversized(&topic, payload.len());
+                                continue;
+                            };
+                            match tx.try_send(frame) {
+                                Ok(()) => {
+                                    ctx.metrics.messages_sent.fetch_add(1, Ordering::Relaxed);
                                 }
-                                match tx.try_send(frame) {
-                                    Ok(()) => {
-                                        ctx.metrics.messages_sent.fetch_add(1, Ordering::Relaxed);
-                                    }
-                                    Err(mpsc::error::TrySendError::Full(_)) => {
-                                        ctx.metrics.messages_dropped.fetch_add(1, Ordering::Relaxed);
+                                Err(mpsc::error::TrySendError::Full(_)) => {
+                                    ctx.metrics.messages_dropped.fetch_add(1, Ordering::Relaxed);
+                                    if caps & CAP_ARRIVAL != 0 {
+                                        // Not dropped silently: the link is made
+                                        // again, and its catch-up brings what the
+                                        // peer did not hear.
+                                        tracing::warn!("[WSE-Cluster] Peer {peer_addr} fell behind; the link is made again");
+                                        link.cancel();
+                                    } else {
                                         tracing::warn!("[WSE-Cluster] Peer {peer_addr} backpressure, dropping message");
                                     }
-                                    Err(mpsc::error::TrySendError::Closed(_)) => {
-                                        ctx.metrics.messages_dropped.fetch_add(1, Ordering::Relaxed);
-                                        if let Ok(mut dlq_guard) = dlq.lock() {
-                                            dlq_guard.push(ClusterDlqEntry {
-                                                topic: topic.clone(),
-                                                payload: payload.clone(),
-                                                peer_addr: peer_addr.clone(),
-                                                error: "peer channel closed".to_string(),
-                                            });
-                                        }
+                                }
+                                Err(mpsc::error::TrySendError::Closed(_)) => {
+                                    ctx.metrics.messages_dropped.fetch_add(1, Ordering::Relaxed);
+                                    if let Ok(mut dlq_guard) = dlq.lock() {
+                                        dlq_guard.push(ClusterDlqEntry {
+                                            topic: topic.clone(),
+                                            payload: payload.clone(),
+                                            peer_addr: peer_addr.clone(),
+                                            error: "peer channel closed".to_string(),
+                                        });
                                     }
                                 }
                             }
@@ -382,7 +362,7 @@ pub(crate) async fn cluster_manager(
                         let mut frame_data = BytesMut::new();
                         if encode_sub(&mut frame_data, &topic) {
                             let frame_bytes = frame_data.freeze();
-                            for (_, tx, caps) in &peer_txs {
+                            for (_, tx, caps, _) in &peer_txs {
                                 if caps & CAP_INTEREST_ROUTING != 0 {
                                     let _ = tx.try_send(frame_bytes.clone());
                                 }
@@ -393,7 +373,7 @@ pub(crate) async fn cluster_manager(
                         let mut frame_data = BytesMut::new();
                         if encode_unsub(&mut frame_data, &topic) {
                             let frame_bytes = frame_data.freeze();
-                            for (_, tx, caps) in &peer_txs {
+                            for (_, tx, caps, _) in &peer_txs {
                                 if caps & CAP_INTEREST_ROUTING != 0 {
                                     let _ = tx.try_send(frame_bytes.clone());
                                 }
@@ -406,7 +386,7 @@ pub(crate) async fn cluster_manager(
                         let mut frame_data = BytesMut::new();
                         if encode_presence_update(&mut frame_data, &topic, &user_id, action, &data, updated_at) {
                             let frame_bytes = frame_data.freeze();
-                            for (peer_addr, tx, caps) in &peer_txs {
+                            for (peer_addr, tx, caps, _) in &peer_txs {
                                 if caps & CAP_PRESENCE != 0 {
                                     match tx.try_send(frame_bytes.clone()) {
                                         Ok(()) => {}
@@ -434,7 +414,7 @@ pub(crate) async fn cluster_manager(
                         let mut drain_data = BytesMut::new();
                         encode_drain(&mut drain_data);
                         let drain_bytes = drain_data.freeze();
-                        for (peer_addr, tx, _) in &peer_txs {
+                        for (peer_addr, tx, _, _) in &peer_txs {
                             if tx.try_send(drain_bytes.clone()).is_err() {
                                 tracing::warn!("[WSE-Cluster] Could not send DRAIN to {peer_addr}");
                             }
@@ -445,7 +425,7 @@ pub(crate) async fn cluster_manager(
                         let mut shutdown_data = BytesMut::new();
                         encode_shutdown(&mut shutdown_data);
                         let shutdown_bytes = shutdown_data.freeze();
-                        for (peer_addr, tx, _) in &peer_txs {
+                        for (peer_addr, tx, _, _) in &peer_txs {
                             if tx.try_send(shutdown_bytes.clone()).is_err() {
                                 tracing::warn!("[WSE-Cluster] Could not send SHUTDOWN to {peer_addr}");
                             }
@@ -498,7 +478,7 @@ pub(crate) async fn cluster_manager(
                         let mut frame_data = BytesMut::new();
                         encode_peer_announce(&mut frame_data, &addr);
                         let frame_bytes = frame_data.freeze();
-                        for (peer_addr, tx, _) in &peer_txs {
+                        for (peer_addr, tx, _, _) in &peer_txs {
                             if *peer_addr != exclude_peer {
                                 let _ = tx.try_send(frame_bytes.clone());
                             }
@@ -643,7 +623,7 @@ pub(crate) async fn cluster_manager(
             // Handle inbound peer registrations/deregistrations
             Some(reg) = peer_reg_rx.recv() => {
                 match reg {
-                    PeerRegistration::Register { peer_addr, write_tx, negotiated_caps, taken } => {
+                    PeerRegistration::Register { peer_addr, write_tx, negotiated_caps, taken, link } => {
                         // A live session, outbound or inbound, with the caps its
                         // handshake negotiated. This node's interest and presence
                         // go out from here, in the order of every SUB, UNSUB and
@@ -661,15 +641,15 @@ pub(crate) async fn cluster_manager(
                         {
                             presence_dirty.insert(peer_addr.clone());
                         }
-                        peer_txs.retain(|(a, _, _)| a != &peer_addr);
-                        peer_txs.push((peer_addr.clone(), write_tx, negotiated_caps));
+                        peer_txs.retain(|(a, _, _, _)| a != &peer_addr);
+                        peer_txs.push((peer_addr.clone(), write_tx, negotiated_caps, link));
                         if let Some(taken) = taken {
                             let _ = taken.send(());
                         }
                         tracing::debug!("[WSE-Cluster] Link up: {peer_addr} (caps=0x{negotiated_caps:08x})");
                     }
                     PeerRegistration::Deregister { peer_addr } => {
-                        peer_txs.retain(|(a, _, _)| a != &peer_addr);
+                        peer_txs.retain(|(a, _, _, _)| a != &peer_addr);
                         presence_dirty.remove(&peer_addr);
                         // A gossip-discovered peer that is no longer dialed can be
                         // discovered again.
@@ -750,7 +730,7 @@ pub(crate) async fn cluster_manager(
                     Some(pm) if !presence_dirty.is_empty() => Some(presence_round(pm)),
                     _ => None,
                 };
-                for (peer_addr, tx, caps) in &peer_txs {
+                for (peer_addr, tx, caps, _) in &peer_txs {
                     if !queue_whole(tx, &interest) {
                         tracing::debug!("[WSE-Cluster] {peer_addr} busy; its RESYNC waits a period");
                     }
@@ -767,7 +747,7 @@ pub(crate) async fn cluster_manager(
         }
 
         // Prune dead peer channels (receiver dropped = peer task exited)
-        peer_txs.retain(|(addr, tx, _)| {
+        peer_txs.retain(|(addr, tx, _, _)| {
             if tx.is_closed() {
                 tracing::debug!("[WSE-Cluster] Pruning dead peer channel: {addr}");
                 false

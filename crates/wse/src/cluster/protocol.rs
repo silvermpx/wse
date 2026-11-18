@@ -4,7 +4,7 @@
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 
 use super::{
-    COMPRESSION_THRESHOLD, FLAG_COMPRESSED, FLAG_HAS_RECOVERY, FLAG_REPLAYED, MAGIC,
+    COMPRESSION_THRESHOLD, FLAG_ARRIVAL, FLAG_COMPRESSED, FLAG_HAS_RECOVERY, FLAG_REPLAYED, MAGIC,
     MAX_CLUSTER_PEERS, MAX_FRAME_SIZE, MAX_KNOWN_PEERS, PROTOCOL_VERSION, PROTOCOL_VERSION_MIN,
 };
 use crate::server::{Decided, Hole, MAX_HOLES, Refusal};
@@ -36,6 +36,8 @@ pub(crate) enum MsgType {
     ProducerState = 0x10,
     /// Messages of a topic were published that no node holds.
     Lost = 0x11,
+    /// The catch-up covers what the sender published up to an arrival.
+    CaughtUp = 0x12,
 }
 
 impl MsgType {
@@ -58,6 +60,7 @@ impl MsgType {
             0x0F => Some(Self::ProducerQuery),
             0x10 => Some(Self::ProducerState),
             0x11 => Some(Self::Lost),
+            0x12 => Some(Self::CaughtUp),
             _ => None,
         }
     }
@@ -69,6 +72,7 @@ impl MsgType {
 
 /// Encode a MSG frame into buf. Returns false if topic exceeds 64KB.
 /// Format: [u8 type][u8 flags][u16 LE topic_len][u32 LE payload_len][topic][payload]
+#[cfg(test)]
 pub(crate) fn encode_msg(buf: &mut BytesMut, topic: &str, payload: &str) -> bool {
     let topic_bytes = topic.as_bytes();
     if topic_bytes.len() > u16::MAX as usize {
@@ -100,6 +104,7 @@ pub(crate) fn encode_msg(buf: &mut BytesMut, topic: &str, payload: &str) -> bool
 /// Encode a MSG frame with zstd compression on the payload.
 /// Compresses only if payload >= COMPRESSION_THRESHOLD and compressed size < original.
 /// Falls back to uncompressed encoding if compression doesn't help.
+#[cfg(test)]
 pub(crate) fn encode_msg_compressed(buf: &mut BytesMut, topic: &str, payload: &str) -> bool {
     let topic_bytes = topic.as_bytes();
     if topic_bytes.len() > u16::MAX as usize {
@@ -134,6 +139,7 @@ pub(crate) fn encode_msg_compressed(buf: &mut BytesMut, topic: &str, payload: &s
 /// Encode a MSG frame with recovery trailer (origin epoch + offset).
 /// Optionally compresses the payload with zstd. The 12-byte recovery trailer
 /// is appended AFTER the payload (not included in payload_len).
+#[cfg(test)]
 pub(crate) fn encode_msg_with_recovery(
     buf: &mut BytesMut,
     topic: &str,
@@ -142,48 +148,80 @@ pub(crate) fn encode_msg_with_recovery(
     origin_offset: u64,
     compress: bool,
 ) -> bool {
+    encode_msg_full(
+        buf,
+        topic,
+        payload,
+        Some((origin_epoch, origin_offset)),
+        None,
+        compress,
+    )
+}
+
+/// Encode a MSG frame: compressed when `compress` and it helps, with the
+/// origin's recovery position (12 bytes after the payload, FLAG_HAS_RECOVERY)
+/// and its arrival number (8 bytes after that, FLAG_ARRIVAL) when given.
+/// False when the topic or the frame is too large.
+pub(crate) fn encode_msg_full(
+    buf: &mut BytesMut,
+    topic: &str,
+    payload: &str,
+    recovery: Option<(u32, u64)>,
+    arrival: Option<u64>,
+    compress: bool,
+) -> bool {
     let topic_bytes = topic.as_bytes();
     if topic_bytes.len() > u16::MAX as usize {
         return false;
     }
     let payload_bytes = payload.as_bytes();
-
-    if compress
-        && payload_bytes.len() >= COMPRESSION_THRESHOLD
-        && let Ok(compressed) = zstd::bulk::compress(payload_bytes, 1)
-        && compressed.len() < payload_bytes.len()
-    {
-        let total = 8 + topic_bytes.len() + compressed.len() + 12; // +12 for recovery trailer
-        if total > MAX_FRAME_SIZE {
-            return false;
-        }
-        buf.reserve(total);
-        buf.put_u8(MsgType::Msg as u8);
-        buf.put_u8(FLAG_COMPRESSED | FLAG_HAS_RECOVERY);
-        buf.put_u16_le(topic_bytes.len() as u16);
-        buf.put_u32_le(compressed.len() as u32);
-        buf.put_slice(topic_bytes);
-        buf.put_slice(&compressed);
-        buf.put_u32_le(origin_epoch);
-        buf.put_u64_le(origin_offset);
-        return true;
-    }
-
-    // Uncompressed with recovery trailer
-    let total = 8 + topic_bytes.len() + payload_bytes.len() + 12;
+    let compressed = (compress && payload_bytes.len() >= COMPRESSION_THRESHOLD)
+        .then(|| zstd::bulk::compress(payload_bytes, 1).ok())
+        .flatten()
+        .filter(|compressed| compressed.len() < payload_bytes.len());
+    let body: &[u8] = compressed.as_deref().unwrap_or(payload_bytes);
+    let trailers = recovery.map_or(0, |_| 12) + arrival.map_or(0, |_| 8);
+    let total = 8 + topic_bytes.len() + body.len() + trailers;
     if total > MAX_FRAME_SIZE {
         return false;
     }
+    let mut flags = 0;
+    if compressed.is_some() {
+        flags |= FLAG_COMPRESSED;
+    }
+    if recovery.is_some() {
+        flags |= FLAG_HAS_RECOVERY;
+    }
+    if arrival.is_some() {
+        flags |= FLAG_ARRIVAL;
+    }
     buf.reserve(total);
     buf.put_u8(MsgType::Msg as u8);
-    buf.put_u8(FLAG_HAS_RECOVERY);
+    buf.put_u8(flags);
     buf.put_u16_le(topic_bytes.len() as u16);
-    buf.put_u32_le(payload_bytes.len() as u32);
+    buf.put_u32_le(body.len() as u32);
     buf.put_slice(topic_bytes);
-    buf.put_slice(payload_bytes);
-    buf.put_u32_le(origin_epoch);
-    buf.put_u64_le(origin_offset);
+    buf.put_slice(body);
+    if let Some((epoch, offset)) = recovery {
+        buf.put_u32_le(epoch);
+        buf.put_u64_le(offset);
+    }
+    if let Some(seq) = arrival {
+        buf.put_u64_le(seq);
+    }
     true
+}
+
+/// Encode a CAUGHT_UP frame: the catch-up just sent covers what this node
+/// published up to arrival `through`.
+/// Format: [header: type=0x12, payload_len=8] [8 bytes: through (LE u64)]
+pub(crate) fn encode_caught_up(buf: &mut BytesMut, through: u64) {
+    buf.reserve(16);
+    buf.put_u8(MsgType::CaughtUp as u8);
+    buf.put_u8(0);
+    buf.put_u16_le(0);
+    buf.put_u32_le(8);
+    buf.put_u64_le(through);
 }
 
 /// Encode a PING frame (header only, 8 bytes).
@@ -374,7 +412,8 @@ pub(crate) fn encode_replayed(
     origin_offset: u64,
 ) -> bool {
     let start = buf.len();
-    if !encode_msg_with_recovery(buf, topic, payload, origin_epoch, origin_offset, true) {
+    let position = Some((origin_epoch, origin_offset));
+    if !encode_msg_full(buf, topic, payload, position, None, true) {
         return false;
     }
     if buf.len() - start > MAX_FRAME_SIZE {
@@ -389,6 +428,9 @@ pub(crate) fn encode_replayed(
 pub(crate) const RESUME_LAST: u8 = 0x01;
 /// A RESUME frame that names the topics the node has (CAP_RESUME_TOPICS).
 pub(crate) const RESUME_TOPICS: u8 = 0x02;
+/// A RESUME frame naming, in one entry (no topic, epoch 0), the last of the
+/// receiver's arrivals the sender heard of (CAP_ARRIVAL).
+pub(crate) const RESUME_HEARD: u8 = 0x04;
 
 /// Where a node stands in the streams other nodes relay to it, as it asks on
 /// a new link for what it missed: (topic, the origin's epoch, the last offset
@@ -405,7 +447,11 @@ pub(crate) type ResumeTopic = (String, u64);
 /// Format: [u8 type=0x0E][u8 flags][u16 LE 0][u32 LE payload_len][payload],
 /// the payload a run of [u16 LE topic_len][topic][u32 LE epoch][u64 LE offset];
 /// in a frame of topics the epoch is 0 and the offset the interest's age.
-pub(crate) fn encode_resume(points: &[ResumePoint], topics: &[ResumeTopic]) -> Vec<BytesMut> {
+pub(crate) fn encode_resume(
+    points: &[ResumePoint],
+    topics: &[ResumeTopic],
+    heard: Option<u64>,
+) -> Vec<BytesMut> {
     fn header(buf: &mut BytesMut, flags: u8) {
         buf.put_u8(MsgType::Resume as u8);
         buf.put_u8(flags);
@@ -431,6 +477,11 @@ pub(crate) fn encode_resume(points: &[ResumePoint], topics: &[ResumeTopic]) -> V
     header(&mut buf, 0);
     for (topic, epoch, offset) in points {
         entry(&mut frames, &mut buf, 0, (topic, *epoch, *offset));
+    }
+    if let Some(heard) = heard {
+        frames.push(std::mem::take(&mut buf));
+        header(&mut buf, RESUME_HEARD);
+        entry(&mut frames, &mut buf, RESUME_HEARD, ("", 0, heard));
     }
     if !topics.is_empty() {
         frames.push(std::mem::take(&mut buf));
@@ -663,6 +714,8 @@ pub(crate) enum ClusterFrame {
         payload: Bytes,
         /// Origin node's recovery position (epoch, offset) for cross-node recovery.
         recovery: Option<(u32, u64)>,
+        /// The message's number in the origin's arrival order (CAP_ARRIVAL).
+        arrival: Option<u64>,
     },
     Ping,
     Pong,
@@ -709,6 +762,9 @@ pub(crate) enum ClusterFrame {
         points: Vec<ResumePoint>,
         /// The topics the node has (a frame flagged RESUME_TOPICS).
         topics: Vec<ResumeTopic>,
+        /// The last arrival of the receiver's the node heard of (a frame
+        /// flagged RESUME_HEARD).
+        heard: Option<u64>,
         /// The request's last frame.
         last: bool,
     },
@@ -735,6 +791,11 @@ pub(crate) enum ClusterFrame {
     /// published on the peer that no node holds.
     Lost {
         topic: String,
+    },
+    /// The catch-up the peer just sent covers what it published up to
+    /// arrival `through`.
+    CaughtUp {
+        through: u64,
     },
     Unknown {
         msg_type: u8,
@@ -789,6 +850,14 @@ pub(crate) fn decode_frame(mut data: BytesMut) -> Option<ClusterFrame> {
             } else {
                 None
             };
+            let arrival = if flags & FLAG_ARRIVAL != 0 {
+                if data.remaining() < 8 {
+                    return None;
+                }
+                Some(data.get_u64_le())
+            } else {
+                None
+            };
             if flags & FLAG_REPLAYED != 0
                 && let Some(position) = recovery
             {
@@ -802,6 +871,7 @@ pub(crate) fn decode_frame(mut data: BytesMut) -> Option<ClusterFrame> {
                 topic,
                 payload,
                 recovery,
+                arrival,
             })
         }
         Some(MsgType::Resume) => {
@@ -809,7 +879,7 @@ pub(crate) fn decode_frame(mut data: BytesMut) -> Option<ClusterFrame> {
                 return None;
             }
             let mut payload = data.split_to(payload_len);
-            let (mut points, mut topics) = (Vec::new(), Vec::new());
+            let (mut points, mut topics, mut heard) = (Vec::new(), Vec::new(), None);
             while payload.has_remaining() {
                 if payload.remaining() < 2 {
                     return None;
@@ -821,7 +891,9 @@ pub(crate) fn decode_frame(mut data: BytesMut) -> Option<ClusterFrame> {
                 let topic = String::from_utf8(payload.split_to(topic_len).to_vec()).ok()?;
                 let epoch = payload.get_u32_le();
                 let offset = payload.get_u64_le();
-                if flags & RESUME_TOPICS != 0 {
+                if flags & RESUME_HEARD != 0 {
+                    heard = Some(offset);
+                } else if flags & RESUME_TOPICS != 0 {
                     topics.push((topic, offset));
                 } else {
                     points.push((topic, epoch, offset));
@@ -830,6 +902,7 @@ pub(crate) fn decode_frame(mut data: BytesMut) -> Option<ClusterFrame> {
             Some(ClusterFrame::Resume {
                 points,
                 topics,
+                heard,
                 last: flags & RESUME_LAST != 0,
             })
         }
@@ -872,6 +945,14 @@ pub(crate) fn decode_frame(mut data: BytesMut) -> Option<ClusterFrame> {
             }
             let topic = String::from_utf8(data.split_to(topic_len).to_vec()).ok()?;
             Some(ClusterFrame::Sub { topic })
+        }
+        Some(MsgType::CaughtUp) => {
+            if data.remaining() < 8 {
+                return None;
+            }
+            Some(ClusterFrame::CaughtUp {
+                through: data.get_u64_le(),
+            })
         }
         Some(MsgType::Lost) => {
             if data.remaining() < topic_len {

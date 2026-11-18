@@ -196,6 +196,17 @@ server every client is checked against.
   message relayed to it twice once a lost link is back: its catch-up request
   names where it stands in the streams it keeps no buffer of, and what was
   delivered of them already is not delivered again.
+- Cluster: the catch-up after a lost link starts where the node left off
+  (`CAP_ARRIVAL`): relayed messages carry the origin's arrival number, a
+  node names the last one it heard of, and gets what came after it, LOST for
+  what of that is gone (let go of from a full ring, or a record the origin
+  let go of meanwhile), and CAUGHT_UP. A stream longer than its history no
+  longer comes back said whole; what a node had already, its history of it
+  gone, no longer comes again; a loss told once is not told after the next
+  empty outage. What a node publishes to its own subscribers only is a
+  stream of its own: it no longer leaves a gap in the stream other nodes get,
+  nor pushes a message for the cluster out of its history. A link too full
+  for a message is made again, and catches up, instead of dropping it.
 - Swift, Kotlin and Dart: once the client is closed, the events end with
   what the close said (the messages it will not deliver, the close itself);
   a reader waiting at the close no longer gets its end before them.

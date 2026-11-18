@@ -21,8 +21,8 @@ On the wire every frame follows a 4-byte big-endian length (u32), the length of 
 
 | Offset | Size | Field | Description |
 |--------|------|-------|-------------|
-| 0 | 1 | type | Message type (0x01 - 0x11) |
-| 1 | 1 | flags | Per type: MSG bit 0 compressed (zstd), bit 1 recovery trailer, bit 2 replayed; RESYNC bit 0 continuation; RESUME bit 0 last; PresenceFull bits 0-2 sync round; otherwise 0 |
+| 0 | 1 | type | Message type (0x01 - 0x12) |
+| 1 | 1 | flags | Per type: MSG bit 0 compressed (zstd), bit 1 recovery trailer, bit 2 replayed, bit 3 arrival trailer; RESYNC bit 0 continuation; RESUME bit 0 last, bit 1 topics, bit 2 heard; PresenceFull bits 0-2 sync round; otherwise 0 |
 | 2 | 2 | topic_len | Topic field length (little-endian u16) |
 | 4 | 4 | payload_len | Payload field length (little-endian u32) |
 | 8 | N | topic | Topic string (UTF-8, N = topic_len) |
@@ -49,6 +49,10 @@ The payload is the message as the sending node's own subscribers got it: JSON te
 If FLAG_HAS_RECOVERY (0x02) is set, a 12-byte **recovery trailer** is appended *after* the payload (and is **not** counted in `payload_len`): a little-endian `u32` origin epoch followed by a little-endian `u64` origin offset. The receiving node stores the payload in a foreign recovery buffer keyed by `(topic, origin_epoch)`, so a client that reconnects to a different node can still recover with its original `(epoch, offset)` — provided that node had interest in (and therefore received) the topic's messages. With recovery on, a node keeps its interest in a topic for the history's lifetime (`recovery_ttl`) after the topic's last local subscriber leaves, so what other nodes publish meanwhile still reaches it. A topic published on several nodes has one stream per origin (one epoch each): a recovery replays, from every stream, what reached this node after the client's last message, in the order it arrived, and reports `recovered: false` when a stream no longer holds all of that or when this node's interest was interrupted since.
 
 If FLAG_REPLAYED (0x04) is set, the message is one the receiver missed while its link was down, sent again after its RESUME request (it always has the recovery trailer). The receiver waits for room to deliver it instead of shedding it, and delivers a message it holds already (same origin epoch and offset) only once.
+
+If FLAG_ARRIVAL (0x08) is set (CAP_ARRIVAL), an 8-byte little-endian **arrival number** follows the recovery trailer (or the payload, with none): the message's place in the origin's arrival order, which counts every message the origin published to the cluster, kept or not. The receiver remembers, per origin, the last arrival it delivered with nothing missing before it, and names it in its next RESUME request; a message it sheds keeps that number where it was.
+
+A message the origin publishes to its own subscribers only (`publish_local`) is not sent, and is kept in a stream of its own (an epoch of its own): it takes neither an offset nor room in the stream of the topic that other nodes get.
 
 ### PING (0x02) / PONG (0x03) - Heartbeat
 
@@ -82,6 +86,7 @@ The magic bytes `WSE\x00` prevent accidental connections from non-WSE services. 
 | 4 | CAP_RESUME | Catch-up after a lost link (RESUME); offered by a node with recovery on |
 | 5 | CAP_PRODUCERS | A node asks another what it decided of a client's outbox (PRODUCER_QUERY / PRODUCER_STATE) |
 | 6 | CAP_RESUME_TOPICS | The catch-up covers streams the asking node does not hold: its RESUME request names its topics too (from 3.2) |
+| 7 | CAP_ARRIVAL | Relayed messages carry the origin's arrival number; the catch-up starts after the last one the asking node heard of (from 3.2) |
 
 The instance id is the name the node gives its clients in the `outbox` answer: a client that comes to another node names it, and that node asks it (see [PRODUCER_QUERY](#producer_query-0x0f-and-producer_state-0x10---a-clients-outbox-moves)).
 
@@ -212,13 +217,15 @@ TCP connection open so in-flight delivery can finish (lame-duck). See
 
 Where the sender stands in every stream other nodes relay to it: for each foreign recovery buffer, the topic, the origin's epoch and the last offset it holds with nothing missing before it; for a stream it holds no buffer of (no room in its memory budget for one, or the buffer was removed), the last offset it delivered with nothing missing before it, for 100,000 such streams. What it delivered of those streams is not delivered again when a peer sends it again, within the last 64 offsets past that one. A request over the frame limit is split; flags `0x01` marks its last frame, and a node with nothing relayed to it sends one empty frame with that flag.
 
+With CAP_ARRIVAL, a frame flagged `0x04` follows those entries with one entry (no topic, an epoch of 0): in place of the offset, the last of the receiver's arrival numbers the sender heard of (0 for none).
+
 With CAP_RESUME_TOPICS, the frames flagged `0x02` follow those entries and name the topics the sender has (its subscribers', and those still kept for clients that may come back): each entry is the topic, an epoch of 0, and in place of the offset how long ago the sender's interest in it began, in milliseconds.
 
-When CAP_RESUME is negotiated, each node sends its request right after HELLO and reads the other's. Then it hands the link to its cluster manager and, once the manager routes publishes to it, sends the peer every message of its own streams the request names after the offset given (from the oldest still kept when some are gone) as MSG frames marked replayed, before anything live; a message it published to its own subscribers only (`publish_local`) is never among them: what was published before the manager took the link is in this catch-up, what after it follows it, and a message in both is delivered once. Streams of other origins or of an earlier epoch (the node restarted) are skipped. For each topic the request names, and each topic of its own a pattern the request names matches (`prices:*`: `prices:new`), a stream of its own the request does not name (one begun while the link was down, or one the peer never got a message of) is sent too, once: what it published to the topic since the oldest of the peer's interests in it began, and up to 3 seconds before. A node marks where its arrival order stands once a second for that. A peer that does not send its whole request within 5 seconds is dropped, and redials.
+When CAP_RESUME is negotiated, each node sends its request right after HELLO and reads the other's. Then it hands the link to its cluster manager and, once the manager routes publishes to it, sends the peer every message of its own streams the request names after the offset given (from the oldest still kept when some are gone) as MSG frames marked replayed, before anything live; a message it published to its own subscribers only (`publish_local`) is never among them: what was published before the manager took the link is in this catch-up, what after it follows it, and a message in both is delivered once. Streams of other origins or of an earlier epoch (the node restarted) are skipped. For each topic the request names, and each topic of its own a pattern the request names matches (`prices:*`: `prices:new`), a stream of its own the request does not name (one begun while the link was down, or one the peer never got a message of) is sent too, once: what it published to the topic after the arrival the peer heard of (CAP_ARRIVAL), and since the oldest of the peer's interests in it began, with up to 3 seconds before that. A node marks where its arrival order stands once a second for that. A peer that does not send its whole request within 5 seconds is dropped, and redials.
 
-So a link that drops and comes back loses nothing the origin still holds: the receiving node's subscribers get the missed messages in order, followed by the live ones, and its recovery buffers have no hole, a stream the origin began while the link was down included. A message shed on a full link is filled in the same way the next time the link comes up.
+So a link that drops and comes back loses nothing the origin still holds, and nothing the receiver had comes twice: the receiving node's subscribers get the missed messages in order, followed by the live ones, and its recovery buffers have no hole, a stream the origin began while the link was down included. A message shed on a full link is filled in the same way the next time the link comes up; with CAP_ARRIVAL, a link too full for a message is made again at once, so it comes up.
 
-After those messages the node sends a LOST frame for each topic the request names, by itself or by a pattern, of which it published a message to other nodes that it no longer holds, or never could, since the oldest of the peer's interests in it began (and up to 3 seconds before): see [LOST](#lost-0x11---messages-no-node-holds).
+After those messages the node sends a LOST frame for each topic the request names, by itself or by a pattern, of which it published a message to other nodes past that point (the arrival the peer heard of, and the start of its interest) that it no longer holds, or never could: see [LOST](#lost-0x11---messages-no-node-holds). Then, with CAP_ARRIVAL, a CAUGHT_UP frame says up to which of its arrivals the catch-up covers.
 
 ### PRODUCER_QUERY (0x0F) and PRODUCER_STATE (0x10) - A Client's Outbox Moves
 
@@ -249,7 +256,16 @@ A client that reconnects to another node names the node it was on and the highes
 [N bytes: topic or pattern]
 ```
 
-Sent after the catch-up that follows a RESUME with topics (CAP_RESUME_TOPICS): the sender published messages of this topic that no node holds, while the link was down or before, and the receiving node has no way to tell which of its clients missed them. A client of the receiving node whose last message of the topic came before the frame is told it was not recovered and resyncs; one whose last message came after it is recovered as usual. A pattern counts for each topic the receiving node has that it matches; the sender names one when it ran out of room to remember the topics themselves (100,000 of them). A message relayed live with no position, because its origin had no room to keep it, means the same for its topic.
+Sent after the catch-up that follows a RESUME with topics (CAP_RESUME_TOPICS): the sender published messages of this topic to the cluster that the receiving node did not hear of and no node holds (not kept for the memory budget, let go of from its history or its ring), and the receiving node has no way to tell which of its clients missed them. A client of the receiving node whose last message of the topic came before the frame is told it was not recovered and resyncs; one whose last message came after it is recovered as usual. A pattern counts for each topic the receiving node has that it matches; the sender names one when it ran out of room to remember the topics themselves (100,000 of them), or let go of its record of a loss the peer did not hear of: then it cannot say which topic it was. A message relayed live with no position, because its origin had no room to keep it, means the same for its topic.
+
+### CAUGHT_UP (0x12) - The Catch-up Covers Up to Here
+
+```
+[header: type=0x12, payload_len=8]
+[8 bytes: arrival number (little-endian u64)]
+```
+
+The last frame of a catch-up with CAP_ARRIVAL: everything the sender published to the cluster up to this arrival number reached the receiver before it, replayed or told LOST. Once it delivered what came before the frame, the receiver takes it as the last arrival it heard of the sender, and its next RESUME request starts there: a loss told once is not told again.
 
 ## Interest-Based Routing
 
@@ -330,7 +346,7 @@ Gossip is lightweight: PeerAnnounce and PeerList go out when links come up, and 
 | Dead letter queue | 1,000 entries, FIFO eviction |
 | Write batching | 64 KB batch limit per flush |
 | Catch-up | After a lost link, each node gets what it missed of the other's streams before anything live ([RESUME](#resume-0x0e---catch-up-after-a-lost-link)), as far as the origin's recovery buffers still hold it |
-| Backpressure | Bounded per-peer outbound channel (10,000 frames), messages dropped on overflow. The inbound MSG dispatch queue per peer is likewise bounded (10,000); overflow is shed (counted in `messages_dropped`) so the reader stays responsive to heartbeats. A shed message is missing on the receiving node until the link next comes up and its RESUME asks for it: a client recovering there across it meanwhile gets `recovered: false`. Interest and presence updates reach the manager through bounded queues (65,536); a peer that sends them faster than the manager keeps up waits, slowed down at its socket |
+| Backpressure | Bounded per-peer outbound channel (10,000 frames): with CAP_ARRIVAL a link full for a message is made again, and catches up; without, messages are dropped on overflow. The inbound MSG dispatch queue per peer is likewise bounded (10,000); overflow is shed (counted in `messages_dropped`) so the reader stays responsive to heartbeats. A shed message is missing on the receiving node until the link next comes up and its RESUME asks for it: a client recovering there across it meanwhile gets `recovered: false`. Interest and presence updates reach the manager through bounded queues (65,536); a peer that sends them faster than the manager keeps up waits, slowed down at its socket |
 
 ### Circuit Breaker
 

@@ -307,9 +307,12 @@ async fn handle_cluster_inbound_generic<S>(
         return;
     }
 
+    // What this node heard of the peer, kept across its links.
+    let heard = Arc::clone(&ctx.heard.entry(peer_instance_id.clone()).or_default());
     // Catch-up: each node first says where it stands in the other's streams.
     let wanted = if peer_caps & CAP_RESUME != 0 {
-        let Some(wanted) = exchange_resume(&mut reader, &mut writer, &ctx, peer_caps).await else {
+        let resumed = exchange_resume(&mut reader, &mut writer, &ctx, (peer_caps, &heard)).await;
+        let Some(wanted) = resumed else {
             tracing::warn!("[WSE-Cluster] No RESUME from inbound {addr} within {RESUME_TIMEOUT:?}");
             release_link(&ctx.links, &peer_instance_id, session_gen);
             return;
@@ -368,8 +371,12 @@ async fn handle_cluster_inbound_generic<S>(
 
     let (dispatch_tx, dispatch_rx) = mpsc::channel::<DispatchItem>(PEER_DISPATCH_QUEUE_CAP);
 
-    let dispatch_handle =
-        tokio::spawn(peer_dispatch_task(dispatch_rx, ctx.clone(), cancel.clone()));
+    let dispatch_handle = tokio::spawn(peer_dispatch_task(
+        dispatch_rx,
+        ctx.clone(),
+        cancel.clone(),
+        Arc::clone(&heard),
+    ));
 
     let reader_handle = tokio::spawn(peer_reader(
         reader,
@@ -378,7 +385,7 @@ async fn handle_cluster_inbound_generic<S>(
         ctx.clone(),
         dispatch_tx,
         cancel.clone(),
-        (last_activity.clone(), session_gen),
+        (last_activity.clone(), session_gen, heard),
     ));
 
     // Publish/Sub/Unsub frames from the manager (bidirectional routing),
@@ -386,7 +393,7 @@ async fn handle_cluster_inbound_generic<S>(
     if !go_live(
         &mut writer,
         &peer_reg_tx,
-        (&peer_addr_str, write_tx.clone(), peer_caps),
+        (&peer_addr_str, write_tx.clone(), peer_caps, cancel.clone()),
         wanted,
         &ctx,
     )

@@ -181,6 +181,47 @@ pub(crate) struct ClusterContext {
     pub producers: Arc<crate::server::Producers>,
     /// The links that answer for producers, and the questions out.
     pub producer_links: Arc<super::ProducerLinks>,
+    /// What this node heard of each peer, by its instance id: where the
+    /// catch-up starts once a lost link to it is back (CAP_ARRIVAL).
+    pub heard: Arc<DashMap<String, Arc<Heard>>>,
+}
+
+/// What a node heard of a peer: the last of the peer's arrivals it heard of
+/// with nothing missing before it, as far as it can tell.
+#[derive(Default)]
+pub(crate) struct Heard {
+    through: AtomicU64,
+    /// A message of the peer was shed here since the catch-up: `through`
+    /// stays where it was, so the next catch-up brings it again.
+    shed: std::sync::atomic::AtomicBool,
+}
+
+impl Heard {
+    /// A live message of the peer came, its arrival `seq`.
+    pub(crate) fn live(&self, seq: u64) {
+        if !self.shed.load(Ordering::Relaxed) {
+            self.through.fetch_max(seq, Ordering::Relaxed);
+        }
+    }
+
+    /// A message of the peer was shed: the catch-up starts before it.
+    pub(crate) fn shed(&self) {
+        self.shed.store(true, Ordering::Relaxed);
+    }
+
+    /// The peer's catch-up covers up to `through`.
+    pub(crate) fn caught_up(&self, through: u64) {
+        if !self.shed.load(Ordering::Relaxed) {
+            self.through.fetch_max(through, Ordering::Relaxed);
+        }
+    }
+
+    /// Where the next catch-up starts from: named in the request, after
+    /// which what is shed counts again.
+    pub(crate) fn asked(&self) -> u64 {
+        self.shed.store(false, Ordering::Relaxed);
+        self.through.load(Ordering::Relaxed)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -196,6 +237,9 @@ pub(crate) enum ClusterCommand {
         /// That position (epoch, offset), carried in the frame so peers store
         /// the message for cross-node recovery under the same position.
         position: Option<(u32, u64)>,
+        /// Its number in this node's arrival order (0 without recovery):
+        /// what a peer heard of this node goes by it.
+        seq: u64,
     },
     Sub {
         topic: String,
@@ -231,6 +275,8 @@ pub(crate) enum PeerRegistration {
         /// Told once the manager routes to the link: a catch-up owed to the
         /// peer is taken from the recovery buffers then.
         taken: Option<tokio::sync::oneshot::Sender<()>>,
+        /// Ends the link: one that fell behind is made again, and catches up.
+        link: tokio_util::sync::CancellationToken,
     },
     Deregister {
         peer_addr: String,

@@ -15,15 +15,15 @@ use tokio_util::sync::CancellationToken;
 
 use super::protocol::{encode_lost, write_framed};
 use super::{
-    CAP_RESUME, CAP_RESUME_TOPICS, ClusterCommand, ClusterContext, ClusterFrame, ClusterMetrics,
-    ClusterTlsConfig, DispatchItem, HEARTBEAT_INTERVAL_SECS, HEARTBEAT_TIMEOUT_SECS,
-    InterestUpdate, Link, LinkRefused, MAX_BATCH_BYTES, MAX_FRAME_SIZE, MAX_RESUME_POINTS,
-    PEER_DISPATCH_QUEUE_CAP, PEER_SESSION_GENERATION, PRESENCE_ROUND, PRESENCE_ROUND_FIRST,
-    PRESENCE_ROUND_LAST, PROTOCOL_VERSION, PeerInfo, PeerRegistration, PresencePeerFrame,
-    RESUME_TIMEOUT, ResumePoint, ResumeTopic, RoundPart, claim_link, decode_frame, encode_hello,
-    encode_peer_announce, encode_peer_list, encode_ping, encode_pong, encode_replayed,
-    encode_resume, epoch_ms, local_capabilities, negotiate_capabilities, negotiate_version,
-    release_link,
+    CAP_ARRIVAL, CAP_RESUME, CAP_RESUME_TOPICS, ClusterCommand, ClusterContext, ClusterFrame,
+    ClusterMetrics, ClusterTlsConfig, DispatchItem, HEARTBEAT_INTERVAL_SECS,
+    HEARTBEAT_TIMEOUT_SECS, Heard, InterestUpdate, Link, LinkRefused, MAX_BATCH_BYTES,
+    MAX_FRAME_SIZE, MAX_RESUME_POINTS, PEER_DISPATCH_QUEUE_CAP, PEER_SESSION_GENERATION,
+    PRESENCE_ROUND, PRESENCE_ROUND_FIRST, PRESENCE_ROUND_LAST, PROTOCOL_VERSION, PeerInfo,
+    PeerRegistration, PresencePeerFrame, RESUME_TIMEOUT, ResumePoint, ResumeTopic, RoundPart,
+    claim_link, decode_frame, encode_hello, encode_peer_announce, encode_peer_list, encode_ping,
+    encode_pong, encode_replayed, encode_resume, epoch_ms, local_capabilities,
+    negotiate_capabilities, negotiate_version, release_link,
 };
 use crate::reliability::{CircuitBreaker, ExponentialBackoff};
 
@@ -95,10 +95,10 @@ pub(super) async fn peer_reader<R: AsyncReadExt + Unpin>(
     ctx: ClusterContext,
     dispatch_tx: mpsc::Sender<DispatchItem>,
     cancel: CancellationToken,
-    session: (Arc<AtomicU64>, u64),
+    session: (Arc<AtomicU64>, u64, Arc<Heard>),
 ) {
     let _end_link = cancel.clone().drop_guard();
-    let (last_activity, generation) = session;
+    let (last_activity, generation, heard) = session;
     // BufReader: bulk reads from TCP into 64KB buffer, serves read_exact from memory
     let mut reader = BufReader::with_capacity(65_536, reader);
     let mut len_buf = [0u8; 4];
@@ -139,17 +139,23 @@ pub(super) async fn peer_reader<R: AsyncReadExt + Unpin>(
                 topic,
                 payload,
                 recovery,
+                arrival,
             }) => {
                 last_activity.store(epoch_ms(), Ordering::Relaxed);
                 // Bounded dispatch: shed (don't block the reader) when local fan-out
                 // falls behind, so a fast peer cannot grow an unbounded backlog -> OOM.
-                // Shed MSGs stay recoverable via the recovery buffer; the reader remains
-                // responsive to control/heartbeat frames on the same loop.
-                if dispatch_tx
-                    .try_send(DispatchItem::Message(topic, payload, recovery))
-                    .is_err()
-                {
+                // A shed message is not held here, and the next catch-up from
+                // the peer starts before it; the reader remains responsive to
+                // control/heartbeat frames on the same loop.
+                let item = DispatchItem::Message(topic, payload, recovery, arrival);
+                if let Err(shed) = dispatch_tx.try_send(item) {
                     ctx.metrics.messages_dropped.fetch_add(1, Ordering::Relaxed);
+                    heard.shed();
+                    if let (DispatchItem::Message(topic, ..), Some(rm)) =
+                        (shed.into_inner(), &ctx.recovery)
+                    {
+                        rm.not_kept(&topic);
+                    }
                 }
             }
             Some(ClusterFrame::Replayed {
@@ -160,7 +166,7 @@ pub(super) async fn peer_reader<R: AsyncReadExt + Unpin>(
                 last_activity.store(epoch_ms(), Ordering::Relaxed);
                 // What this node missed while the link was down: delivered,
                 // so it waits for room instead of being shed.
-                let replayed = DispatchItem::Message(topic, payload, Some(position));
+                let replayed = DispatchItem::Message(topic, payload, Some(position), None);
                 if !to_manager(&dispatch_tx, replayed, &cancel).await {
                     break;
                 }
@@ -169,6 +175,13 @@ pub(super) async fn peer_reader<R: AsyncReadExt + Unpin>(
                 last_activity.store(epoch_ms(), Ordering::Relaxed);
                 // In order with the messages replayed before it.
                 if !to_manager(&dispatch_tx, DispatchItem::Lost(topic), &cancel).await {
+                    break;
+                }
+            }
+            Some(ClusterFrame::CaughtUp { through }) => {
+                last_activity.store(epoch_ms(), Ordering::Relaxed);
+                // Heard once what came before it is delivered.
+                if !to_manager(&dispatch_tx, DispatchItem::CaughtUp(through), &cancel).await {
                     break;
                 }
             }
@@ -361,6 +374,7 @@ pub(super) async fn peer_dispatch_task(
     mut dispatch_rx: mpsc::Receiver<DispatchItem>,
     ctx: ClusterContext,
     cancel: CancellationToken,
+    heard: Arc<Heard>,
 ) {
     let _end_link = cancel.clone().drop_guard();
     let mut batch: Vec<DispatchItem> = Vec::with_capacity(64);
@@ -387,15 +401,25 @@ pub(super) async fn peer_dispatch_task(
         let mut total_dropped = 0u64;
 
         for item in batch.drain(..) {
-            let (topic, payload, rec) = match item {
-                DispatchItem::Message(topic, payload, rec) => (topic, payload, rec),
+            let (topic, payload, rec, arrival) = match item {
+                DispatchItem::Message(topic, payload, rec, arrival) => {
+                    (topic, payload, rec, arrival)
+                }
                 DispatchItem::Lost(topic) => {
                     if let Some(rm) = &ctx.recovery {
                         rm.lost(&topic);
                     }
                     continue;
                 }
+                DispatchItem::CaughtUp(through) => {
+                    heard.caught_up(through);
+                    continue;
+                }
             };
+            // Heard of once it is here: delivered below, or held already.
+            if let Some(seq) = arrival {
+                heard.live(seq);
+            }
             // Store the unframed payload in the foreign recovery buffer
             // (cross-node recovery), the form the local buffer stores too.
             // One this node has already (a peer catching it up sends from
@@ -500,6 +524,8 @@ pub(super) async fn heartbeat_task(
 pub(super) struct Wanted {
     points: Vec<ResumePoint>,
     topics: Vec<ResumeTopic>,
+    /// The last of this node's arrivals the peer heard of (CAP_ARRIVAL).
+    heard: Option<u64>,
 }
 
 /// The catch-up on a new link (CAP_RESUME): this node's RESUME request goes
@@ -511,12 +537,13 @@ pub(super) async fn exchange_resume<R, W>(
     reader: &mut R,
     writer: &mut W,
     ctx: &ClusterContext,
-    peer_caps: u32,
+    peer: (u32, &Heard),
 ) -> Option<Wanted>
 where
     R: AsyncReadExt + Unpin,
     W: AsyncWriteExt + Unpin,
 {
+    let (peer_caps, heard) = peer;
     let (points, topics) = ctx.recovery.as_ref().map_or_else(Default::default, |rm| {
         let topics = if peer_caps & CAP_RESUME_TOPICS != 0 {
             rm.interests()
@@ -525,8 +552,9 @@ where
         };
         (rm.foreign_positions(), topics)
     });
+    let heard = (peer_caps & CAP_ARRIVAL != 0).then(|| heard.asked());
     let mut request = BytesMut::new();
-    for frame in encode_resume(&points, &topics) {
+    for frame in encode_resume(&points, &topics, heard) {
         write_framed(&mut request, &frame);
     }
     let send = async {
@@ -539,11 +567,13 @@ where
             let Ok(Some(ClusterFrame::Resume {
                 points,
                 topics,
+                heard,
                 last,
             })) = read_frame(reader).await
             else {
                 return None;
             };
+            wanted.heard = wanted.heard.max(heard);
             let asked = wanted.points.len() + wanted.topics.len();
             if asked + points.len() + topics.len() > MAX_RESUME_POINTS {
                 return None;
@@ -634,6 +664,9 @@ where
     let Some(rm) = &ctx.recovery else {
         return Ok(0);
     };
+    // The manager routes to the link already: what this node publishes from
+    // here on reaches the peer live, after this.
+    let through = rm.arrived_through();
     let mut replay = Replay {
         out: BytesMut::with_capacity(MAX_BATCH_BYTES),
         frame: BytesMut::new(),
@@ -645,47 +678,48 @@ where
             replay.push(writer, topic, (*epoch, offset), &data).await?;
         }
     }
-    let named: std::collections::HashSet<(&str, u32)> = if wanted.topics.is_empty() {
-        std::collections::HashSet::new()
-    } else {
-        wanted
-            .points
-            .iter()
-            .map(|(topic, epoch, _)| (topic.as_str(), *epoch))
-            .collect()
-    };
+    let named: std::collections::HashSet<(&str, u32)> = wanted
+        .points
+        .iter()
+        .map(|(topic, epoch, _)| (topic.as_str(), *epoch))
+        .collect();
+    // Where the peer stands in this node's arrival order for a topic it has
+    // since `age` ago: past what it heard of this node, and past where its
+    // interest began (what came before was never relayed to it).
+    let heard = wanted.heard.unwrap_or(0);
+    let unheard_after = |age: u64| heard.max(rm.arrived_before(Duration::from_millis(age)));
     // Each topic of this node's the peer has, by its name or by a pattern
-    // that matches it: once, since the oldest of those interests began.
-    let mut lately: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
+    // that matches it: once, from the earliest of those.
+    let mut unheard: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
     for (topic, age) in &wanted.topics {
+        let after = unheard_after(*age);
         let matched = if crate::server::is_pattern(topic) {
             rm.own_topics_matching(topic)
         } else {
             vec![topic.clone()]
         };
         for topic in matched {
-            let since = lately.entry(topic).or_insert(0);
-            *since = (*since).max(*age);
+            let from = unheard.entry(topic).or_insert(u64::MAX);
+            *from = (*from).min(after);
         }
     }
-    for (topic, age) in &lately {
+    for (topic, after) in &unheard {
         let named = |epoch: u32| named.contains(&(topic.as_str(), epoch));
-        let lately = rm.published_lately(topic, Duration::from_millis(*age), named);
-        let Some((epoch, messages)) = lately else {
+        let Some((epoch, messages)) = rm.published_unheard(topic, *after, named) else {
             continue;
         };
         for (offset, data) in messages {
             replay.push(writer, topic, (epoch, offset), &data).await?;
         }
     }
-    // Of each topic the peer has, by its name or a pattern, what was not kept
-    // here since its interest began, a topic with no history here included:
-    // after what was replayed, so a client of the peer whose last message
-    // came before it is not told it missed nothing.
+    // Of each topic the peer has, by its name or a pattern, what it did not
+    // hear of and this node no longer holds, or never could: after what was
+    // replayed, so a client of the peer whose last message came before it is
+    // not told it missed nothing.
     let mut lost: Vec<String> = wanted
         .topics
         .iter()
-        .flat_map(|(topic, age)| rm.lost_lately(topic, Duration::from_millis(*age)))
+        .flat_map(|(topic, age)| rm.lost_after(topic, unheard_after(*age)))
         .collect();
     lost.sort_unstable();
     lost.dedup();
@@ -694,6 +728,12 @@ where
         if encode_lost(&mut replay.frame, name) {
             write_framed(&mut replay.out, &replay.frame);
         }
+    }
+    // The peer heard of this node up to here: a later catch-up starts after.
+    if wanted.heard.is_some() {
+        replay.frame.clear();
+        super::protocol::encode_caught_up(&mut replay.frame, through);
+        write_framed(&mut replay.out, &replay.frame);
     }
     write_progressing(writer, &replay.out).await?;
     let bytes = replay.bytes + replay.out.len() as u64;
@@ -714,14 +754,14 @@ where
 pub(super) async fn go_live<W>(
     writer: &mut W,
     peer_reg_tx: &mpsc::UnboundedSender<PeerRegistration>,
-    link: (&str, mpsc::Sender<Bytes>, u32),
+    link: (&str, mpsc::Sender<Bytes>, u32, CancellationToken),
     wanted: Option<Wanted>,
     ctx: &ClusterContext,
 ) -> bool
 where
     W: AsyncWriteExt + Unpin,
 {
-    let (peer_addr, write_tx, negotiated_caps) = link;
+    let (peer_addr, write_tx, negotiated_caps, link) = link;
     let (taken, routed) = match wanted {
         Some(_) => {
             let (tx, rx) = tokio::sync::oneshot::channel();
@@ -734,6 +774,7 @@ where
         write_tx,
         negotiated_caps,
         taken,
+        link,
     });
     let (Some(wanted), Some(routed)) = (wanted, routed) else {
         return true;
@@ -881,9 +922,12 @@ where
         }
     }
 
+    // What this node heard of the peer, kept across its links.
+    let heard = Arc::clone(&ctx.heard.entry(peer_instance_id.clone()).or_default());
     // Catch-up: each node first says where it stands in the other's streams.
     let wanted = if peer_caps & CAP_RESUME != 0 {
-        let Some(wanted) = exchange_resume(&mut reader, &mut writer, ctx, peer_caps).await else {
+        let resumed = exchange_resume(&mut reader, &mut writer, ctx, (peer_caps, &heard)).await;
+        let Some(wanted) = resumed else {
             tracing::warn!("[WSE-Cluster] No RESUME from {peer_addr} within {RESUME_TIMEOUT:?}");
             release_link(&ctx.links, &peer_instance_id, session_gen);
             return Outcome::Failed;
@@ -942,6 +986,7 @@ where
         dispatch_rx,
         ctx.clone(),
         peer_cancel.clone(),
+        Arc::clone(&heard),
     ));
 
     let reader_handle = tokio::spawn(peer_reader(
@@ -951,13 +996,18 @@ where
         ctx.clone(),
         dispatch_tx,
         peer_cancel.clone(),
-        (last_activity.clone(), session_gen),
+        (last_activity.clone(), session_gen, heard),
     ));
 
     if !go_live(
         &mut writer,
         peer_reg_tx,
-        (peer_addr, peer_write_tx.clone(), peer_caps),
+        (
+            peer_addr,
+            peer_write_tx.clone(),
+            peer_caps,
+            peer_cancel.clone(),
+        ),
         wanted,
         ctx,
     )
