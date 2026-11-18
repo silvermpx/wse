@@ -266,10 +266,10 @@ class SyncWSEClient:
             # Another connect() is on its way: its outcome is this one's.
             if wait:
                 self._outcome_of(running, timeout, abandon=False)
-                # One started connects in the background: this call
-                # returns once that connection is up.
-                if not running.wait:
-                    self._connected(running, timeout)
+                # The session connects in the background (one started, or
+                # one whose connection dropped): this call returns once its
+                # connection is up.
+                self._connected(running, timeout)
             return
         session.thread.start()  # type: ignore[union-attr]
         self._outcome_of(session, timeout, abandon=True)

@@ -376,6 +376,19 @@ class TestSyncOutbox:
             assert client.is_connected
             client.close()
 
+    def test_a_connect_after_a_drop_returns_once_the_connection_is_up_again(self):
+        # The first connection at once, the next after a while.
+        st = ServerThread(upgrade_delay=lambda index: 0.0 if index == 0 else 0.35)
+        with st as srv:
+            client = SyncWSEClient(srv.url, reconnect=FAST)
+            client.connect(timeout=5)
+            st.call(srv.connections[0].ws.close(1001))
+            wait_until(lambda: not client.is_connected)
+            client.connect(timeout=5)
+            assert client.is_connected
+            assert client.is_ready
+            client.close()
+
     def test_a_connect_made_while_one_is_on_its_way_gets_its_outcome(self):
         st = ServerThread(upgrade_delay=lambda _index: 0.25)
         with st as srv:

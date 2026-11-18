@@ -684,7 +684,13 @@ class AsyncWSEClient:
             # Connecting in the background: returns once it is up.
             up: asyncio.Future[None] = asyncio.get_running_loop().create_future()
             self._waiting_up.append(up)
-            await up
+            try:
+                await up
+            except asyncio.CancelledError:
+                # Given up (timed out, cancelled): it waits no more.
+                if up in self._waiting_up:
+                    self._waiting_up.remove(up)
+                raise
             return
         outcome: asyncio.Future[None] = asyncio.get_running_loop().create_future()
         self._connecting = outcome

@@ -591,6 +591,18 @@ class TestTheStreamsEnd:
             assert client.is_ready
             await client.disconnect()
 
+    async def test_a_connect_that_gives_up_waiting_waits_no_more(self):
+        async with FakeWSEServer(upgrade_delay=lambda _index: 0.5) as server:
+            client = make_client(server.url)
+            await client.start()
+            for _ in range(4):
+                with pytest.raises(asyncio.TimeoutError):
+                    await asyncio.wait_for(client.connect(), timeout=0.02)
+            assert client._waiting_up == []
+            await client.connect()
+            assert client.is_ready
+            await client.disconnect()
+
     async def test_a_connect_after_start_hears_the_client_give_up(self):
         client = AsyncWSEClient(
             "ws://127.0.0.1:9/wse",

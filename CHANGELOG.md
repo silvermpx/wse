@@ -142,6 +142,10 @@ server every client is checked against.
   said `queued` and waited for good.
 - Python: a connection for another user starts the topics over and drops
   the last user's queue; `SyncWSEClient` takes `cookie_name`.
+- Python: `SyncWSEClient.connect()` after the connection dropped returns
+  once it is up again (or raises), as after `start()`; it returned at once.
+  An `AsyncWSEClient.connect()` that gave up waiting (a timeout around it)
+  is let go; each one stayed with the client until it connected.
 - Rust client (and Swift, Kotlin, Dart): a connection that died while the
   device slept is made again at the first heartbeat after waking (15 s at
   most, not 40 s).
