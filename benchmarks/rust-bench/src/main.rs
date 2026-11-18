@@ -10,6 +10,15 @@ macro_rules! say {
     };
 }
 
+/// [`say!`] of a check that failed: the run says so in its exit code,
+/// however its test ends.
+macro_rules! fail {
+    ($($arg:tt)*) => {{
+        crate::report::failed();
+        say!($($arg)*)
+    }};
+}
+
 /// [`say!`] without the end of the line.
 macro_rules! say_on {
     ($($arg:tt)*) => {

@@ -128,7 +128,7 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
         {
             Ok(ws) => clients.push(ws),
             Err(e) => {
-                say!(
+                fail!(
                     "    [FAIL] Failed to connect client {} ({}): {}",
                     i,
                     label,
@@ -227,7 +227,7 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
     {
         Ok(ws) => ws,
         Err(e) => {
-            say!("    [FAIL] Failed to connect publisher: {}", e);
+            fail!("    [FAIL] Failed to connect publisher: {}", e);
             protocol::close_all(clients).await;
             return Vec::new();
         }

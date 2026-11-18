@@ -143,6 +143,9 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
         // Correctness checks
         let ba_ok = ba_count > 0;
         let topic_ok = topic_count > 0;
+        if !ba_ok || !topic_ok {
+            crate::report::failed();
+        }
 
         say!("    Duration:       {:.2}s", elapsed);
         say!(

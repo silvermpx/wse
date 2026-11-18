@@ -210,7 +210,7 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
     let mut ws = match connect_raw(&cli.host, cli.port, &token).await {
         Ok(ws) => ws,
         Err(e) => {
-            say!("    [FAIL] Could not connect: {}", e);
+            fail!("    [FAIL] Could not connect: {}", e);
             return vec![];
         }
     };
@@ -307,7 +307,7 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
     {
         Ok(ws) => ws,
         Err(e) => {
-            say!("    [FAIL] Could not connect unencrypted: {}", e);
+            fail!("    [FAIL] Could not connect unencrypted: {}", e);
             return vec![];
         }
     };
@@ -330,7 +330,7 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
     let mut ws_bad = match connect_raw(&cli.host, cli.port, &token).await {
         Ok(ws) => ws,
         Err(e) => {
-            say!("    [FAIL] Could not connect: {}", e);
+            fail!("    [FAIL] Could not connect: {}", e);
             return vec![];
         }
     };
@@ -391,7 +391,7 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
     let mut ws_enc = match connect_raw(&cli.host, cli.port, &token).await {
         Ok(ws) => ws,
         Err(e) => {
-            say!("    [FAIL] Could not connect: {}", e);
+            fail!("    [FAIL] Could not connect: {}", e);
             return vec![];
         }
     };

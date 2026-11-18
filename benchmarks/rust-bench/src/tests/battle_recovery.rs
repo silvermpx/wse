@@ -127,7 +127,7 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
     {
         Ok(ws) => ws,
         Err(e) => {
-            say!("    [FAIL] Failed to connect: {}", e);
+            fail!("    [FAIL] Failed to connect: {}", e);
             return Vec::new();
         }
     };
@@ -280,7 +280,7 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
     {
         Ok(ws) => ws,
         Err(e) => {
-            say!("    [FAIL] Failed to connect helper: {}", e);
+            fail!("    [FAIL] Failed to connect helper: {}", e);
             return Vec::new();
         }
     };
@@ -328,7 +328,7 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
     {
         Ok(ws) => ws,
         Err(e) => {
-            say!("    [FAIL] Failed to reconnect: {}", e);
+            fail!("    [FAIL] Failed to reconnect: {}", e);
             return Vec::new();
         }
     };

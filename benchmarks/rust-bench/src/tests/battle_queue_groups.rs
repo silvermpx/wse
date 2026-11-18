@@ -122,7 +122,7 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
         {
             Ok(ws) => workers.push(ws),
             Err(e) => {
-                say!("    [FAIL] Failed to connect worker {}: {}", i, e);
+                fail!("    [FAIL] Failed to connect worker {}: {}", i, e);
                 checks.check("All workers connected", false);
                 protocol::close_all(workers).await;
                 return Vec::new();
@@ -175,7 +175,7 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
         {
             Ok(ws) => fanout_clients.push(ws),
             Err(e) => {
-                say!("    [FAIL] Failed to connect fanout {}: {}", i, e);
+                fail!("    [FAIL] Failed to connect fanout {}: {}", i, e);
                 checks.check("All fanout clients connected", false);
                 protocol::close_all(workers).await;
                 protocol::close_all(fanout_clients).await;
@@ -224,7 +224,7 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
     {
         Ok(ws) => ws,
         Err(e) => {
-            say!("    [FAIL] Failed to connect publisher: {}", e);
+            fail!("    [FAIL] Failed to connect publisher: {}", e);
             protocol::close_all(workers).await;
             protocol::close_all(fanout_clients).await;
             return Vec::new();

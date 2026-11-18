@@ -45,10 +45,43 @@ async fn a_test_that_stops_early_fails_the_run_and_json_is_alone_on_stdout() {
     .await
     .unwrap();
     let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(!out.status.success(), "a failed check fails the run: {stderr}");
+    assert!(
+        !out.status.success(),
+        "a failed check fails the run: {stderr}"
+    );
     assert!(stderr.contains("[FAIL]"), "{stderr}");
     let stdout = String::from_utf8(out.stdout).unwrap();
     let report: serde_json::Value = serde_json::from_str(&stdout)
         .unwrap_or_else(|e| panic!("stdout is the JSON report alone ({e}): {stdout}"));
     assert_eq!(report[0]["test"], "BattlePresence");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn every_test_that_cannot_connect_fails_the_run() {
+    for test in [
+        "battle-presence",
+        "battle-recovery",
+        "battle-encryption",
+        "battle-queue-groups",
+        "battle-topic-acl",
+        "battle-drain",
+        "battle-metrics",
+    ] {
+        let port = one_connection().await;
+        let out = tokio::task::spawn_blocking(move || {
+            Command::new(env!("CARGO_BIN_EXE_wse-bench"))
+                .args(["--test", test, "--port"])
+                .arg(port.to_string())
+                .output()
+                .unwrap()
+        })
+        .await
+        .unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(stdout.contains("[FAIL]"), "{test}: {stdout}");
+        assert!(
+            !out.status.success(),
+            "{test} printed FAIL and exited 0: {stdout}"
+        );
+    }
 }
