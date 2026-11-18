@@ -32,10 +32,12 @@ export function toMarkdown(reports: TestReport[]): string {
       continue;
     }
 
+    // What was measured: a latency (a ping test counts its pings as sent,
+    // over no duration), a rate over a duration, or connections alone.
     const hasLatency = report.results.some((r) => r.latency !== null);
-    const hasMsgs = report.results.some((r) => r.messagesSent > 0);
+    const hasMsgs = report.results.some((r) => r.messagesSent > 0 && r.durationSecs > 0);
 
-    if (hasLatency && !hasMsgs) {
+    if (hasLatency) {
       lines.push('| Connections | p50 | p95 | p99 | p99.9 | Errors |');
       lines.push('|-------------|-----|-----|-----|-------|--------|');
       for (const r of report.results) {
@@ -44,7 +46,9 @@ export function toMarkdown(reports: TestReport[]): string {
           `| ${r.tier} | ${l ? l.p50.toFixed(2) : '-'} ms | ${l ? l.p95.toFixed(2) : '-'} ms | ${l ? l.p99.toFixed(2) : '-'} ms | ${l ? l.p99_9.toFixed(2) : '-'} ms | ${r.errors} |`
         );
       }
-    } else if (hasMsgs) {
+    }
+    if (hasMsgs) {
+      if (hasLatency) lines.push('');
       lines.push('| Connections | Msg/s | MB/s | Per-conn msg/s | Errors |');
       lines.push('|-------------|-------|------|---------------|--------|');
       for (const r of report.results) {
@@ -55,7 +59,8 @@ export function toMarkdown(reports: TestReport[]): string {
           `| ${r.tier} | ${fmtRate(rate)} | ${mbps.toFixed(1)} | ${perConn} | ${r.errors} |`
         );
       }
-    } else {
+    }
+    if (!hasLatency && !hasMsgs) {
       lines.push('| Connections | Connected | Errors | Duration |');
       lines.push('|-------------|-----------|--------|----------|');
       for (const r of report.results) {
