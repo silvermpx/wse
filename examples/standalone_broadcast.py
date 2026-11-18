@@ -1,7 +1,10 @@
 """Standalone WSE server with topic subscriptions and fan-out.
 
 Clients connect and get auto-subscribed to 'prices'.
-Server publishes price ticks every 100ms.
+Server publishes price ticks every 100ms. A client subscribes to more
+topics, and unsubscribes, on its own (the clients' subscription_update):
+with client_subscriptions=True the server answers it, within the topics
+the connection's ACL allows (its token's claim, or set_topic_acl).
 
 Three broadcast methods:
   - broadcast_all(data)           -- send to ALL connections (no topics)
@@ -53,15 +56,6 @@ def event_loop(server: RustWSEServer, stop: threading.Event):
                 # subscribe this connection to the prices topic
                 server.subscribe_connection(conn_id, ["prices"])
 
-            elif event_type == "msg":
-                data = event[2]
-                # client can request additional topics at runtime
-                if isinstance(data, dict) and data.get("t") == "subscribe":
-                    topics = data.get("p", {}).get("topics", [])
-                    if topics:
-                        server.subscribe_connection(conn_id, topics)
-                        print(f"[sub] {conn_id} subscribed to {topics}")
-
             elif event_type == "disconnect":
                 print(f"[-] {conn_id} disconnected")
 
@@ -72,14 +66,16 @@ def publisher(server: RustWSEServer, stop: threading.Event):
     start = time.time()
 
     while not stop.is_set():
-        msg = json.dumps({
-            "t": "price_update",
-            "p": {
-                "symbol": "AAPL",
-                "price": round(187.42 + seq * 0.01, 2),
-                "seq": seq,
-            },
-        })
+        msg = json.dumps(
+            {
+                "t": "price_update",
+                "p": {
+                    "symbol": "AAPL",
+                    "price": round(187.42 + seq * 0.01, 2),
+                    "seq": seq,
+                },
+            }
+        )
 
         # broadcast_local sends to subscribers of 'prices' on this instance
         server.broadcast_local("prices", msg)
@@ -100,15 +96,23 @@ def publisher(server: RustWSEServer, stop: threading.Event):
         time.sleep(0.1)
 
 
-def main():
+def make_server(host: str = HOST, port: int = PORT) -> RustWSEServer:
     server = RustWSEServer(
-        HOST, PORT,
+        host,
+        port,
         max_connections=10_000,
         jwt_secret=JWT_SECRET,
         jwt_issuer=JWT_ISSUER,
         jwt_audience=JWT_AUDIENCE,
+        # The server answers the clients' subscribe and unsubscribe.
+        client_subscriptions=True,
     )
     server.enable_drain_mode()
+    return server
+
+
+def main():
+    server = make_server()
     server.start()
 
     token = make_token()
