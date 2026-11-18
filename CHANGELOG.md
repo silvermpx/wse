@@ -87,8 +87,10 @@ conformance server every client is checked against.
   recorded (order, no silent loss, no repeat, each message taken once, a
   live message never late, a held topic until its resync, back soon after a
   cut). Every client passes them: TypeScript (on its own, through both
-  bridges, in Electron and in Tauri), Rust (natively and in the browser),
-  Python, Swift, Kotlin and Dart; the release checks the reports.
+  bridges, in Electron, in Tauri and in a React Native app on Android),
+  Rust (natively and in the browser), Python, Swift (macOS and iOS), Kotlin
+  (the JVM and Android) and Dart (the desktop, iOS and Android); CI checks
+  every report.
 - Example applications for Electron and Tauri: two windows on one
   connection, in German and English. Applications built against the packed
   packages run in CI and in the release: Angular 20 to 22 and Solid 1.9 and
