@@ -129,12 +129,18 @@ pub(super) async fn process_commands(
                 let mut position = None;
                 let stamped: Bytes = if !skip_recovery && let Some(ref recovery) = state.recovery {
                     let text = std::str::from_utf8(&original).unwrap_or("");
-                    recovery
-                        .push_stamped(&topic, |epoch, offset| {
-                            position = Some((epoch, offset));
-                            Bytes::from(stamp_recovery_fields(text, &topic, epoch, offset))
-                        })
-                        .unwrap_or_else(|| original.clone())
+                    let stamp = |epoch, offset| {
+                        position = Some((epoch, offset));
+                        Bytes::from(stamp_recovery_fields(text, &topic, epoch, offset))
+                    };
+                    // One for this server's subscribers only is never sent
+                    // to another node, in a catch-up either.
+                    if publish {
+                        recovery.push_stamped(&topic, stamp)
+                    } else {
+                        recovery.push_stamped_local(&topic, stamp)
+                    }
+                    .unwrap_or_else(|| original.clone())
                 } else {
                     original.clone()
                 };

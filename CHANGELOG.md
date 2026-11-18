@@ -154,6 +154,9 @@ server every client is checked against.
   link was down is told to the other node after the catch-up (LOST): a
   recovery from before it there says `recovered: false`, where it said it
   missed nothing.
+- Cluster: a message published to one node's subscribers only
+  (`publish_local`, `broadcast_local` in Python) is no longer sent to other
+  nodes when a link comes up; the catch-up sent it with the rest.
 - Cluster: a node with no room left for history no longer delivers a
   message relayed to it twice once a lost link is back: its catch-up request
   names where it stands in the streams it keeps no buffer of, and what was

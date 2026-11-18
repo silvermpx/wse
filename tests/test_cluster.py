@@ -518,6 +518,36 @@ def test_a_message_a_node_had_no_room_to_keep_is_not_delivered_again_after_a_los
     assert [message["p"]["n"] for message in got] == [0, 1, 2], got
 
 
+def test_a_message_published_to_one_nodes_subscribers_stays_there_through_a_catch_up(nodes):
+    """What a node publishes to its own subscribers only is not sent to
+    another node when a link comes up, with the catch-up of what it missed."""
+    websockets = pytest.importorskip("websockets")
+    origin = nodes(recovery=True)
+    other = nodes(recovery=True)
+
+    def message(topic, n):
+        return json.dumps({"t": topic, "p": {"n": n}})
+
+    async def scenario():
+        async with websockets.connect(f"ws://127.0.0.1:{other.port}/wse") as live:
+            await subscribe_next_client(other, ["news", "barrier"])
+            origin.server.broadcast_local("news", message("news", 1))
+            origin.join()
+            other.join(origin)
+            await until(lambda: origin.peers == 1 and other.peers == 1)
+            await asyncio.sleep(0.5)
+            origin.server.broadcast("barrier", message("barrier", 2))
+            got = []
+            while not got or got[-1].get("t") != "barrier":
+                frame = await asyncio.wait_for(live.recv(), 5.0)
+                text = frame if isinstance(frame, str) else frame.decode(errors="replace")
+                got.append(json.loads(text[text.index("{") :]))
+        return [entry.get("t") for entry in got]
+
+    seen = asyncio.run(scenario())
+    assert "news" not in seen, seen
+
+
 def test_a_message_its_origin_had_no_room_to_keep_is_never_said_recovered(nodes):
     """The origin of a message had no room left for its history and sent it
     on with no position: a client of the other node whose last message of the

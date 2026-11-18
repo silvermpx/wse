@@ -143,6 +143,11 @@ struct TopicRecoveryBuffer {
     key_len: usize,
     /// Timestamp of the most recent push.
     last_write: Instant,
+    /// The offsets of the messages published to this node's subscribers
+    /// only, oldest first: never sent to another node.
+    local: VecDeque<u64>,
+    /// It held a message published to other nodes too.
+    shared: bool,
 }
 
 impl TopicRecoveryBuffer {
@@ -166,6 +171,8 @@ impl TopicRecoveryBuffer {
             total_bytes: 0,
             key_len,
             last_write: Instant::now(),
+            local: VecDeque::new(),
+            shared: false,
         }
     }
 
@@ -180,22 +187,33 @@ impl TopicRecoveryBuffer {
     fn footprint(&self) -> usize {
         self.total_bytes
             + self.entries.capacity() * size_of::<(Bytes, u64)>()
+            + self.local.capacity() * size_of::<u64>()
             + self.key_len
             + BUFFER_OVERHEAD
     }
 
-    /// Push a message into the buffer. Returns the assigned offset.
+    /// Push a message into the buffer, one published to this node's
+    /// subscribers only or to other nodes too. Returns the assigned offset.
     ///
     /// When the buffer is full, the oldest entry is evicted.
-    fn push(&mut self, data: Bytes, seq: u64) -> u64 {
-        if self.entries.len() >= self.capacity
-            && let Some((old, old_seq)) = self.entries.pop_front()
-        {
-            self.total_bytes -= old.len();
-            self.evicted_through = self.evicted_through.max(old_seq);
+    fn push(&mut self, data: Bytes, seq: u64, local_only: bool) -> u64 {
+        if self.entries.len() >= self.capacity {
+            let evicted = self.tail_offset();
+            if let Some((old, old_seq)) = self.entries.pop_front() {
+                self.total_bytes -= old.len();
+                self.evicted_through = self.evicted_through.max(old_seq);
+            }
+            if self.local.front() == Some(&evicted) {
+                self.local.pop_front();
+            }
         }
 
         let offset = self.head_offset;
+        if local_only {
+            self.local.push_back(offset);
+        } else {
+            self.shared = true;
+        }
         self.total_bytes += data.len();
         self.entries.push_back((data, seq));
         self.head_offset += 1;
@@ -278,6 +296,22 @@ impl TopicRecoveryBuffer {
             .map_or(self.evicted_through, |(_, seq)| *seq)
     }
 
+    /// From offset `from` on, the messages held that went to other nodes
+    /// too: each one's offset, arrival number and bytes.
+    fn shared_from(&self, from: u64) -> impl Iterator<Item = (u64, u64, &Bytes)> {
+        let tail = self.tail_offset();
+        let from = from.max(tail);
+        let first_local = self.local.partition_point(|offset| *offset < from);
+        let mut local = self.local.range(first_local..).copied().peekable();
+        self.entries
+            .iter()
+            .skip(usize::try_from(from - tail).unwrap_or(usize::MAX))
+            .zip(from..)
+            .filter_map(move |((data, seq), offset)| {
+                (local.next_if_eq(&offset).is_none()).then_some((offset, *seq, data))
+            })
+    }
+
     /// The messages that arrived after `seq`; None when one of them was
     /// evicted already.
     fn arrived_after(&self, seq: u64) -> Option<Vec<Arrived>> {
@@ -302,6 +336,35 @@ impl TopicRecoveryBuffer {
 // This buffer stores those messages keyed by the origin node's epoch so that a
 // client reconnecting to *this* node can recover using the original epoch/offset
 // even though the messages originated elsewhere.
+
+/// What this node no longer holds of a topic: the latest arrival among it,
+/// when the last of it went, and when the last went of what this node
+/// published to other nodes (None: none of that).
+#[derive(Clone, Copy)]
+struct Removed {
+    through: u64,
+    at: Instant,
+    shared_at: Option<Instant>,
+}
+
+impl Removed {
+    fn note(&mut self, seq: u64, shared: bool) {
+        let now = Instant::now();
+        self.through = self.through.max(seq);
+        self.at = now;
+        if shared {
+            self.shared_at = Some(now);
+        }
+    }
+
+    fn none() -> Self {
+        Self {
+            through: 0,
+            at: Instant::now(),
+            shared_at: None,
+        }
+    }
+}
 
 /// Where this node stands in a stream relayed to it that it holds no buffer
 /// of (no room to make one, or it was removed): every offset up to
@@ -676,10 +739,10 @@ pub(crate) struct RecoveryManager {
     /// heard from. Kept while the topic has buffers, and for the history's
     /// lifetime after: a peer that comes back after a lost link is told of
     /// what was not kept meanwhile.
-    removed_through: DashMap<String, (u64, Instant)>,
+    removed_through: DashMap<String, Removed>,
     /// The latest arrival not kept of a topic that found no room among
     /// `MAX_UNKEPT_TOPICS`, and when: it counts for every topic.
-    removed_any: parking_lot::Mutex<Option<(u64, Instant)>>,
+    removed_any: parking_lot::Mutex<Option<Removed>>,
     /// Per relayed stream with no buffer here ("topic\0epoch"), where this
     /// node stands in it.
     relayed_unkept: DashMap<String, Delivered>,
@@ -722,6 +785,22 @@ impl RecoveryManager {
     where
         F: FnOnce(u32, u64) -> Bytes,
     {
+        self.push_stamped_as(topic, false, build)
+    }
+
+    /// `push_stamped` for a message published to this node's subscribers
+    /// only: kept for them, never sent to another node.
+    pub(crate) fn push_stamped_local<F>(&self, topic: &str, build: F) -> Option<Bytes>
+    where
+        F: FnOnce(u32, u64) -> Bytes,
+    {
+        self.push_stamped_as(topic, true, build)
+    }
+
+    fn push_stamped_as<F>(&self, topic: &str, local_only: bool, build: F) -> Option<Bytes>
+    where
+        F: FnOnce(u32, u64) -> Bytes,
+    {
         let mut created = false;
         // A topic that has a buffer is found without making a key.
         let mut entry = match self.buffers.get_mut(topic) {
@@ -731,7 +810,8 @@ impl RecoveryManager {
             {
                 // Not kept: a client whose last message of the topic came
                 // before it cannot be told it missed nothing.
-                self.note_removed(topic, self.arrival.fetch_add(1, Ordering::Relaxed));
+                let seq = self.arrival.fetch_add(1, Ordering::Relaxed);
+                self.note_removed(topic, seq, !local_only);
                 return None;
             }
             None => self.buffers.entry(topic.to_owned()).or_insert_with(|| {
@@ -746,7 +826,11 @@ impl RecoveryManager {
         let data = build(epoch, offset);
 
         let old_bytes = if created { 0 } else { buf.footprint() };
-        buf.push(data.clone(), self.arrival.fetch_add(1, Ordering::Relaxed));
+        buf.push(
+            data.clone(),
+            self.arrival.fetch_add(1, Ordering::Relaxed),
+            local_only,
+        );
         let new_bytes = buf.footprint();
 
         // Update global byte counter with the delta (accounts for evictions).
@@ -821,10 +905,8 @@ impl RecoveryManager {
                 if !self.deliver_unkept(key, origin_epoch, origin_offset) {
                     return false;
                 }
-                self.note_removed(
-                    foreign_topic(key),
-                    self.arrival.fetch_add(1, Ordering::Relaxed),
-                );
+                let seq = self.arrival.fetch_add(1, Ordering::Relaxed);
+                self.note_removed(foreign_topic(key), seq, false);
                 return true;
             }
             // Delivered before, with no buffer to hold it then: not again,
@@ -837,10 +919,8 @@ impl RecoveryManager {
                     return false;
                 }
                 drop(delivered);
-                self.note_removed(
-                    foreign_topic(key),
-                    self.arrival.fetch_add(1, Ordering::Relaxed),
-                );
+                let seq = self.arrival.fetch_add(1, Ordering::Relaxed);
+                self.note_removed(foreign_topic(key), seq, false);
                 return true;
             }
             None => self
@@ -932,13 +1012,8 @@ impl RecoveryManager {
         if buf.epoch != epoch {
             return Vec::new();
         }
-        let tail = buf.tail_offset();
-        let from = after.saturating_add(1).max(tail);
-        buf.entries
-            .iter()
-            .skip((from - tail) as usize)
-            .zip(from..)
-            .map(|((data, _), offset)| (offset, data.clone()))
+        buf.shared_from(after.saturating_add(1))
+            .map(|(offset, _, data)| (offset, data.clone()))
             .collect()
     }
 
@@ -1321,7 +1396,7 @@ impl RecoveryManager {
         }
         for key in &to_remove {
             if let Some((_, removed)) = self.buffers.remove(key) {
-                self.note_removed(key, removed.last_seq());
+                self.note_removed(key, removed.last_seq(), removed.shared);
                 let _ = self
                     .total_bytes
                     .try_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
@@ -1339,7 +1414,7 @@ impl RecoveryManager {
         }
         for key in &foreign_to_remove {
             if let Some(removed) = self.remove_foreign(key) {
-                self.note_removed(foreign_topic(key), removed.last_seq());
+                self.note_removed(foreign_topic(key), removed.last_seq(), false);
                 let _ = self
                     .total_bytes
                     .try_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
@@ -1379,7 +1454,7 @@ impl RecoveryManager {
                 }
                 if is_local {
                     if let Some((_, removed)) = self.buffers.remove(&key) {
-                        self.note_removed(&key, removed.last_seq());
+                        self.note_removed(&key, removed.last_seq(), removed.shared);
                         let _ = self.total_bytes.try_update(
                             Ordering::Relaxed,
                             Ordering::Relaxed,
@@ -1387,7 +1462,7 @@ impl RecoveryManager {
                         );
                     }
                 } else if let Some(removed) = self.remove_foreign(&key) {
-                    self.note_removed(foreign_topic(&key), removed.last_seq());
+                    self.note_removed(foreign_topic(&key), removed.last_seq(), false);
                     let _ =
                         self.total_bytes
                             .try_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
@@ -1405,7 +1480,7 @@ impl RecoveryManager {
             .iter()
             .filter(|entry| {
                 let topic = entry.key();
-                entry.value().1.elapsed() > ttl
+                entry.value().at.elapsed() > ttl
                     && !self.buffers.contains_key(topic)
                     && !self.foreign_epochs.contains_key(topic)
             })
@@ -1415,7 +1490,7 @@ impl RecoveryManager {
             self.removed_through.remove(&topic);
         }
         let mut any = self.removed_any.lock();
-        if any.is_some_and(|(_, at)| at.elapsed() > ttl) {
+        if any.is_some_and(|removed| removed.at.elapsed() > ttl) {
             *any = None;
         }
         drop(any);
@@ -1427,32 +1502,40 @@ impl RecoveryManager {
     /// The latest arrival of `topic` this node no longer holds, the one of
     /// any topic among it.
     fn removed_after(&self, topic: &str) -> Option<u64> {
-        let own = self.removed_through.get(topic).map(|r| r.0);
-        let any = self.removed_any.lock().map(|(seq, _)| seq);
+        let own = self
+            .removed_through
+            .get(topic)
+            .map(|removed| removed.through);
+        let any = self.removed_any.lock().map(|removed| removed.through);
         own.max(any)
     }
 
     /// The topics a peer that has `topic` (a name, or a pattern of them)
-    /// since `age` ago must hear were not kept here meanwhile: none, the
-    /// topic, each topic the pattern matches, or the pattern itself for one
-    /// that counts for every topic.
+    /// since `age` ago must hear this node no longer holds, or never could,
+    /// what it published to other nodes of meanwhile: none, the topic, each
+    /// topic the pattern matches, or the pattern itself for one that counts
+    /// for every topic.
     pub(crate) fn lost_lately(&self, topic: &str, age: Duration) -> Vec<String> {
         let since = Instant::now().checked_sub(age.saturating_add(LATELY_MARGIN));
-        let lately = |at: Instant| since.is_none_or(|since| at >= since);
-        if self.removed_any.lock().is_some_and(|(_, at)| lately(at)) {
+        let lately = |removed: &Removed| {
+            removed
+                .shared_at
+                .is_some_and(|at| since.is_none_or(|since| at >= since))
+        };
+        if self.removed_any.lock().as_ref().is_some_and(lately) {
             return vec![topic.to_owned()];
         }
         if crate::server::is_pattern(topic) {
             return self
                 .removed_through
                 .iter()
-                .filter(|entry| lately(entry.value().1))
+                .filter(|entry| lately(entry.value()))
                 .filter(|entry| crate::server::glob_match(topic, entry.key()))
                 .map(|entry| entry.key().clone())
                 .collect();
         }
         match self.removed_through.get(topic) {
-            Some(entry) if lately(entry.1) => vec![topic.to_owned()],
+            Some(entry) if lately(&entry) => vec![topic.to_owned()],
             _ => Vec::new(),
         }
     }
@@ -1482,33 +1565,35 @@ impl RecoveryManager {
     }
 
     /// Messages of `topic` up to arrival `seq` are not held here (a buffer
-    /// removed, or a message with no room to keep it).
-    fn note_removed(&self, topic: &str, seq: u64) {
+    /// removed, or a message with no room to keep it), `shared` when some
+    /// of them this node published to other nodes.
+    fn note_removed(&self, topic: &str, seq: u64, shared: bool) {
         if seq == 0 {
             return;
         }
-        let now = Instant::now();
-        if let Some(mut through) = self.removed_through.get_mut(topic) {
-            *through = (through.0.max(seq), now);
+        if let Some(mut removed) = self.removed_through.get_mut(topic) {
+            removed.note(seq, shared);
             return;
         }
         // No room for another topic's: it counts for every topic.
         if self.removed_through.len() >= MAX_UNKEPT_TOPICS {
-            let mut any = self.removed_any.lock();
-            *any = Some((any.map_or(seq, |(was, _)| was.max(seq)), now));
+            self.removed_any
+                .lock()
+                .get_or_insert_with(Removed::none)
+                .note(seq, shared);
             return;
         }
-        let mut through = self
-            .removed_through
+        self.removed_through
             .entry(topic.to_owned())
-            .or_insert((0, now));
-        *through = (through.0.max(seq), now);
+            .or_insert_with(Removed::none)
+            .note(seq, shared);
     }
 
     /// A message of `topic` came, relayed with no position: the node it was
     /// published on had no room to keep it, and no node holds it.
     pub(crate) fn not_kept(&self, topic: &str) {
-        self.note_removed(topic, self.arrival.fetch_add(1, Ordering::Relaxed));
+        let seq = self.arrival.fetch_add(1, Ordering::Relaxed);
+        self.note_removed(topic, seq, false);
     }
 
     /// This node took an interest in `topic` (its first local subscriber,
@@ -1596,13 +1681,10 @@ impl RecoveryManager {
         if named(buf.epoch) {
             return None;
         }
-        let tail = buf.tail_offset();
         let messages = buf
-            .entries
-            .iter()
-            .zip(tail..)
-            .filter(|((_, seq), _)| *seq >= since)
-            .map(|((data, _), offset)| (offset, data.clone()))
+            .shared_from(0)
+            .filter(|(_, seq, _)| *seq >= since)
+            .map(|(offset, _, data)| (offset, data.clone()))
             .collect();
         Some((buf.epoch, messages))
     }
@@ -1744,7 +1826,7 @@ mod tests {
     fn test_push_recover_roundtrip() {
         let mut buf = TopicRecoveryBuffer::new(4, 0); // 16 slots
         for i in 0..5 {
-            buf.push(make_data(&format!("msg{i}")), i + 1);
+            buf.push(make_data(&format!("msg{i}")), i + 1, false);
         }
 
         // Recover from offset 2 (should get messages at offsets 3 and 4).
@@ -1758,7 +1840,7 @@ mod tests {
     fn test_buffer_overflow() {
         let mut buf = TopicRecoveryBuffer::new(2, 0); // 4 slots
         for i in 0..10 {
-            buf.push(make_data(&format!("msg{i}")), i + 1);
+            buf.push(make_data(&format!("msg{i}")), i + 1, false);
         }
 
         // Tail should have advanced. head=10, tail=6.
@@ -2544,35 +2626,94 @@ mod tests {
 
     #[test]
     fn a_peer_hears_what_was_not_kept_since_its_interest_began() {
-        let mgr = RecoveryManager::new(RecoveryConfig::default());
-        mgr.not_kept("news");
-        mgr.not_kept("prices:a");
+        // No room for any history.
+        let mgr = with_budget(RecoveryManager::new(RecoveryConfig::default()), 0);
+        for topic in ["news", "prices:a"] {
+            assert!(mgr.push_stamped(topic, |_, _| make_data("x")).is_none());
+        }
+        // Published to this node's subscribers only, relayed here, or told
+        // of by a peer: not this node's to tell.
+        assert!(
+            mgr.push_stamped_local("mine", |_, _| make_data("x"))
+                .is_none()
+        );
+        mgr.push_foreign("theirs", make_data("x"), 0xf, 0);
+        mgr.not_kept("told");
         let minute = Duration::from_secs(60);
         assert_eq!(mgr.lost_lately("news", minute), ["news"]);
         assert_eq!(mgr.lost_lately("prices:*", minute), ["prices:a"]);
-        assert!(mgr.lost_lately("other", minute).is_empty());
+        for topic in ["other", "mine", "theirs", "told"] {
+            assert!(mgr.lost_lately(topic, minute).is_empty(), "{topic}");
+        }
         // Not kept before the interest began (and its margin): nothing to say.
         let long_ago = Instant::now()
             .checked_sub(Duration::from_secs(600))
             .unwrap();
-        mgr.removed_through.get_mut("news").unwrap().1 = long_ago;
+        mgr.removed_through.get_mut("news").unwrap().shared_at = Some(long_ago);
         assert!(mgr.lost_lately("news", minute).is_empty());
+    }
+
+    #[test]
+    fn a_buffer_removed_is_told_to_peers_when_they_had_some_of_it() {
+        let mgr = RecoveryManager::new(RecoveryConfig::default());
+        mgr.push("news", make_data("x"));
+        mgr.push_stamped_local("mine", |_, _| make_data("x"));
+        let mgr = with_budget(mgr, 0);
+        mgr.cleanup();
+        assert_eq!(mgr.topic_count(), 0);
+        let minute = Duration::from_secs(60);
+        assert_eq!(mgr.lost_lately("news", minute), ["news"]);
+        assert!(mgr.lost_lately("mine", minute).is_empty());
+    }
+
+    #[test]
+    fn what_was_published_to_this_nodes_subscribers_only_is_never_sent_to_a_peer() {
+        // Two slots a topic.
+        let mgr = RecoveryManager::new(RecoveryConfig {
+            buffer_size_bits: 1,
+            ..RecoveryConfig::default()
+        });
+        mgr.push_stamped_local("news", |_, _| make_data("l0"));
+        mgr.push("news", make_data("s1"));
+        let (epoch, _) = mgr.get_position("news").unwrap();
+        let sent = |after| mgr.published_after("news", epoch, after);
+        assert_eq!(sent(0), vec![(1, make_data("s1"))]);
+        let lately = |mgr: &RecoveryManager| {
+            mgr.published_lately("news", Duration::from_secs(60), |_| false)
+                .unwrap()
+                .1
+        };
+        assert_eq!(lately(&mgr), vec![(1, make_data("s1"))]);
+        // The local one evicted, another one in: from the oldest kept.
+        mgr.push_stamped_local("news", |_, _| make_data("l2"));
+        assert_eq!(sent(0), vec![(1, make_data("s1"))]);
+        mgr.push("news", make_data("s3"));
+        assert_eq!(sent(0), vec![(3, make_data("s3"))]);
+        assert_eq!(lately(&mgr), vec![(3, make_data("s3"))]);
+        // Its own subscribers recover all of it.
+        let RecoveryResult::Recovered { publications, .. } = mgr.recover("news", epoch, 1) else {
+            panic!("not recovered");
+        };
+        assert_eq!(publications, vec![make_data("l2"), make_data("s3")]);
     }
 
     #[test]
     fn a_topic_not_kept_with_no_room_to_name_it_counts_for_every_topic() {
         let mgr = RecoveryManager::new(RecoveryConfig::default());
         for n in 0..MAX_UNKEPT_TOPICS {
-            mgr.removed_through
-                .insert(format!("t{n}"), (1, Instant::now()));
+            mgr.removed_through.insert(format!("t{n}"), Removed::none());
         }
         mgr.push("room", make_data("l0"));
         let (local, _) = mgr.get_position("room").unwrap();
         mgr.not_kept("unnamed");
         assert!(!mgr.removed_through.contains_key("unnamed"));
-        // Each topic a client asks of, and each a peer has.
+        // Each topic a client asks of.
         assert!(not_recovered(&mgr.recover("room", local, 0)));
+        // And each a peer has, of what this node published to other nodes.
         let minute = Duration::from_secs(60);
+        assert!(mgr.lost_lately("other", minute).is_empty());
+        let mgr = with_budget(mgr, 0);
+        assert!(mgr.push_stamped("unnamed", |_, _| make_data("x")).is_none());
         assert_eq!(mgr.lost_lately("other", minute), ["other"]);
         assert_eq!(mgr.lost_lately("prices:*", minute), ["prices:*"]);
     }
