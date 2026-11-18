@@ -270,10 +270,13 @@ fn a_hello_says_where_its_node_is_reached_and_one_before_says_nothing() {
 #[test]
 fn a_node_that_dialed_in_is_known_by_where_it_is_reached() {
     let from: std::net::SocketAddr = "10.0.0.3:51234".parse().unwrap();
-    let from_v6: std::net::SocketAddr = "[::1]:51234".parse().unwrap();
+    let loopback_peer: std::net::SocketAddr = "[::1]:51234".parse().unwrap();
     let slot = super::inbound::reached_slot;
     assert_eq!(slot(Some(":7000"), from).as_deref(), Some("10.0.0.3:7000"));
-    assert_eq!(slot(Some(":7000"), from_v6).as_deref(), Some("[::1]:7000"));
+    assert_eq!(
+        slot(Some(":7000"), loopback_peer).as_deref(),
+        Some("[::1]:7000")
+    );
     assert_eq!(
         slot(Some("node-a.internal:7000"), from).as_deref(),
         Some("node-a.internal:7000")

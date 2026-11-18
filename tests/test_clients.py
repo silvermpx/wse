@@ -178,9 +178,7 @@ async def taken_messages(srv: RustWSEServer, count: int) -> list[dict]:
 
 class TestOutbox:
     @pytest.mark.asyncio
-    async def test_a_message_waits_in_the_outbox_until_the_server_confirms_it(
-        self, server_port
-    ):
+    async def test_a_message_waits_in_the_outbox_until_the_server_confirms_it(self, server_port):
         """Numbered, said delivered by its id; sent with no connection, it
         goes on the next."""
         srv = start_server(server_port)
@@ -222,9 +220,7 @@ class TestOutboxInAFile:
         next client sends it, taken once."""
         offline = wse_client.Offline(path=str(tmp_path / "queue"))
         first = client_for(server_port, offline=offline)
-        assert await first.send("order", {"n": 1}, id="kept") is (
-            wse_client.SendResult.QUEUED
-        )
+        assert await first.send("order", {"n": 1}, id="kept") is (wse_client.SendResult.QUEUED)
         assert first.kept == 1
         first._outbox.close_file()  # as the process ends
 
