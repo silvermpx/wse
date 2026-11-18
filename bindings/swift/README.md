@@ -92,7 +92,8 @@ nowhere.
 
 Every message sent, except a live or signed one, waits in the outbox until
 the server answers for it, goes again after a reconnect, and reaches the
-server's application once. `.delivered(ids:)` names the messages the server
+server's application once where the server can tell (one it cannot, the node
+that took it gone, comes marked `possible_repeat`). `.delivered(ids:)` names the messages the server
 took; `.notDelivered(reason:ids:)` those it will not take and why: the server
 refused it (`busy`, `rate_limited`, `missing`, `not_ready`), it was not
 written within its time (`expired`), it was the last user's

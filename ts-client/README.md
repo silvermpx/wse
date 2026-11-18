@@ -1,6 +1,6 @@
 # wse-client (TypeScript)
 
-TypeScript client for [WSE](https://github.com/silvermpx/wse), the WebSocket engine for reactive user interfaces: topics, message recovery, reconnects, an outbox that sends each message once (offline too), end-to-end encryption and signed messages. It runs without a framework, and comes with adapters for React, Vue, Svelte and React Native.
+TypeScript client for [WSE](https://github.com/silvermpx/wse), the WebSocket engine for reactive user interfaces: topics, message recovery, reconnects, an outbox that keeps each message until the server took it (offline too), once where the server can tell, end-to-end encryption and signed messages. It runs without a framework, and comes with adapters for React, Vue, Svelte and React Native.
 
 [![npm](https://img.shields.io/npm/v/wse-client)](https://www.npmjs.com/package/wse-client)
 [![TypeScript](https://img.shields.io/badge/TypeScript-5.0+-blue)](https://www.typescriptlang.org/)
@@ -73,8 +73,8 @@ storage name, the consumer and the realm (the first endpoint, or `realm`) -- so 
 another part of the application never reads it. Each client of the scope (each tab) keeps a producer
 of its own there, held by a Web Lock while the tab lives, and sends what it holds on its own
 connection, as its own user. A page that opens takes over what a closed or crashed tab of the scope
-left (or the page it reloads), and sends it under that tab's producer, so the server still takes each
-message once; another user's connection drops it (`user_changed`). The changes of a turn of the event
+left (or the page it reloads), and sends it under that tab's producer, so the server still knows each
+message by its number; another user's connection drops it (`user_changed`). The changes of a turn of the event
 loop go to the database in one transaction. The page that goes (`pagehide`) lets its producer go, so
 the back/forward cache can keep it, and reads the database again when it is back. Web Locks need a
 secure context (HTTPS, or localhost): without them the outbox stays in memory. What the queue of 3.1
@@ -831,7 +831,7 @@ The logger defaults to `WARN` in production and `INFO` in development (`process.
 | Feature | Description |
 |---------|-------------|
 | **Auto-reconnection** | Exponential, linear, fibonacci or adaptive backoff with jitter, infinite by default |
-| **Outbox** | Every message waits until the server answers for it and goes again after a reconnect, taken once; in IndexedDB or a file it outlives the page or the process |
+| **Outbox** | Every message waits until the server answers for it and goes again after a reconnect, taken once where the server can tell (else marked `possible_repeat`); in IndexedDB or a file it outlives the page or the process |
 | **E2E encryption** | Sessions with a pinned server identity via Web Crypto; fails closed |
 | **Compression** | Inflates `C:` (zlib) frames from the server with a size limit |
 | **MessagePack** | `wireFormat: 'msgpack'`: msgpack both ways via `@msgpack/msgpack` (24-41% fewer bytes than JSON) |

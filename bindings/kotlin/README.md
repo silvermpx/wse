@@ -144,7 +144,8 @@ once the server takes a connection for another user it goes nowhere.
 
 Every message sent, except a live or signed one, waits in the outbox until
 the server answers for it, goes again after a reconnect, and reaches the
-server's application once. `WseItem.Delivered` names the messages the server
+server's application once where the server can tell (one it cannot, the node
+that took it gone, comes marked `possible_repeat`). `WseItem.Delivered` names the messages the server
 took (`ids`); `WseItem.NotDelivered` those it will not take and why
 (`reason`): the server refused it (`busy`, `rate_limited`, `missing`,
 `not_ready`), it was not written within its time (`expired`), it was the last

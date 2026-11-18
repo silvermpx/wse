@@ -74,7 +74,8 @@ queued and closes; a closed client's calls throw a `WseError` of kind
 
 Every message sent, except a live or signed one, waits in the outbox until
 the server answers for it, goes again after a reconnect, and reaches the
-server's application once. The `delivered` item names the messages the
+server's application once where the server can tell (one it cannot, the node
+that took it gone, comes marked `possible_repeat`). The `delivered` item names the messages the
 server took (`ids`); `notDelivered` names those it will not take and why
 (`reason`): the server refused it (`busy`, `rate_limited`, `missing`,
 `not_ready`), it was not written within its time (`expired`), it was the

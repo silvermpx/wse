@@ -4,8 +4,9 @@
 
 Desktop applications and an outbox in every client: Electron and Tauri with
 one connection for every window, Angular and Solid adapters, Java and Kotlin
-on the JVM, messages kept until the server has taken each once, and a
-conformance server every client is checked against.
+on the JVM, messages kept until the server has taken them (each once where
+the server can tell, else marked as a possible repeat), and a conformance
+server every client is checked against.
 
 ### Added
 
