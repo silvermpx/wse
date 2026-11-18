@@ -377,6 +377,8 @@ export function createBridgeClient(
           // A listener let the window go: nothing more is handed on, and
           // what became of its sends was said as it went.
           if (done || over()) return;
+          // A listener paused it: the rest waits for its resume.
+          if (paused.length > 0) return;
           const item = b.items[b.next++];
           // A listener signed out: of the rest, only what became of its sends.
           if (signingOut && !isOutcome(item)) continue;

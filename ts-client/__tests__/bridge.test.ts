@@ -385,6 +385,26 @@ describe('a window, its owner’s frames given by hand', () => {
     expect(client.bridge.phase).toBe('attached');
   });
 
+  it('hands on nothing more of a batch once a listener paused it, and the rest once, in order, as it resumes', () => {
+    const { client, feed, posted } = byHand();
+    const notes: number[] = [];
+    client.onMessage('note', (m) => {
+      const n = (m.p as { n: number }).n;
+      notes.push(n);
+      if (n <= 2) client.pause('hidden');
+    });
+    feed({ k: 'b', s: 1, items: [note(1), note(2), note(3)] });
+    expect(notes).toEqual([1]);
+    client.resume('hidden');
+    expect(notes).toEqual([1, 2]);
+    client.resume('hidden');
+    expect(notes).toEqual([1, 2, 3]);
+    client.resume('hidden');
+    expect(notes).toEqual([1, 2, 3]);
+    // Acknowledged once, when all of it was taken.
+    expect(posted.filter((f) => f.k === 'ack')).toEqual([{ k: 'ack', s: 1 }]);
+  });
+
   it('closes at once once its owner is gone, whatever it still waits to hear of', async () => {
     const { client, gone } = byHand();
     expect(client.send('order', { n: 1 }, { id: 'unknown' })).toBe('queued');

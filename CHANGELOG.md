@@ -230,7 +230,9 @@ server every client is checked against.
   that batch and in the batches it held before `cleared`, where it said only
   `cleared`; a batch that comes while it takes the one before waits its
   turn, where the window stopped. `close()` of a window its owner let go
-  ends at once, where it waited out its deadline.
+  ends at once, where it waited out its deadline. A window a listener
+  pauses in the middle of a batch holds the rest of it until it resumes,
+  where it handed on the next message.
 - Outbox: a message whose bytes were held up on a connection the client
   left is no longer taken once the client is back on another and was told
   the server had not taken it. The connection whose hello came last holds
