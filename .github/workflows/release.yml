@@ -118,6 +118,9 @@ jobs:
     outputs:
       version: ${{ steps.versions.outputs.version }}
       npm-version: ${{ steps.versions.outputs.npm-version }}
+      # v and the npm version: the tag the Swift and Dart packages download
+      # the release's files from; a tag spelled otherwise is refused.
+      tag: ${{ steps.versions.outputs.tag }}
       prerelease: ${{ steps.versions.outputs.prerelease }}
       # The run whose files the gate checks and a tag publishes, and whether
       # this run builds them.
@@ -1898,6 +1901,7 @@ jobs:
       - name: Create GitHub Release
         uses: softprops/action-gh-release@8a0cd651e5b2365bd640854a3fa5dfc70e4875f3  # v3.0.4
         with:
+          tag_name: ${{ needs.preflight.outputs.tag }}
           generate_release_notes: true
           prerelease: ${{ needs.preflight.outputs.prerelease == 'true' }}
           files: release/*

@@ -8,9 +8,12 @@ Subcommands:
 
   versions [--tag TAG]
       Every file that states the release version must agree. With a tag
-      (v3.0.0, v3.0.0rc1 or v3.0.0-rc.1) they must equal the tag; without one
-      they must equal wse-server's own version. Writes ``version`` (PEP 440),
-      ``npm-version`` and ``prerelease`` to $GITHUB_OUTPUT when it is set.
+      they must equal the tag, and the tag must be v and the version as npm
+      spells it (v3.0.0, v3.0.0-rc.1): the Swift and Dart packages download
+      the release's files from that tag, and pub.dev publishes from it.
+      Without one they must equal wse-server's own version. Writes
+      ``version`` (PEP 440), ``npm-version``, ``tag`` (the release's tag) and
+      ``prerelease`` to $GITHUB_OUTPUT when it is set.
 
   cargo-config
       No committed cargo config may tune the build to one CPU (target-cpu or
@@ -387,8 +390,8 @@ def cmd_versions(args: argparse.Namespace) -> int:
     sources = collect()
     errors = 0
 
-    if args.tag:
-        tag = args.tag.removeprefix("refs/tags/")
+    tag = args.tag.removeprefix("refs/tags/") if args.tag else None
+    if tag:
         if not tag.startswith("v"):
             gh_error(
                 ".github/workflows/release.yml", None, f"release tags look like v3.0.0, got {tag!r}"
@@ -441,10 +444,25 @@ def cmd_versions(args: argparse.Namespace) -> int:
 
     npm_version = next(s.value for s in sources if s.path == "package.json")
     assert npm_version is not None
+    # The tag the Swift package and the Dart build hook download the
+    # release's files from (releases/download/v<version>/), and the one
+    # pub.dev publishes from (v{{version}}).
+    release_tag = f"v{npm_version}"
+    if tag and tag != release_tag:
+        gh_error(
+            ".github/workflows/release.yml",
+            None,
+            f"the release of {npm_version} is tagged {release_tag}, not {tag}: the Swift "
+            f"and Dart packages download its files from releases/download/{release_tag}/, "
+            "and pub.dev publishes from that tag",
+        )
+        print(f"\nTag {release_tag} instead of {tag}.")
+        return 1
     write_outputs(
         {
             "version": expected,
             "npm-version": npm_version,
+            "tag": release_tag,
             "prerelease": "true" if is_prerelease(expected) else "false",
         }
     )
