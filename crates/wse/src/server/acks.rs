@@ -100,6 +100,9 @@ pub(crate) struct Decided {
     pub(crate) forgot: u64,
     /// A message whose handler never ended: it may have done its work.
     pub(crate) undecided: Option<u64>,
+    /// Up to here a message may have been taken on a node that could not be
+    /// asked: the first time one comes, it is marked a possible repeat.
+    pub(crate) unsure: u64,
 }
 
 /// One producer on this node. Its lock is held while a message of it is
@@ -127,14 +130,22 @@ pub(crate) struct SlotState {
     /// A message being decided: its handler runs. One whose handler never
     /// ended (it panicked) stays undecided.
     deciding: Option<u64>,
+    /// Up to here a message may have been taken on a node that could not be
+    /// asked (gone, or it knew nothing of the producer): the first time one
+    /// comes, whatever connection brings it, it is handed on marked.
+    unsure: u64,
 }
 
 /// Whether a message is handed on.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Claim {
-    /// The first time it came: handed on. Those it skipped are refused
-    /// (`gap`, first and last).
-    First { gap: Option<(u64, u64)> },
+    /// The first time it came: handed on, marked a possible repeat when a
+    /// node that could not be asked may have taken it (`unsure`). Those it
+    /// skipped are refused (`gap`, first and last).
+    First {
+        gap: Option<(u64, u64)>,
+        unsure: bool,
+    },
     /// Taken already: confirmed again, not handed on.
     Repeat,
     /// Refused already: refused again.
@@ -168,7 +179,16 @@ impl SlotState {
             self.refuse(from, to, skipped);
         }
         self.mark = s;
-        Claim::First { gap }
+        Claim::First {
+            gap,
+            unsure: s <= self.unsure,
+        }
+    }
+
+    /// A message up to `s` may have been taken on a node that could not be
+    /// asked.
+    fn unsure_up_to(&mut self, s: u64) {
+        self.unsure = self.unsure.max(s);
     }
 
     /// Messages `from` to `to`, behind the mark, were not taken.
@@ -241,7 +261,11 @@ impl SlotState {
     /// does what it could not tell.
     fn advance(&mut self, decided: &Decided) {
         let to = decided.mark;
-        if self.moved || to <= self.mark {
+        if self.moved {
+            return;
+        }
+        self.unsure_up_to(decided.unsure);
+        if to <= self.mark {
             return;
         }
         let mark = self.mark;
@@ -271,6 +295,7 @@ impl Slot {
                 holes: VecDeque::new(),
                 forgot: 0,
                 deciding: None,
+                unsure: 0,
             }),
             seen: AtomicU64::new(now),
         }
@@ -291,6 +316,7 @@ impl Slot {
             holes: state.holes.iter().copied().collect(),
             forgot: state.forgot,
             undecided: state.deciding,
+            unsure: state.unsure,
         }
     }
 
@@ -354,19 +380,10 @@ impl Producers {
                 let mut state = slot.lock();
                 (state.decided_for(hello.from), state.told_from(hello.from))
             };
-            let link = Link {
-                slot,
-                start,
-                unsure_until: 0,
-            };
-            (link, told)
+            (Link { slot, start }, told)
         } else {
-            let link = Link {
-                slot,
-                start: 0,
-                unsure_until: hello.written,
-            };
-            (link, Vec::new())
+            slot.lock().unsure_up_to(hello.written);
+            (Link { slot, start: 0 }, Vec::new())
         }
     }
 
@@ -387,20 +404,11 @@ impl Producers {
                     state.advance(&decided);
                     (state.decided_for(hello.from), state.told_from(hello.from))
                 };
-                let link = Link {
-                    slot,
-                    start,
-                    unsure_until: 0,
-                };
-                (link, told)
+                (Link { slot, start }, told)
             }
             None => {
-                let link = Link {
-                    slot,
-                    start: 0,
-                    unsure_until: hello.written,
-                };
-                (link, Vec::new())
+                slot.lock().unsure_up_to(hello.written);
+                (Link { slot, start: 0 }, Vec::new())
             }
         }
     }
@@ -462,9 +470,6 @@ pub(crate) struct Link {
     /// What the client was told was decided: where its messages on this
     /// connection go on from.
     pub(crate) start: u64,
-    /// Up to this message the server cannot tell whether one was taken (on
-    /// a node that is gone): handed on marked as a possible repeat.
-    pub(crate) unsure_until: u64,
 }
 
 /// The connection ends: its producer is kept for a day from now.
@@ -706,9 +711,21 @@ mod tests {
     #[test]
     fn a_message_is_handed_on_once() {
         let slot = Slot::new(0);
-        assert_eq!(claim(&slot, 1), Claim::First { gap: None });
+        assert_eq!(
+            claim(&slot, 1),
+            Claim::First {
+                gap: None,
+                unsure: false
+            }
+        );
         assert_eq!(claim(&slot, 1), Claim::Repeat);
-        assert_eq!(claim(&slot, 3), Claim::First { gap: Some((2, 2)) });
+        assert_eq!(
+            claim(&slot, 3),
+            Claim::First {
+                gap: Some((2, 2)),
+                unsure: false
+            }
+        );
         assert_eq!(
             claim(&slot, 2),
             Claim::Refused(Refusal::Missing),
@@ -734,11 +751,29 @@ mod tests {
     fn a_refused_message_stays_refused_until_the_client_heard() {
         let slot = Slot::new(0);
         let mut state = slot.lock();
-        assert_eq!(state.claim(1, Refusal::Missing), Claim::First { gap: None });
+        assert_eq!(
+            state.claim(1, Refusal::Missing),
+            Claim::First {
+                gap: None,
+                unsure: false
+            }
+        );
         state.refuse(1, 1, Refusal::Busy);
-        assert_eq!(state.claim(2, Refusal::Missing), Claim::First { gap: None });
+        assert_eq!(
+            state.claim(2, Refusal::Missing),
+            Claim::First {
+                gap: None,
+                unsure: false
+            }
+        );
         state.refuse(2, 2, Refusal::Busy);
-        assert_eq!(state.claim(3, Refusal::Missing), Claim::First { gap: None });
+        assert_eq!(
+            state.claim(3, Refusal::Missing),
+            Claim::First {
+                gap: None,
+                unsure: false
+            }
+        );
         assert_eq!(
             state.claim(1, Refusal::Missing),
             Claim::Refused(Refusal::Busy)
@@ -787,10 +822,22 @@ mod tests {
     fn a_decision_whose_handler_never_ended_is_not_said_taken() {
         let slot = Slot::new(0);
         let mut state = slot.lock();
-        assert_eq!(state.claim(1, Refusal::Missing), Claim::First { gap: None });
+        assert_eq!(
+            state.claim(1, Refusal::Missing),
+            Claim::First {
+                gap: None,
+                unsure: false
+            }
+        );
         state.deciding(1);
         state.decided(1);
-        assert_eq!(state.claim(2, Refusal::Missing), Claim::First { gap: None });
+        assert_eq!(
+            state.claim(2, Refusal::Missing),
+            Claim::First {
+                gap: None,
+                unsure: false
+            }
+        );
         // Its handler panicked: 2 was never decided.
         state.deciding(2);
         assert_eq!(state.acked(), 1, "a client that comes back is told 1");
@@ -873,11 +920,7 @@ mod tests {
     fn a_producer_whose_connection_is_open_is_kept_however_long_it_is_silent() {
         let producers = Producers::default();
         let (slot, _) = producers.attach(None, "p", 0);
-        let link = Link {
-            slot,
-            start: 0,
-            unsure_until: 0,
-        };
+        let link = Link { slot, start: 0 };
         producers.sweep(3 * KEPT_FOR_MS);
         let (again, known) = producers.attach(None, "p", 3 * KEPT_FOR_MS);
         assert!(known);
@@ -936,7 +979,7 @@ mod tests {
     fn a_client_from_another_node_is_unsure_up_to_what_it_wrote() {
         let producers = Producers::default();
         let (link, _) = producers.link(Some("ann"), &hello("other", 4), false, 0);
-        assert_eq!((link.start, link.unsure_until), (0, 4));
+        assert_eq!((link.start, link.slot.lock().unsure), (0, 4));
 
         // Back on this node, which decided messages of it: they are known,
         // and so is what it refused.
@@ -946,7 +989,8 @@ mod tests {
             state.refuse(9, 9, Refusal::Busy);
         }
         let (link, told) = producers.link(Some("ann"), &hello("here", 11), true, 0);
-        assert_eq!((link.start, link.unsure_until), (9, 0));
+        // What it could not tell stays: none of those comes unmarked.
+        assert_eq!((link.start, link.slot.lock().unsure), (9, 4));
         assert_eq!(
             told,
             [
@@ -978,14 +1022,20 @@ mod tests {
             ..Decided::default()
         };
         let (link, told) = producers.taken_over(Some("ann"), &hello("other", 12), Some(decided), 0);
-        assert_eq!((link.start, link.unsure_until), (10, 0));
+        assert_eq!((link.start, link.slot.lock().unsure), (10, 0));
         assert_eq!(told, holes);
         assert_eq!(claim(&link.slot, 10), Claim::Repeat);
         assert_eq!(claim(&link.slot, 7), Claim::Refused(Refusal::Busy));
-        assert_eq!(claim(&link.slot, 11), Claim::First { gap: None });
+        assert_eq!(
+            claim(&link.slot, 11),
+            Claim::First {
+                gap: None,
+                unsure: false
+            }
+        );
         // The last node did not answer: unsure up to what was written.
         let (link, told) = producers.taken_over(Some("bob"), &hello("other", 12), None, 0);
-        assert_eq!((link.start, link.unsure_until), (0, 12));
+        assert_eq!((link.start, link.slot.lock().unsure), (0, 12));
         assert!(told.is_empty());
     }
 

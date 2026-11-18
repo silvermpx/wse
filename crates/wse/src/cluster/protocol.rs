@@ -265,14 +265,14 @@ pub(crate) fn encode_producer_query(
 }
 
 /// A PRODUCER_STATE's payload before its holes: id, known, mark, forgot,
-/// undecided and the count of holes.
-const PRODUCER_STATE_FIXED: usize = 8 + 1 + 8 + 8 + 8 + 2;
+/// undecided, unsure and the count of holes.
+const PRODUCER_STATE_FIXED: usize = 8 + 1 + 8 + 8 + 8 + 8 + 2;
 
 /// Encode a PRODUCER_STATE: the answer to question `id`, what the peer
 /// decided of the producer, the refusals behind it, and what it could not
 /// tell.
 /// Format: [header, payload_len][u64 LE id][u8 known][u64 LE mark]
-/// [u64 LE forgot][u64 LE undecided, 0: none]
+/// [u64 LE forgot][u64 LE undecided, 0: none][u64 LE unsure]
 /// [u16 LE holes][per hole: u64 LE from, u64 LE to, u8 why]
 pub(crate) fn encode_producer_state(buf: &mut BytesMut, id: u64, decided: Option<&Decided>) {
     let holes = decided.map_or(&[][..], |d| &d.holes[..]);
@@ -288,6 +288,7 @@ pub(crate) fn encode_producer_state(buf: &mut BytesMut, id: u64, decided: Option
     buf.put_u64_le(decided.map_or(0, |d| d.mark));
     buf.put_u64_le(decided.map_or(0, |d| d.forgot));
     buf.put_u64_le(decided.and_then(|d| d.undecided).unwrap_or(0));
+    buf.put_u64_le(decided.map_or(0, |d| d.unsure));
     buf.put_u16_le(holes.len() as u16);
     for hole in holes {
         buf.put_u64_le(hole.from);
@@ -986,6 +987,8 @@ pub(crate) fn decode_frame(mut data: BytesMut) -> Option<ClusterFrame> {
             let mark = payload.get_u64_le();
             let forgot = payload.get_u64_le();
             let undecided = payload.get_u64_le();
+            // What a node could not tell may reach past what it decided.
+            let unsure = payload.get_u64_le();
             if forgot > mark || undecided > mark {
                 return None;
             }
@@ -1009,6 +1012,7 @@ pub(crate) fn decode_frame(mut data: BytesMut) -> Option<ClusterFrame> {
                     holes,
                     forgot,
                     undecided: (undecided > 0).then_some(undecided),
+                    unsure,
                 }),
             })
         }

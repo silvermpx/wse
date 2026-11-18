@@ -1110,15 +1110,15 @@ fn deliver_json<H: Handler>(
     let mut slot = link.slot.lock();
     let skipped = pending.skipped();
     // Handed on marked as a possible repeat: the server cannot tell whether
-    // it took it already.
-    let mut unsure = s <= link.unsure_until;
-    match slot.claim(s, skipped) {
-        acks::Claim::First { gap } => {
+    // it was taken already.
+    let unsure = match slot.claim(s, skipped) {
+        acks::Claim::First { gap, unsure } => {
             if let Some((from, to)) = gap {
                 pending.refuse(from, to, skipped);
             }
+            unsure
         }
-        acks::Claim::Unsure => unsure = true,
+        acks::Claim::Unsure => true,
         acks::Claim::Repeat => {
             pending.taken(s);
             return;
@@ -1139,7 +1139,7 @@ fn deliver_json<H: Handler>(
             );
             return;
         }
-    }
+    };
     if unsure && let Some(fields) = val.as_object_mut() {
         fields.insert("possible_repeat".to_owned(), serde_json::Value::Bool(true));
     }
@@ -1175,7 +1175,7 @@ fn refuse_dropped(conn: &Conn<'_>, pending: &mut acks::Pending, frame: &[u8]) {
     let mut slot = link.slot.lock();
     let skipped = pending.skipped();
     match slot.claim(s, skipped) {
-        acks::Claim::First { gap } => {
+        acks::Claim::First { gap, .. } => {
             if let Some((from, to)) = gap {
                 pending.refuse(from, to, skipped);
             }

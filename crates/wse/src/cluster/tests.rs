@@ -170,6 +170,8 @@ fn a_producer_state_says_what_the_peer_could_not_tell() {
         }],
         forgot: 2,
         undecided: Some(9),
+        // Past the mark: what it wrote when a node could not be asked.
+        unsure: 12,
     };
     let mut buf = BytesMut::new();
     protocol::encode_producer_state(&mut buf, 7, Some(&decided));

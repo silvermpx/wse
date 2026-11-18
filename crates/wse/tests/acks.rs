@@ -777,3 +777,53 @@ async fn a_message_whose_handler_panicked_comes_marked_on_another_node() {
     a.server.stop().await;
     b.server.stop().await;
 }
+
+/// What a node that is gone may have taken stays unsure here, whatever
+/// connection of the client comes: the first time each of those comes, on a
+/// later connection too, it is marked as a possible repeat.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn what_the_server_cannot_tell_stays_marked_on_the_next_connection() {
+    let mut node = node().await;
+    let outbox = serde_json::json!({"producer": "p13", "node": "gone", "written": 2});
+    let (mut ws, acked_at, name) = node.client("ann", outbox).await;
+    assert_eq!(acked_at, 0);
+    send(&mut ws, "m", 1).await;
+    assert_eq!(node.took().await, marked("m", 1));
+    acked(&mut ws, 1).await;
+    ws.close(None).await.ok();
+    // Back here, the node it names now, with 2 still waiting.
+    let outbox = serde_json::json!({"producer": "p13", "node": name, "from": 2, "written": 2});
+    let (mut ws, acked_at, _) = node.client("ann", outbox).await;
+    assert_eq!(acked_at, 1);
+    send(&mut ws, "m", 2).await;
+    assert_eq!(node.took().await, marked("m", 2));
+    send(&mut ws, "m", 3).await;
+    assert_eq!(node.took().await, taken("m", 3));
+    node.server.stop().await;
+}
+
+/// What a node could not tell of a client's outbox goes with it to the node
+/// it moves to: there too the first time each of those comes it is marked.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn what_a_node_could_not_tell_goes_with_the_client_to_another_node() {
+    let mut a = node().await;
+    let mut b = node().await;
+    link(&a, &b).await;
+    let outbox = serde_json::json!({"producer": "p14", "node": "gone", "written": 3});
+    let (mut on_a, _, name_a) = a.client("ann", outbox).await;
+    send(&mut on_a, "m", 1).await;
+    assert_eq!(a.took().await, marked("m", 1));
+    acked(&mut on_a, 1).await;
+    on_a.close(None).await.ok();
+    let outbox = serde_json::json!({"producer": "p14", "node": name_a, "from": 2, "written": 3});
+    let (mut on_b, acked_at, _) = b.client("ann", outbox).await;
+    assert_eq!(acked_at, 1, "B asked A");
+    for s in 2..=4 {
+        send(&mut on_b, "m", s).await;
+    }
+    assert_eq!(b.took().await, marked("m", 2));
+    assert_eq!(b.took().await, marked("m", 3));
+    assert_eq!(b.took().await, taken("m", 4));
+    a.server.stop().await;
+    b.server.stop().await;
+}
