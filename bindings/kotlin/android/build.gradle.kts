@@ -31,7 +31,8 @@ dependencies {
     implementation("net.java.dev.jna:jna:5.19.1@aar")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-core:1.11.0")
     implementation("androidx.annotation:annotation:1.9.1")
-    implementation("androidx.lifecycle:lifecycle-process:2.11.0")
+    // WseAppLifecycle is a DefaultLifecycleObserver: part of its API.
+    api("androidx.lifecycle:lifecycle-process:2.11.0")
     implementation("androidx.startup:startup-runtime:1.2.0")
     // The Java part of Android's certificate verifier, which build-libs.sh fetched: inside the AAR.
     implementation(files(System.getenv("WSE_ANDROID_VERIFIER") ?: "../../../target/android-verifier/rustls-platform-verifier.jar"))

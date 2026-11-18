@@ -52,7 +52,7 @@ pom() {
         dependency org.jetbrains.kotlinx kotlinx-coroutines-core 1.11.0 compile
         dependency net.java.dev.jna jna 5.19.1 runtime aar
         dependency androidx.annotation annotation 1.9.1 runtime
-        dependency androidx.lifecycle lifecycle-process 2.11.0 runtime
+        dependency androidx.lifecycle lifecycle-process 2.11.0 compile
         dependency androidx.startup startup-runtime 1.2.0 runtime)"
       ;;
     wse-client-jvm)
