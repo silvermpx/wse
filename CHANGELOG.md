@@ -218,6 +218,13 @@ server every client is checked against.
   paused when it resumes before its owner let it go. It no longer gives up
   on an owner slow to answer the sign-out and says `cleared` of a send the
   server may have taken: it says nothing of a send until its owner did.
+  A listener of its state that signs it out as its owner lets it go
+  (signing out, ending, or its channel closing) no longer has it say
+  `cleared` of a send whose `wseDelivered` it held paused, and then
+  `wseDelivered` as well: what the server answered is said first, once.
+  Signed out after its owner went without saying, it says nothing of the
+  send, where it said `cleared`; a window its owner refused hears that its
+  sends never went (`closed`).
 - Outbox: a message whose bytes were held up on a connection the client
   left is no longer taken once the client is back on another and was told
   the server had not taken it. The connection whose hello came last holds

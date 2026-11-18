@@ -271,20 +271,28 @@ export function createBridgeClient(
     phase = next;
     reason = why;
     // What it held paused is the last connection's: never handed on. What
-    // became of its sends is said all the same, once: the window is let go
-    // first, so a send from a listener of it is dropped.
+    // became of its sends is said all the same, once, and before the state
+    // changes: the window is let go first, so a send from a listener of it
+    // is dropped, and a listener of its state that signs out finds them
+    // settled.
     const outcomes = pausedBatches.flatMap((b) => b.items.filter(isOutcome));
     pausedBatches = [];
     for (const resolve of signs.values()) resolve('dropped');
     signs.clear();
-    // What waited for its topics never reached the owner: it goes.
+    // What waited for its topics never reached the owner: it goes. So does
+    // what an owner that refused the window had: it took none of it.
     const unsent = waiting.map((w) => w.options.id!);
     waiting = [];
+    if (next === 'refused') {
+      for (const [id, n] of pending) for (let i = 0; i < n; i++) unsent.push(id);
+      pending.clear();
+      pendingCount = 0;
+    }
     // The connection is gone for good: what the window holds is not current.
     if (!done) delivery.connectionLost();
-    refresh();
-    if (unsent.length > 0) emit('wseNotDelivered', { reason: 'closed', ids: unsent });
     for (const item of outcomes) take(item);
+    if (unsent.length > 0) emit('wseNotDelivered', { reason: 'closed', ids: unsent });
+    refresh();
   };
 
   const take = (item: BridgeItem) => {
@@ -704,10 +712,12 @@ export function createBridgeClient(
         refresh();
         return;
       }
-      // Let go first: what the owner said became of its sends, then what it
-      // held went with the user, and a send from a listener is dropped.
+      // Let go first: what the owner said became of its sends is said, and
+      // a send from a listener is dropped. Sends that never reached an owner
+      // went with the user; one an owner had before it went has no outcome
+      // to say, the server may have taken it.
       finish();
-      signedOut();
+      if (!port) signedOut();
       port?.close();
     },
     destroy: () => {

@@ -271,8 +271,68 @@ describe('a window, its owner’s frames given by hand', () => {
     windows.push(client);
     const feed = (f: unknown) => sink!.frame(f);
     feed({ k: 'welcome', v: 1, att: 1, limits: {}, realm: 'test', account: { epoch: 0, user: 'ann' }, conn, gen: 1 });
-    return { client, feed, posted };
+    /** The channel to the owner closes: the owner went without a word. */
+    const gone = () => sink!.close();
+    return { client, feed, posted, gone };
   }
+
+  /** What the window was told of its sends, in order. */
+  function outcomesOf(client: BridgeClient) {
+    const said: unknown[] = [];
+    client.on('wseDelivered', (d) => said.push(['delivered', d]));
+    client.on('wseNotDelivered', (d) => said.push(['not', d]));
+    return said;
+  }
+
+  const confirmed = { ev: 'event', name: 'wseDelivered', detail: { ids: ['confirmed'] } };
+
+  it('says once what the server confirmed, though a listener of its state signs out as it is let go', () => {
+    // The owner signs out, goes with its outbox kept, or its channel closes:
+    // only a sign-out clears what the owner still held.
+    for (const end of ['signed_out', 'owner_closed', 'gone'] as const) {
+      const { client, feed, gone } = byHand();
+      const said = outcomesOf(client);
+      expect(client.send('order', { n: 1 }, { id: 'confirmed' })).toBe('queued');
+      expect(client.send('order', { n: 2 }, { id: 'held' })).toBe('queued');
+      client.pause('background');
+      feed({ k: 'b', s: 1, items: [confirmed] });
+      client.state.listen(() => {
+        if (client.bridge.phase !== 'attached') client.signOut();
+      });
+      if (end === 'gone') gone();
+      else feed({ k: 'revoked', reason: end });
+      expect(said, end).toEqual(
+        end === 'signed_out'
+          ? [['delivered', { ids: ['confirmed'] }], ['not', { reason: 'cleared', ids: ['held'] }]]
+          : [['delivered', { ids: ['confirmed'] }]],
+      );
+    }
+  });
+
+  it('says nothing of a send its owner went without telling of, signed out after', () => {
+    const { client, gone } = byHand();
+    const said = outcomesOf(client);
+    expect(client.send('order', { n: 1 }, { id: 'unknown' })).toBe('queued');
+    gone();
+    client.signOut();
+    // The server may have taken it: there is nothing to say.
+    expect(said).toEqual([]);
+    expect(client.kept()).toBe(1);
+  });
+
+  it('says a send the owner refused the window with never went', () => {
+    let sink: { frame(f: unknown): void } | undefined;
+    const client = createBridgeClient({ listen: (s) => (sink = s as never), post: () => {}, close: () => {} });
+    windows.push(client);
+    const said = outcomesOf(client);
+    // Sent while it attaches: the owner refuses it and takes none of its frames.
+    expect(client.send('order', { n: 1 }, { id: 'refused' })).toBe('queued');
+    sink!.frame({ k: 'refused', reason: 'version' });
+    expect(said).toEqual([['not', { reason: 'closed', ids: ['refused'] }]]);
+    client.signOut();
+    expect(said).toHaveLength(1);
+    expect(client.kept()).toBe(0);
+  });
 
   const price = (o: number, secret = 'x') => ({ m: { t: 'price', p: { secret }, tp: 'prices', e: '0000000a', o } });
 
