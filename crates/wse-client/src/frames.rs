@@ -12,6 +12,16 @@ use crate::session::Session;
 /// by no client, natively (the WebSocket's own limit) or in the browser.
 pub(crate) const FRAME_OVERHEAD: usize = 32;
 
+/// Whether a data frame of `size` bytes is past what the client takes: a
+/// message up to `max`, a sealed frame (`sealed`) its overhead more.
+pub(crate) fn past_limit(size: usize, sealed: bool, max: usize) -> bool {
+    size > if sealed {
+        max.saturating_add(FRAME_OVERHEAD)
+    } else {
+        max
+    }
+}
+
 /// The data of a frame.
 pub(crate) enum Data<'a> {
     /// A text frame, and the bytes it came in when a message may keep them.

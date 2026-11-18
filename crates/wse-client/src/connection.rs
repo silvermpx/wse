@@ -318,7 +318,26 @@ impl<H: Handler> Driver<H> {
                                 // frames show the server is alive.
                                 alive |= self.session.sealing.is_none();
                             }
-                            Some(Ok(frame)) => alive |= self.on_frame(&frame),
+                            Some(Ok(frame)) => {
+                                // The WebSocket takes a sealed frame's
+                                // overhead on any frame: a plain one past the
+                                // message's limit ends the connection here.
+                                if let Some(size) = self.past_limit(&frame) {
+                                    let close = CloseFrame {
+                                        code: CloseCode::Size,
+                                        reason: "message too big".into(),
+                                    };
+                                    let _ = ws.close(Some(close)).await;
+                                    return Lost::Closed {
+                                        code: None,
+                                        reason: format!(
+                                            "a message of {size} bytes, past max_message_size ({})",
+                                            self.config.max_message_size
+                                        ),
+                                    };
+                                }
+                                alive |= self.on_frame(&frame);
+                            }
                             Some(Err(e)) => {
                                 return Lost::Closed { code: None, reason: e.to_string() };
                             }
@@ -447,6 +466,16 @@ impl<H: Handler> Driver<H> {
                 }
             }
         }
+    }
+
+    /// The size of a data frame past what the client takes, when it is.
+    fn past_limit(&self, frame: &Frame) -> Option<usize> {
+        let (size, sealed) = match frame {
+            Frame::Text(text) => (text.len(), false),
+            Frame::Binary(data) => (data.len(), data.starts_with(b"E:")),
+            _ => return None,
+        };
+        frames::past_limit(size, sealed, self.config.max_message_size).then_some(size)
     }
 
     /// A data frame; true when it shows the server is alive.

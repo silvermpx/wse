@@ -611,15 +611,15 @@ impl<H: Handler> Driver<H> {
                     let mut alive = false;
                     let mut taken = 1;
                     // The browser takes a frame of any size: one past the
-                    // limit ends the connection, as the native WebSocket does.
-                    let limit = self.config.max_message_size.saturating_add(frames::FRAME_OVERHEAD);
+                    // limit (a sealed one's with its overhead) ends the
+                    // connection, as the native client does.
                     loop {
-                        let size = match &happened {
-                            Some(Happened::Text(text)) => text.len(),
-                            Some(Happened::Binary(data)) => data.len(),
-                            _ => 0,
+                        let (size, sealed) = match &happened {
+                            Some(Happened::Text(text)) => (text.len(), false),
+                            Some(Happened::Binary(data)) => (data.len(), data.starts_with(b"E:")),
+                            _ => (0, false),
                         };
-                        if size > limit {
+                        if frames::past_limit(size, sealed, self.config.max_message_size) {
                             socket.close("message too big");
                             return Lost::Closed {
                                 code: None,

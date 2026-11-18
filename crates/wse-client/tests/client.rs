@@ -1491,3 +1491,88 @@ async fn a_burst_longer_than_a_read_batch_reaches_the_handler_whole() {
     assert_eq!(*seen.lock().unwrap(), (1..=90).collect::<Vec<_>>());
     client.close().await;
 }
+
+/// What the handler took, and why the connection went.
+struct Sizes {
+    seen: Arc<Mutex<Vec<u64>>>,
+    lost: Arc<Mutex<Vec<String>>>,
+}
+
+impl wse_client::Handler for Sizes {
+    fn message(&mut self, message: &wse_client::Message<'_>) {
+        if let Some(n) = message.payload_value().ok().and_then(|p| p["n"].as_u64()) {
+            self.seen.lock().unwrap().push(n);
+        }
+    }
+
+    fn event(&mut self, event: wse_client::Event) {
+        if let wse_client::Event::Disconnected(gone) = event {
+            self.lost.lock().unwrap().push(gone.reason);
+        }
+    }
+}
+
+/// A message of exactly `max_message_size` is taken; one byte past it ends
+/// the connection: the overhead a frame may carry is a sealed frame's alone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_plain_message_is_taken_up_to_max_message_size_and_not_a_byte_past() {
+    use futures_util::{SinkExt, StreamExt};
+    use tokio_tungstenite::tungstenite::Message as Frame;
+    const MAX: usize = 1024;
+    // A message of `n` padded to `size` bytes.
+    let sized = |n: u64, size: usize| {
+        let bare = json!({"t": "said", "p": {"n": n, "pad": ""}}).to_string();
+        json!({"t": "said", "p": {"n": n, "pad": "x".repeat(size - bare.len())}}).to_string()
+    };
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("ws://{}/wse", listener.local_addr().unwrap());
+    tokio::spawn(async move {
+        let (socket, _) = listener.accept().await.unwrap();
+        let mut ws = tokio_tungstenite::accept_async(socket).await.unwrap();
+        while let Some(Ok(frame)) = ws.next().await {
+            let Frame::Text(text) = frame else {
+                continue;
+            };
+            if !text.contains("client_hello") {
+                continue;
+            }
+            let ready = json!({"c": "WSE", "t": "server_ready", "v": 1,
+                "p": {"connection_id": "c1", "details": {"user_id": "ann", "features": {}}}});
+            ws.send(Frame::Text(ready.to_string().into()))
+                .await
+                .unwrap();
+            let at = sized(1, MAX);
+            let past = sized(2, MAX + 1);
+            assert_eq!((at.len(), past.len()), (MAX, MAX + 1));
+            ws.send(Frame::Text(at.into())).await.unwrap();
+            let _ = ws.send(Frame::Text(past.into())).await;
+        }
+    });
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let lost = Arc::new(Mutex::new(Vec::new()));
+    let mut config = Config::new(url);
+    config.offline = None;
+    config.max_message_size = MAX;
+    let client = wse_client::Client::start(
+        config,
+        Sizes {
+            seen: Arc::clone(&seen),
+            lost: Arc::clone(&lost),
+        },
+    )
+    .await
+    .unwrap();
+    for _ in 0..250 {
+        if !lost.lock().unwrap().is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(*seen.lock().unwrap(), [1]);
+    let lost = lost.lock().unwrap().clone();
+    assert!(
+        lost.iter().any(|why| why.contains("past max_message_size")),
+        "{lost:?}"
+    );
+    client.close().await;
+}
