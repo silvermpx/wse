@@ -1,0 +1,6 @@
+{
+  "about": "The Swift package on an iOS simulator (bindings/swift, run-tests.sh with SIMULATOR=1): its client on the Rust client's native layer, in an iOS app's sandbox.",
+  "agents": {
+    "swift-ios": { "features": ["outbox", "start", "live", "msgpack", "e2e", "signing", "recover_or_resync"] }
+  }
+}

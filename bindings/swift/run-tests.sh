@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # Builds the package's native part, starts the Rust client's example server
-# and runs the tests: on the Mac (swift test), and with SIMULATOR=1 also on
-# an iOS simulator, built as CONFIGURATION says (Debug, or Release: the
-# optimized build an app ships).
+# and the conformance server, and runs the tests, the conformance cases among
+# them: on the Mac (swift test), and with SIMULATOR=1 also on an iOS
+# simulator, built as CONFIGURATION says (Debug, or Release: the optimized
+# build an app ships). Each run's cases are checked after it.
 set -euo pipefail
 here="$(cd "$(dirname "$0")" && pwd)"
 root="$(cd "$here/../.." && pwd)"
@@ -61,9 +62,12 @@ sys.exit("no iPhone simulator")')
   xcrun simctl boot "$device"
   xcrun simctl keychain "$device" add-root-cert "$WSE_TEST_CA"
   # xcodebuild hands TEST_RUNNER_ variables to the tests, without the prefix.
+  # The conformance cases run there too, as the agent swift-ios.
   TEST_RUNNER_WSE_TEST_URL="$WSE_TEST_URL" TEST_RUNNER_WSE_TEST_TLS_URL="$WSE_TEST_TLS_URL" \
     TEST_RUNNER_WSE_TEST_CA="$WSE_TEST_CA" TEST_RUNNER_WSE_TEST_CA_TRUSTED=1 \
     TEST_RUNNER_WSE_TEST_IDENTITY="$WSE_TEST_IDENTITY" TEST_RUNNER_WSE_TEST_SIGNING="$WSE_TEST_SIGNING" \
+    TEST_RUNNER_WSE_CONFORMANCE="$WSE_CONFORMANCE" TEST_RUNNER_WSE_CONFORMANCE_REQUIRED=1 \
     xcodebuild test -scheme WseClient -destination "id=$device" -configuration "${CONFIGURATION:-Debug}" \
     ENABLE_TESTABILITY=YES
+  "$target/debug/wse-conformance" check --manifest "$root/tests/conformance/swift-ios.json" --reports "$conformance"
 fi

@@ -395,14 +395,20 @@ final class ConformanceTests: XCTestCase {
         #else
             let arch = "x86_64"
         #endif
+        // On iOS (a simulator) the package is an agent of its own.
+        #if os(iOS)
+            let (agent, system) = ("swift-ios", "iOS")
+        #else
+            let (agent, system) = ("swift", "macOS")
+        #endif
         let control = Control(url)
         let hello = try await control.call(
             "hello",
             [
-                "agent": "swift",
+                "agent": agent,
                 "version": "3.2.0",
                 "runtime": "swift",
-                "os": ProcessInfo.processInfo.operatingSystemVersionString,
+                "os": "\(system) \(ProcessInfo.processInfo.operatingSystemVersionString)",
                 "arch": arch,
                 "features": features,
             ])
