@@ -328,23 +328,33 @@ fn hold(rule: &Rule, trace: &Trace<'_>, log: &Log) -> Result<(), String> {
             }
         }
         "held_until_resynced" => {
+            // Every resync the client asked for holds the topic back until
+            // the application said it resynced: the cold start's, and the
+            // one after a reconnect.
             let topic = topic()?;
-            let asked = trace
+            let asks: Vec<usize> = trace
                 .of("resync")
-                .find(|(_, e)| names(&e["topics"], topic))
+                .filter(|(_, e)| names(&e["topics"], topic))
                 .map(|(at, _)| at)
-                .ok_or("the client never asked for a resync")?;
-            let said = trace
-                .of("resynced")
-                .find(|(at, e)| *at > asked && names(&e["topics"], topic))
-                .map(|(at, _)| at)
-                .ok_or("the application never said it resynced")?;
-            let early: Vec<u64> = trace
-                .numbers(topic)
-                .into_iter()
-                .filter(|(at, _)| asked < *at && *at < said)
-                .map(|(_, n)| n)
                 .collect();
+            if asks.is_empty() {
+                return Err("the client never asked for a resync".to_owned());
+            }
+            let numbers = trace.numbers(topic);
+            let mut early: Vec<u64> = Vec::new();
+            for asked in asks {
+                let said = trace
+                    .of("resynced")
+                    .find(|(at, e)| *at > asked && names(&e["topics"], topic))
+                    .map(|(at, _)| at)
+                    .ok_or("the application never said it resynced")?;
+                early.extend(
+                    numbers
+                        .iter()
+                        .filter(|(at, _)| asked < *at && *at < said)
+                        .map(|(_, n)| *n),
+                );
+            }
             if early.is_empty() {
                 Ok(())
             } else {
@@ -451,6 +461,35 @@ mod tests {
             1
         );
         assert!(judged(rules, &[message(4), message(5), gap(), message(1)], &log).is_empty());
+    }
+
+    #[test]
+    fn every_resync_holds_its_messages_back_the_cold_start_s_and_a_reconnect_s() {
+        let rules = json!([{"rule": "held_until_resynced", "topic": "t"}]);
+        let log = Log::default();
+        let resync = || json!({"ev": "resync", "topics": ["t"]});
+        let resynced = || json!({"ev": "resynced", "topics": ["t"]});
+        // The cold start's resync, answered, then a reconnect's.
+        let held = [
+            resync(),
+            resynced(),
+            message(1),
+            resync(),
+            resynced(),
+            message(44),
+        ];
+        assert!(judged(rules.clone(), &held, &log).is_empty());
+        // The reconnect's barrier broken: 44 and 45 before its resynced.
+        let broken = [
+            resync(),
+            resynced(),
+            message(1),
+            resync(),
+            message(44),
+            message(45),
+            resynced(),
+        ];
+        assert_eq!(judged(rules, &broken, &log).len(), 1);
     }
 
     #[test]
