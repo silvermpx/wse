@@ -1,9 +1,23 @@
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use crate::stats::LatencyHistogram;
 
+/// A check of a run failed: the run says so in its exit code.
+static FAILED: AtomicBool = AtomicBool::new(false);
+
+/// A check failed (it was printed FAILED).
+pub fn failed() {
+    FAILED.store(true, Ordering::Relaxed);
+}
+
+/// Whether a check of this run failed.
+pub fn any_failed() -> bool {
+    FAILED.load(Ordering::Relaxed)
+}
+
 /// Single tier result (used across all tests).
-/// Fields are stored for JSON report generation even if not directly read in Rust.
-#[derive(Clone)]
-#[allow(dead_code)]
+/// Each field goes into the JSON report (`--output json`).
+#[derive(Clone, serde::Serialize)]
 pub struct TierResult {
     pub tier: usize,
     pub connected: usize,
@@ -16,8 +30,7 @@ pub struct TierResult {
     pub extra: serde_json::Value,
 }
 
-#[derive(Clone)]
-#[allow(dead_code)]
+#[derive(Clone, serde::Serialize)]
 pub struct LatencySummary {
     pub p50: f64,
     pub p95: f64,
@@ -48,11 +61,43 @@ impl LatencySummary {
     }
 }
 
-/// Full test result.
-#[allow(dead_code)]
-pub struct TestResult {
-    pub test_name: String,
-    pub tiers: Vec<TierResult>,
+/// What the run gives back past the tables each test prints: with `--output
+/// json` every tier of every test as JSON, with `--output markdown` a table
+/// for each test.
+pub fn write(format: crate::config::OutputFormat, results: &[(String, Vec<TierResult>)]) {
+    use crate::config::OutputFormat;
+    match format {
+        OutputFormat::Text => {}
+        OutputFormat::Json => {
+            let tests: Vec<serde_json::Value> = results
+                .iter()
+                .map(|(test, tiers)| serde_json::json!({ "test": test, "tiers": tiers }))
+                .collect();
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&tests).unwrap_or_default()
+            );
+        }
+        OutputFormat::Markdown => {
+            for (test, tiers) in results {
+                println!("\n### {test}\n");
+                println!("| Tier | Connected | Errors | Msg/s | p50 ms | p99 ms |");
+                println!("|---:|---:|---:|---:|---:|---:|");
+                for tier in tiers {
+                    let (p50, p99) = tier.latency.as_ref().map_or(("-".into(), "-".into()), |l| {
+                        (format!("{:.2}", l.p50), format!("{:.2}", l.p99))
+                    });
+                    println!(
+                        "| {} | {} | {} | {:.0} | {p50} | {p99} |",
+                        tier.tier,
+                        tier.connected,
+                        tier.errors,
+                        tier.msg_per_sec()
+                    );
+                }
+            }
+        }
+    }
 }
 
 impl TierResult {

@@ -110,6 +110,7 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
         }
         Err(e) => {
             eprintln!("FAILED: {e}");
+            crate::report::failed();
             eprintln!(
                 "\n  Start servers with TLS (separate cluster ports):\n    \
                 python benchmarks/bench_battle_server.py --mode cluster --port {} --peers 127.0.0.1:6007 \
@@ -357,6 +358,7 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
     );
     if checks.failed > 0 {
         println!("  FAILED");
+        crate::report::failed();
     } else {
         println!("  PASSED");
     }

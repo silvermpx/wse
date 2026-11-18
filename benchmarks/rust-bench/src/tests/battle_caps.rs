@@ -228,6 +228,7 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
     );
     if checks.failed > 0 {
         println!("  FAILED");
+        crate::report::failed();
     } else {
         println!("  PASSED");
     }

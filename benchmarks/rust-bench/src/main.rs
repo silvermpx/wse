@@ -8,6 +8,7 @@ mod tests;
 
 use clap::Parser;
 use config::{Cli, TestName};
+use report::TierResult;
 
 #[tokio::main]
 async fn main() {
@@ -57,122 +58,71 @@ async fn main() {
     }
 
     // Run tests
-    match cli.test {
-        Some(test) => run_single_test(&cli, test).await,
+    let results = match cli.test {
+        Some(test) => vec![(format!("{test:?}"), run_single_test(&cli, test).await)],
         None => run_full_suite(&cli).await,
-    }
+    };
+    report::write(cli.output, &results);
 
     println!("\nDone.");
-}
-
-async fn run_single_test(cli: &Cli, test: TestName) {
-    match test {
-        TestName::ConnectionStorm => {
-            tests::connection_storm::run(cli).await;
-        }
-        TestName::PingLatency => {
-            tests::ping_latency::run(cli).await;
-        }
-        TestName::Throughput => {
-            tests::throughput::run(cli).await;
-        }
-        TestName::SizeMatrix => {
-            tests::size_matrix::run(cli).await;
-        }
-        TestName::FormatComparison => {
-            tests::format_comparison::run(cli).await;
-        }
-        TestName::SustainedHold => {
-            tests::sustained_hold::run(cli).await;
-        }
-        TestName::ConnectionLimit => {
-            tests::connection_limit::run(cli).await;
-        }
-        TestName::FanoutBroadcast => {
-            tests::fanout_broadcast::run(cli).await;
-        }
-        TestName::FanoutCluster => {
-            tests::fanout_cluster::run(cli).await;
-        }
-        TestName::FanoutClusterTls => {
-            tests::fanout_cluster_tls::run(cli).await;
-        }
-        TestName::BattleStandalone => {
-            tests::battle_standalone::run(cli).await;
-        }
-        TestName::BattleCluster => {
-            tests::battle_cluster::run(cli).await;
-        }
-        TestName::BattleLoad => {
-            tests::battle_load::run(cli).await;
-        }
-        TestName::BattleCaps => {
-            tests::battle_caps::run(cli).await;
-        }
-        TestName::BattleTls => {
-            tests::battle_tls::run(cli).await;
-        }
-        TestName::BattleDiscovery => {
-            tests::battle_discovery::run(cli).await;
-        }
-        TestName::BattleCompression => {
-            tests::battle_compression::run(cli).await;
-        }
-        TestName::BattlePresence => {
-            tests::battle_presence::run(cli).await;
-        }
-        TestName::BattleRecovery => {
-            tests::battle_recovery::run(cli).await;
-        }
-        TestName::BattleEncryption => {
-            tests::battle_encryption::run(cli).await;
-        }
-        TestName::BattleQueueGroups => {
-            tests::battle_queue_groups::run(cli).await;
-        }
-        TestName::BattleTopicAcl => {
-            tests::battle_topic_acl::run(cli).await;
-        }
-        TestName::BattleDrain => {
-            tests::battle_drain::run(cli).await;
-        }
-        TestName::BattleMetrics => {
-            tests::battle_metrics::run(cli).await;
-        }
-        TestName::BattleTopology => {
-            tests::battle_topology::run(cli).await;
-        }
+    // A check that failed fails the run, for whatever runs it.
+    if report::any_failed() {
+        eprintln!("A check failed: see FAILED above.");
+        std::process::exit(1);
     }
 }
 
-async fn run_full_suite(cli: &Cli) {
+async fn run_single_test(cli: &Cli, test: TestName) -> Vec<TierResult> {
+    match test {
+        TestName::ConnectionStorm => tests::connection_storm::run(cli).await,
+        TestName::PingLatency => tests::ping_latency::run(cli).await,
+        TestName::Throughput => tests::throughput::run(cli).await,
+        TestName::SizeMatrix => tests::size_matrix::run(cli).await,
+        TestName::FormatComparison => tests::format_comparison::run(cli).await,
+        TestName::SustainedHold => tests::sustained_hold::run(cli).await,
+        TestName::ConnectionLimit => tests::connection_limit::run(cli).await,
+        TestName::FanoutBroadcast => tests::fanout_broadcast::run(cli).await,
+        TestName::FanoutCluster => tests::fanout_cluster::run(cli).await,
+        TestName::FanoutClusterTls => tests::fanout_cluster_tls::run(cli).await,
+        TestName::BattleStandalone => tests::battle_standalone::run(cli).await,
+        TestName::BattleCluster => tests::battle_cluster::run(cli).await,
+        TestName::BattleLoad => tests::battle_load::run(cli).await,
+        TestName::BattleCaps => tests::battle_caps::run(cli).await,
+        TestName::BattleTls => tests::battle_tls::run(cli).await,
+        TestName::BattleDiscovery => tests::battle_discovery::run(cli).await,
+        TestName::BattleCompression => tests::battle_compression::run(cli).await,
+        TestName::BattlePresence => tests::battle_presence::run(cli).await,
+        TestName::BattleRecovery => tests::battle_recovery::run(cli).await,
+        TestName::BattleEncryption => tests::battle_encryption::run(cli).await,
+        TestName::BattleQueueGroups => tests::battle_queue_groups::run(cli).await,
+        TestName::BattleTopicAcl => tests::battle_topic_acl::run(cli).await,
+        TestName::BattleDrain => tests::battle_drain::run(cli).await,
+        TestName::BattleMetrics => tests::battle_metrics::run(cli).await,
+        TestName::BattleTopology => tests::battle_topology::run(cli).await,
+    }
+}
+
+async fn run_full_suite(cli: &Cli) -> Vec<(String, Vec<TierResult>)> {
     println!("\n  Running full benchmark suite...");
-
-    tests::connection_storm::run(cli).await;
-    pause_between_tests().await;
-
-    tests::ping_latency::run(cli).await;
-    pause_between_tests().await;
-
-    tests::throughput::run(cli).await;
-    pause_between_tests().await;
-
-    tests::size_matrix::run(cli).await;
-    pause_between_tests().await;
-
-    tests::format_comparison::run(cli).await;
-    pause_between_tests().await;
-
-    tests::sustained_hold::run(cli).await;
-    pause_between_tests().await;
-
-    tests::connection_limit::run(cli).await;
-    pause_between_tests().await;
-
-    tests::fanout_broadcast::run(cli).await;
-    pause_between_tests().await;
-
-    tests::fanout_cluster::run(cli).await;
+    let suite = [
+        TestName::ConnectionStorm,
+        TestName::PingLatency,
+        TestName::Throughput,
+        TestName::SizeMatrix,
+        TestName::FormatComparison,
+        TestName::SustainedHold,
+        TestName::ConnectionLimit,
+        TestName::FanoutBroadcast,
+        TestName::FanoutCluster,
+    ];
+    let mut results = Vec::with_capacity(suite.len());
+    for (at, test) in suite.into_iter().enumerate() {
+        if at > 0 {
+            pause_between_tests().await;
+        }
+        results.push((format!("{test:?}"), run_single_test(cli, test).await));
+    }
+    results
 }
 
 async fn pause_between_tests() {

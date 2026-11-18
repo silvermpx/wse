@@ -41,6 +41,7 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
 
         if connections.is_empty() {
             println!("    FAILED: no connections");
+            crate::report::failed();
             continue;
         }
 
