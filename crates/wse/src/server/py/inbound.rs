@@ -16,6 +16,10 @@ impl RustWSEServer {
         max_count: usize,
         timeout_ms: u64,
     ) -> PyResult<Py<PyList>> {
+        // None asked for: none taken, and no wait.
+        if max_count == 0 {
+            return Ok(PyList::empty(py).unbind());
+        }
         // Collect events with GIL released (channel recv happens without GIL)
         let events: Vec<InboundEvent> = py.detach(|| {
             let mut events = Vec::with_capacity(max_count.min(4096));

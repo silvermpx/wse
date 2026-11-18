@@ -128,6 +128,22 @@ class TestServerAcrossThreads:
         finally:
             srv.stop()
 
+    def test_a_drain_of_none_takes_none_and_does_not_wait(self, server_port):
+        websockets = pytest.importorskip("websockets.sync.client")
+        srv = drain_server(server_port)
+        srv.start()
+        try:
+            with websockets.connect(f"ws://127.0.0.1:{server_port}/wse"):
+                time.sleep(0.2)
+                started = time.monotonic()
+                assert srv.drain_inbound(0, 2000) == []
+                assert time.monotonic() - started < 0.5
+                # The connect event is still there for the next drain.
+                events = srv.drain_inbound(16, 2000)
+                assert [e[0] for e in events] == ["connect"]
+        finally:
+            srv.stop()
+
     def test_drain_and_publish_from_many_threads(self, server_port):
         """Drain loops, broadcasts and health reads overlap without errors."""
         srv = drain_server(server_port)
