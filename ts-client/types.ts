@@ -404,7 +404,10 @@ export interface SignedMessageOptions {
 
 /**
  * Result of sendMessage():
- * - 'sent'    handed to the open socket (encrypted when encryption is on)
+ * - 'sent'    handed to the open socket (encrypted when encryption is on);
+ *             in a window of the bridge, a live one handed to the owner,
+ *             which writes it on the connection the window saw ready or
+ *             says `wseNotDelivered` with reason `dropped`
  * - 'queued'  held and sent automatically once the connection is ready
  * - 'dropped' rejected (outgoing queue full, encryption required but not
  *             enabled, or the message could not be serialised)
