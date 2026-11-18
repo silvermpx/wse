@@ -88,14 +88,24 @@ export function createReactNativeClient(options: ReactNativeClientOptions = {}):
   const subscription = appState?.addEventListener('change', onState) ?? null;
   if (appState?.currentState === 'background') client.pause(BACKGROUND);
 
+  let following = subscription !== null;
   const stopFollowingAppState = () => {
-    subscription?.remove();
+    if (following) subscription?.remove();
+    following = false;
     if (timer) clearTimeout(timer);
     timer = null;
   };
   return {
     ...client,
     stopFollowingAppState,
+    // However the client ends, it no longer follows the app.
+    close: async (deadlineMs: number) => {
+      try {
+        return await client.close(deadlineMs);
+      } finally {
+        stopFollowingAppState();
+      }
+    },
     signOut: () => {
       stopFollowingAppState();
       client.signOut();

@@ -15,7 +15,7 @@ class RnWebSocket extends FakeWebSocket {
   }
 }
 
-function appState(): AppStateLike & { set(state: string): void } {
+function appState(): AppStateLike & { set(state: string): void; listening(): number } {
   const listeners = new Set<(state: string) => void>();
   const state = {
     currentState: 'active' as string | null,
@@ -27,6 +27,7 @@ function appState(): AppStateLike & { set(state: string): void } {
       state.currentState = next;
       for (const listener of listeners) listener(next);
     },
+    listening: () => listeners.size,
   };
   return state;
 }
@@ -44,6 +45,21 @@ afterEach(() => {
 });
 
 describe('react-native', () => {
+  it('stops following the app state once closed, however it ends', async () => {
+    for (const end of ['close', 'signOut', 'destroy'] as const) {
+      const app = appState();
+      const client = createReactNativeClient({
+        endpoints: ['ws://phone.test/wse'],
+        offline: { enabled: false },
+        appState: app,
+      });
+      expect(app.listening()).toBe(1);
+      if (end === 'close') await client.close(0);
+      else client[end]();
+      expect(app.listening()).toBe(0);
+    }
+  });
+
   it('sends the token as a header, and pauses in the background after the grace', async () => {
     const app = appState();
     let token = 'first';
