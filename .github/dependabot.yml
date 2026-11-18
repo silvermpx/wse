@@ -17,8 +17,11 @@ updates:
     cooldown:
       default-days: 7
 
+  # The workspace at the root, and the Tauri binding's own (its lock file).
   - package-ecosystem: "cargo"
-    directory: "/rust"
+    directories:
+      - "/"
+      - "/bindings/tauri"
     schedule:
       interval: "weekly"
     cooldown:
