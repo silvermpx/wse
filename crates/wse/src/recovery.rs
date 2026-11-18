@@ -1249,7 +1249,10 @@ impl RecoveryManager {
                 }
                 None => anchor_seq.and_then(|seq| buf.whole_after(seq)),
             };
-            streams.push(more?);
+            let Some(more) = more else {
+                return Some(());
+            };
+            streams.push(more);
             None
         });
         if failed.is_some() {
@@ -2216,6 +2219,44 @@ mod tests {
         // The hole filled: from the newest on.
         mgr.push_foreign("a", make_data("x"), 7, 3);
         assert!(mgr.foreign_positions().contains(&("a".to_owned(), 7, 5)));
+    }
+
+    #[test]
+    fn an_own_stream_that_let_go_what_a_client_missed_is_not_recovered_by_streams() {
+        // Four slots: away for ten, the first six are gone.
+        let mgr = RecoveryManager::new(RecoveryConfig {
+            buffer_size_bits: 2,
+            ..RecoveryConfig::default()
+        });
+        mgr.push("prices", make_data("0"));
+        let (epoch, _) = mgr.get_position("prices").unwrap();
+        for n in 1..=10 {
+            mgr.push("prices", make_data(&n.to_string()));
+        }
+        assert!(not_recovered(&mgr.recover_streams(
+            "prices",
+            (epoch, 0),
+            &[(epoch, 0)]
+        )));
+        assert!(not_recovered(&mgr.recover("prices", epoch, 0)));
+        // From what is still held: recovered.
+        let RecoveryResult::Recovered { publications, .. } =
+            mgr.recover_streams("prices", (epoch, 7), &[(epoch, 7)])
+        else {
+            panic!("not recovered");
+        };
+        assert_eq!(publications.len(), 3);
+        // The same of a local stream.
+        mgr.push_stamped_local("local", |_, _| make_data("0"));
+        let (local, _) = mgr.get_position("local").unwrap();
+        for n in 1..=10 {
+            mgr.push_stamped_local("local", |_, _| make_data(&n.to_string()));
+        }
+        assert!(not_recovered(&mgr.recover_streams(
+            "local",
+            (local, 0),
+            &[(local, 0)]
+        )));
     }
 
     #[test]
