@@ -634,7 +634,21 @@ where
             .map(|(topic, epoch, _)| (topic.as_str(), *epoch))
             .collect()
     };
+    // Each topic of this node's the peer has, by its name or by a pattern
+    // that matches it: once, since the oldest of those interests began.
+    let mut lately: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
     for (topic, age) in &wanted.topics {
+        let matched = if crate::server::is_pattern(topic) {
+            rm.own_topics_matching(topic)
+        } else {
+            vec![topic.clone()]
+        };
+        for topic in matched {
+            let since = lately.entry(topic).or_insert(0);
+            *since = (*since).max(*age);
+        }
+    }
+    for (topic, age) in &lately {
         let named = |epoch: u32| named.contains(&(topic.as_str(), epoch));
         let lately = rm.published_lately(topic, Duration::from_millis(*age), named);
         let Some((epoch, messages)) = lately else {

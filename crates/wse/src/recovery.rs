@@ -1344,6 +1344,15 @@ impl RecoveryManager {
         after.checked_sub(1).map_or(0, |i| marks[i].1)
     }
 
+    /// The topics of this node's own streams that `pattern` matches.
+    pub(crate) fn own_topics_matching(&self, pattern: &str) -> Vec<String> {
+        self.buffers
+            .iter()
+            .filter(|entry| crate::server::glob_match(pattern, entry.key()))
+            .map(|entry| entry.key().clone())
+            .collect()
+    }
+
     /// What this node published to `topic` in the last `age` (and a little
     /// before), with its stream's epoch and each message's offset, for a peer
     /// that has the topic but never heard of the stream: None when this node
@@ -2235,6 +2244,19 @@ mod tests {
         // A client whose last message came after it missed nothing.
         mgr.push("room", make_data("l1"));
         assert!(!not_recovered(&mgr.recover("room", local, 1)));
+    }
+
+    #[test]
+    fn a_pattern_matches_the_topics_of_this_nodes_own_streams() {
+        let mgr = RecoveryManager::new(RecoveryConfig::default());
+        for topic in ["prices:a", "prices:b", "other"] {
+            mgr.push(topic, make_data("x"));
+        }
+        mgr.push_foreign("prices:c", make_data("f"), 0xf, 0);
+        let mut matched = mgr.own_topics_matching("prices:*");
+        matched.sort();
+        assert_eq!(matched, ["prices:a", "prices:b"]);
+        assert!(mgr.own_topics_matching("none:*").is_empty());
     }
 
     #[test]

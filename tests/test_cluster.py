@@ -364,6 +364,55 @@ def test_a_stream_begun_while_a_link_was_down_arrives_after_it(nodes):
     assert [m["p"]["n"] for m in replayed] == [1, 2]
 
 
+def test_a_stream_a_pattern_matches_begun_while_a_link_was_down_arrives_after_it(nodes):
+    """A client holds a pattern; while the link between the nodes is down, the
+    origin publishes to a new topic it matches: the client gets that stream
+    from its first message once the link is back, and the established stream
+    with nothing repeated."""
+    websockets = pytest.importorskip("websockets")
+    origin, relay = nodes(recovery=True), nodes(recovery=True)
+    origin.join()
+
+    def publish(topic, n):
+        origin.server.broadcast(topic, json.dumps({"t": "price", "p": {"n": n}}))
+
+    async def scenario():
+        blink = Blink(origin)
+        await blink.start()
+        try:
+            relay.join(blink)
+            await until(lambda: origin.peers == 1 and relay.peers == 1)
+            async with websockets.connect(f"ws://127.0.0.1:{relay.port}/wse") as live:
+                await subscribe_next_client(relay, ["prices:*"])
+                await asyncio.sleep(0.4)  # the SUB reaches the origin
+                publish("prices:established", 0)
+                got = await messages_of_type(live, "price", 1)
+                blink.cut()
+                await until(lambda: origin.peers == 0 and relay.peers == 0)
+                publish("prices:new", 1)
+                publish("prices:established", 2)
+                blink.open = True
+                await until(lambda: origin.peers == 1 and relay.peers == 1, timeout=20.0)
+                await asyncio.sleep(0.3)
+                publish("prices:new", 3)
+                while got[-1]["p"]["n"] != 3:
+                    got.extend(await messages_of_type(live, "price", 1))
+        finally:
+            blink.close()
+        return got
+
+    got = asyncio.run(scenario())
+    seen = sorted((m["tp"], m["p"]["n"]) for m in got)
+    assert seen == [
+        ("prices:established", 0),
+        ("prices:established", 2),
+        ("prices:new", 1),
+        ("prices:new", 3),
+    ], seen
+    new = [m["o"] for m in got if m["tp"] == "prices:new"]
+    assert new == [0, 1], "the new stream from its first message, in order"
+
+
 def test_a_message_its_origin_had_no_room_to_keep_is_never_said_recovered(nodes):
     """The origin of a message had no room left for its history and sent it
     on with no position: a client of the other node whose last message of the
