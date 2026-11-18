@@ -431,3 +431,19 @@ class TestJwtAlgorithms:
     def test_jwt_options_without_a_secret_are_refused(self):
         with pytest.raises(ValueError, match="jwt_issuer, jwt_audience"):
             RustWSEServer("127.0.0.1", 1, jwt_issuer="auth", jwt_audience="api")
+
+
+class TestEventSequencerStats:
+    def test_a_number_missing_between_two_is_a_gap(self):
+        seq = RustEventSequencer(window_size=100, max_out_of_order=100)
+        seq.process_sequenced_event("t", 1, {"n": 1})
+        assert seq.process_sequenced_event("t", 3, {"n": 3}) is None
+        gaps = seq.get_sequence_stats()["topics"]["t"]["gaps"]
+        assert gaps == [{"start": 2, "end": 2, "size": 1}]
+
+    def test_a_gap_too_large_counts_every_number_it_drops(self):
+        seq = RustEventSequencer(window_size=100, max_out_of_order=5)
+        seq.process_sequenced_event("t", 1, {"n": 1})
+        seq.process_sequenced_event("t", 20, {"n": 20})
+        # 2 to 19 never came.
+        assert seq.get_sequence_stats()["dropped_count"] == 18

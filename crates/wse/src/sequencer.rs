@@ -305,8 +305,9 @@ impl EventSequencerState {
             self.out_of_order_count += 1;
 
             if sequence - expected > self.max_out_of_order {
-                // Gap too large -- drop intermediates, reset, deliver current.
-                self.dropped_count += sequence - expected - 1;
+                // Gap too large -- drop intermediates, reset, deliver current:
+                // every one from the expected on, the current one aside.
+                self.dropped_count += sequence - expected;
                 self.expected_sequences
                     .insert(topic_owned.clone(), sequence + 1);
                 if let Some(buffer) = self.buffered_events.get_mut(&topic_owned) {
@@ -375,21 +376,15 @@ impl EventSequencerState {
             topic_dict.set_item("expected", expected)?;
             topic_dict.set_item("buffered", buffered.len())?;
 
-            // Compute gaps.
+            // The gaps: what is missing from the expected one on, before
+            // each run of what is buffered.
             let gaps = PyList::empty(py);
-            if !buffered.is_empty() {
-                let sequences: Vec<u64> = buffered.keys().copied().collect();
-                let mut last = expected;
-                for &seq in &sequences {
-                    if seq - last > 1 {
-                        let gap = PyDict::new(py);
-                        gap.set_item("start", last + 1)?;
-                        gap.set_item("end", seq - 1)?;
-                        gap.set_item("size", seq - last - 1)?;
-                        gaps.append(gap)?;
-                    }
-                    last = seq;
-                }
+            for (start, end) in missing(expected, buffered.keys().copied()) {
+                let gap = PyDict::new(py);
+                gap.set_item("start", start)?;
+                gap.set_item("end", end)?;
+                gap.set_item("size", end - start + 1)?;
+                gaps.append(gap)?;
             }
             topic_dict.set_item("gaps", gaps)?;
 
@@ -630,10 +625,33 @@ impl RustEventSequencer {
     }
 }
 
+/// The runs missing before the buffered numbers (ascending), `expected` the
+/// next one awaited: each as (first, last).
+fn missing(expected: u64, buffered: impl Iterator<Item = u64>) -> Vec<(u64, u64)> {
+    let mut next = expected;
+    let mut runs = Vec::new();
+    for seq in buffered {
+        if seq > next {
+            runs.push((next, seq - 1));
+        }
+        next = next.max(seq.saturating_add(1));
+    }
+    runs
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    #[test]
+    fn the_gaps_start_at_the_number_awaited() {
+        // 1 came, 3 is buffered: 2 is missing.
+        assert_eq!(missing(2, [3].into_iter()), [(2, 2)]);
+        assert_eq!(missing(2, [5, 6, 9].into_iter()), [(2, 4), (7, 8)]);
+        assert!(missing(2, [2, 3].into_iter()).is_empty());
+        assert!(missing(2, std::iter::empty()).is_empty());
+    }
 
     // cleanup() must not drop the expected-sequence cursor of a live in-order
     // topic just because its reorder buffer is empty: gap detection would
