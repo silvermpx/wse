@@ -395,18 +395,43 @@ pub(super) async fn peer_reader<R: AsyncReadExt + Unpin>(
 /// An address as a place, however it is spelled: an IPv4 address and its
 /// IPv4-mapped IPv6 form (as a dual-stack listener sees it) are one, an IPv6
 /// address is written one way, a host name is one whatever its case (or a
-/// trailing dot), and the port stays part of it.
+/// trailing dot), and the port is a number (`044015` is `44015`) and stays
+/// part of it. A link-local address is a place on its link only: its zone
+/// stays.
 pub(super) fn same_place(addr: &str) -> String {
-    if let Ok(at) = addr.parse::<std::net::SocketAddr>() {
-        return std::net::SocketAddr::new(at.ip().to_canonical(), at.port()).to_string();
+    use std::net::{Ipv6Addr, SocketAddr};
+    if let Ok(at) = addr.parse::<SocketAddr>() {
+        return match at {
+            SocketAddr::V6(v6) if v6.ip().is_unicast_link_local() && v6.scope_id() != 0 => {
+                v6.to_string()
+            }
+            _ => SocketAddr::new(at.ip().to_canonical(), at.port()).to_string(),
+        };
     }
-    match addr.rsplit_once(':') {
-        Some((host, port)) => {
-            let host = host.strip_suffix('.').unwrap_or(host);
-            format!("{}:{port}", host.to_ascii_lowercase())
-        }
-        None => addr.to_ascii_lowercase(),
+    let Some((host, port)) = addr.rsplit_once(':') else {
+        return addr.to_ascii_lowercase();
+    };
+    let Ok(port) = port.parse::<u16>() else {
+        return addr.to_ascii_lowercase();
+    };
+    // An IPv6 address with a zone by name: the address written one way,
+    // the name of its link as it is.
+    if let Some(inner) = host
+        .strip_prefix('[')
+        .and_then(|host| host.strip_suffix(']'))
+    {
+        let (ip, zone) = inner.split_once('%').unwrap_or((inner, ""));
+        let ip = ip
+            .parse::<Ipv6Addr>()
+            .map_or_else(|_| ip.to_ascii_lowercase(), |ip| ip.to_string());
+        return if zone.is_empty() {
+            format!("[{ip}]:{port}")
+        } else {
+            format!("[{ip}%{zone}]:{port}")
+        };
     }
+    let host = host.strip_suffix('.').unwrap_or(host);
+    format!("{}:{port}", host.to_ascii_lowercase())
 }
 
 /// The instance met at `slot`, the address a node is reached at. Another

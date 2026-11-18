@@ -1058,6 +1058,56 @@ def test_a_node_whose_name_comes_back_in_other_letters_is_the_same_place(nodes):
         assert answer["recovered"] is False or 2 in numbers, answer
 
 
+def test_a_node_whose_port_comes_back_written_otherwise_is_the_same_place(nodes):
+    """The origin gives its port as 044015 and the node in its place as
+    44015, or the other way round: a port is a number however it is
+    written, so the relay takes the second for another node where the
+    first was."""
+    for first, then in (("0{}", "{}"), ("{}", "0{}")):
+        results = _back_anew_dialing_in(
+            nodes,
+            dialed="127.0.0.1",
+            before=lambda route, first=first: {
+                "cluster_addr": "localhost:" + first.format(route.port)
+            },
+            after=lambda route, then=then: {"cluster_addr": "localhost:" + then.format(route.port)},
+        )
+        for answer, numbers in results:
+            assert answer["recovered"] is False or 2 in numbers, (first, then, answer)
+
+
+def test_two_nodes_at_one_link_local_address_on_two_links_are_two_places(nodes):
+    """Two nodes give one link-local address and port, on two links (zones):
+    they are two nodes, both up, and the relay's clients lose nothing when
+    the second comes."""
+    websockets = pytest.importorskip("websockets")
+    relay, first, second = (nodes(recovery=True) for _ in range(3))
+    # Zones of no interface here: the links themselves go over loopback.
+    zones = {index for index, _ in socket.if_nameindex()}
+    one, two = 428880001, 428880002
+    assert not {one, two} & zones
+    options = {"cluster_secret": SECRET, "cluster_host": "127.0.0.1"}
+
+    async def scenario():
+        relay.join(**options)
+        first.join(relay, cluster_addr=f"[fe80::abcd%{one}]:{first.cluster_port}", **options)
+        await until(lambda: relay.peers == 1 and first.peers == 1)
+        async with websockets.connect(f"ws://127.0.0.1:{relay.port}/wse") as live:
+            await subscribe_next_client(relay, ["news", "second-node"])
+            await asyncio.sleep(0.35)  # the SUB reaches the first node
+            first.server.broadcast("news", json.dumps({"t": "news", "p": {"n": 1}}))
+            (anchor,) = await messages_of_type(live, "news", 1)
+            second.join(relay, cluster_addr=f"[fe80::abcd%{two}]:{first.cluster_port}", **options)
+            await until(lambda: relay.peers == 2 and second.peers == 1)
+            await asyncio.sleep(0.4)
+            second.server.broadcast("second-node", json.dumps({"t": "second-node", "p": {"n": 2}}))
+            await messages_of_type(live, "second-node", 1)
+        return await _recovered_both_ways(relay, anchor, websockets)
+
+    for answer, numbers in asyncio.run(scenario()):
+        assert answer["recovered"] is True and numbers == [], answer
+
+
 def test_a_node_back_anew_while_its_last_link_still_looks_up_is_never_taken_to_have_lost_nothing(
     nodes,
 ):

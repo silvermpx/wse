@@ -275,9 +275,22 @@ fn an_address_is_one_place_however_it_is_spelled() {
     assert_eq!(place("[0:0:0:0:0:0:0:1]:7000"), "[::1]:7000");
     assert_eq!(place("LOCALHOST:7000"), "localhost:7000");
     assert_eq!(place("Node-A.Internal.:7000"), "node-a.internal:7000");
-    // The port is part of the place.
+    // The port is part of the place, as a number however it is written.
     assert_ne!(place("localhost:7000"), place("localhost:7001"));
     assert_ne!(place("[::ffff:127.0.0.1]:7000"), place("127.0.0.1:7001"));
+    assert_eq!(place("localhost:044015"), place("localhost:44015"));
+    assert_eq!(place("127.0.0.1:044015"), "127.0.0.1:44015");
+    // A link-local address is one on its link: its zone stays.
+    assert_eq!(place("[fe80::abcd%7]:7000"), "[fe80::abcd%7]:7000");
+    assert_ne!(place("[fe80::abcd%7]:7000"), place("[fe80::abcd%8]:7000"));
+    assert_ne!(
+        place("[fe80::abcd%en0]:7000"),
+        place("[fe80::abcd%en1]:7000")
+    );
+    assert_eq!(
+        place("[fe80::abcd%en0]:07000"),
+        place("[FE80::ABCD%en0]:7000")
+    );
 }
 
 /// Where a node that dialed in is reached: the address it names, or the

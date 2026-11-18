@@ -219,11 +219,17 @@ pub(super) async fn accept_cluster_links(
 pub(super) fn reached_slot(reached_at: Option<&str>, from: SocketAddr) -> Option<String> {
     let at = reached_at?;
     match at.strip_prefix(':') {
+        // On the address its link came from, the zone of a link-local one
+        // too.
         Some(port) => port
             .parse::<u16>()
             .ok()
             .filter(|port| *port != 0)
-            .map(|port| SocketAddr::new(from.ip(), port).to_string()),
+            .map(|port| {
+                let mut at = from;
+                at.set_port(port);
+                at.to_string()
+            }),
         None => Some(at.to_owned()),
     }
 }
