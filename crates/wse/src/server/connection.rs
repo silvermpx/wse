@@ -1111,7 +1111,7 @@ fn deliver_json<H: Handler>(
     let skipped = pending.skipped();
     // Handed on marked as a possible repeat: the server cannot tell whether
     // it was taken already.
-    let unsure = match slot.claim(s, skipped) {
+    let unsure = match slot.claim_by(link.owner, s, skipped) {
         acks::Claim::First { gap, unsure } => {
             if let Some((from, to)) = gap {
                 pending.refuse(from, to, skipped);
@@ -1136,6 +1136,18 @@ fn deliver_json<H: Handler>(
                 &conn.handle.out.pending,
                 CLOSE_MOVED,
                 "went on on another node",
+            );
+            return;
+        }
+        // The client is back on another connection, told what was taken:
+        // what this one brings late is not taken, and it goes.
+        acks::Claim::Left => {
+            drop(slot);
+            conn.closer.close(
+                conn.tx,
+                &conn.handle.out.pending,
+                CLOSE_MOVED,
+                "went on on another connection",
             );
             return;
         }
@@ -1174,7 +1186,7 @@ fn refuse_dropped(conn: &Conn<'_>, pending: &mut acks::Pending, frame: &[u8]) {
     };
     let mut slot = link.slot.lock();
     let skipped = pending.skipped();
-    match slot.claim(s, skipped) {
+    match slot.claim_by(link.owner, s, skipped) {
         acks::Claim::First { gap, .. } => {
             if let Some((from, to)) = gap {
                 pending.refuse(from, to, skipped);
@@ -1190,7 +1202,7 @@ fn refuse_dropped(conn: &Conn<'_>, pending: &mut acks::Pending, frame: &[u8]) {
         acks::Claim::Repeat => pending.taken(s),
         acks::Claim::Refused(why) => pending.refuse(s, s, why),
         // Its stale connection: what the closed one sends is not answered.
-        acks::Claim::Moved => {}
+        acks::Claim::Moved | acks::Claim::Left => {}
     }
 }
 

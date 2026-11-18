@@ -209,6 +209,11 @@ server every client is checked against.
   for a message is made again, and catches up, instead of dropping it. A
   node that went without SHUTDOWN while its link was down, another node now
   at its address, is no longer taken to have published nothing meanwhile.
+- Outbox: a message whose bytes were held up on a connection the client
+  left is no longer taken once the client is back on another and was told
+  the server had not taken it. The connection whose hello came last holds
+  the producer; an older one is closed with 4409. Before, the client could
+  hear a message ran out (`expired`) that the application then took.
 - Cluster: a node that comes up anew at the address of one that went
   without SHUTDOWN is known for one also when it is the node that dials
   (its HELLO says where it is reached), and while the link of the one gone

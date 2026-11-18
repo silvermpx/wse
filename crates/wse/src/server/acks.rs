@@ -134,6 +134,9 @@ pub(crate) struct SlotState {
     /// asked (gone, or it knew nothing of the producer): the first time one
     /// comes, whatever connection brings it, it is handed on marked.
     unsure: u64,
+    /// The connection whose hello took the producer last: what an older one
+    /// still brings is not taken, so what that hello was told holds.
+    owner: u64,
 }
 
 /// Whether a message is handed on.
@@ -156,6 +159,9 @@ pub(crate) enum Claim {
     Unsure,
     /// Another node took the producer over.
     Moved,
+    /// The client is back on another connection of this node: this one is
+    /// stale, and what it still brings is not taken.
+    Left,
 }
 
 impl SlotState {
@@ -183,6 +189,23 @@ impl SlotState {
             gap,
             unsure: s <= self.unsure,
         }
+    }
+
+    /// [`claim`](Self::claim), for a message on the connection that holds
+    /// the producer as `owner`: one on a connection the client left is not
+    /// taken.
+    pub(crate) fn claim_by(&mut self, owner: u64, s: u64, skipped: Refusal) -> Claim {
+        if owner != self.owner {
+            return Claim::Left;
+        }
+        self.claim(s, skipped)
+    }
+
+    /// A connection's hello takes the producer: what older ones still bring
+    /// is not taken from now on. Its owner number.
+    fn take(&mut self) -> u64 {
+        self.owner += 1;
+        self.owner
     }
 
     /// A message up to `s` may have been taken on a node that could not be
@@ -309,6 +332,7 @@ impl Slot {
                 forgot: 0,
                 deciding: None,
                 unsure: 0,
+                owner: 0,
             }),
             seen: AtomicU64::new(now),
         }
@@ -389,13 +413,14 @@ impl Producers {
     fn link(&self, user: Option<&str>, hello: &Hello, here: bool, now: u64) -> (Link, Vec<Hole>) {
         let (slot, known) = self.attach(user, &hello.producer, now);
         if known && here {
-            let (start, unsure, told) = {
+            let (start, unsure, told, owner) = {
                 let mut state = slot.lock();
                 let told = state.told_from(hello.from);
                 (
                     state.decided_for(hello.from),
                     state.cannot_tell(hello.from),
                     told,
+                    state.take(),
                 )
             };
             (
@@ -403,17 +428,23 @@ impl Producers {
                     slot,
                     start,
                     unsure,
+                    owner,
                 },
                 told,
             )
         } else {
-            slot.lock().unsure_up_to(hello.written);
+            let owner = {
+                let mut state = slot.lock();
+                state.unsure_up_to(hello.written);
+                state.take()
+            };
             let unsure = hello.written;
             (
                 Link {
                     slot,
                     start: 0,
                     unsure,
+                    owner,
                 },
                 Vec::new(),
             )
@@ -432,7 +463,7 @@ impl Producers {
         let (slot, _) = self.attach(user, &hello.producer, now);
         match decided {
             Some(decided) => {
-                let (start, unsure, told) = {
+                let (start, unsure, told, owner) = {
                     let mut state = slot.lock();
                     state.advance(&decided);
                     let told = state.told_from(hello.from);
@@ -440,6 +471,7 @@ impl Producers {
                         state.decided_for(hello.from),
                         state.cannot_tell(hello.from),
                         told,
+                        state.take(),
                     )
                 };
                 (
@@ -447,18 +479,24 @@ impl Producers {
                         slot,
                         start,
                         unsure,
+                        owner,
                     },
                     told,
                 )
             }
             None => {
-                slot.lock().unsure_up_to(hello.written);
+                let owner = {
+                    let mut state = slot.lock();
+                    state.unsure_up_to(hello.written);
+                    state.take()
+                };
                 let unsure = hello.written;
                 (
                     Link {
                         slot,
                         start: 0,
                         unsure,
+                        owner,
                     },
                     Vec::new(),
                 )
@@ -526,6 +564,9 @@ pub(crate) struct Link {
     /// The highest message the server cannot tell whether it took (0:
     /// none): past it and `start`, one the client wrote was not taken.
     pub(crate) unsure: u64,
+    /// Its hello's hold on the producer: a later hello of the client's takes
+    /// it, and this connection's messages are not taken from then on.
+    pub(crate) owner: u64,
 }
 
 /// The connection ends: its producer is kept for a day from now.
@@ -976,6 +1017,34 @@ mod tests {
         assert_eq!(back.lock().mark(), 0);
     }
 
+    /// The connection whose hello came last holds the producer: a message
+    /// an older one brings late is not taken, whatever its number.
+    #[test]
+    fn a_message_on_a_connection_the_client_left_is_not_taken() {
+        let producers = Producers::default();
+        let hello = |written| Hello {
+            producer: Box::from("p"),
+            node: None,
+            written,
+            from: 1,
+        };
+        let (old, _) = producers.link(None, &hello(0), true, 0);
+        assert!(matches!(
+            old.slot.lock().claim_by(old.owner, 1, Refusal::Missing),
+            Claim::First { .. }
+        ));
+        let (new, _) = producers.link(None, &hello(2), true, 0);
+        assert_eq!(new.start, 1);
+        assert_eq!(
+            old.slot.lock().claim_by(old.owner, 2, Refusal::Missing),
+            Claim::Left
+        );
+        assert!(matches!(
+            new.slot.lock().claim_by(new.owner, 2, Refusal::Missing),
+            Claim::First { .. }
+        ));
+    }
+
     #[test]
     fn a_producer_whose_connection_is_open_is_kept_however_long_it_is_silent() {
         let producers = Producers::default();
@@ -984,6 +1053,7 @@ mod tests {
             slot,
             start: 0,
             unsure: 0,
+            owner: 1,
         };
         producers.sweep(3 * KEPT_FOR_MS);
         let (again, known) = producers.attach(None, "p", 3 * KEPT_FOR_MS);

@@ -418,7 +418,7 @@ Applications send their own codes in the same shape.
 | 4401 | Authentication failed: at the upgrade, or the session's proof of the token's key | stop (a client with a token provider retries with a new token) |
 | 4403 | The token the connection opened with expired | stop (a client with a token provider retries with a new token) |
 | 4408 | Nothing received from the client for `idle_timeout` seconds; or a connection that announced an E2E session did not open it, and prove its key, within 10 seconds | reconnect |
-| 4409 | The client's outbox went on on another node (a stale connection) | reconnect |
+| 4409 | The client's outbox went on on another node, or on another connection of this one (a stale connection) | reconnect |
 | 4429 | The client kept sending past the rate limit for 10 seconds | reconnect |
 | 4800 | No E2E suite in common, or a first-design client on a server with `e2e_legacy=False` (after an `E2E_UNSUPPORTED` error) | stop, with an encryption error |
 | 4802 | An E2E frame from the client out of order, forged, or plaintext inside a session | reconnect (a new session) |
@@ -557,7 +557,7 @@ Once the connection is admitted (`server_ready`), the server answers what it dec
   "refused": [{"s": 38, "code": "busy"}]},"v":1}
 ```
 
-`refused` and `unsure` are left out when there is none. A producer is kept per user: another user's connection cannot reach it. The server decides one producer's messages one at a time, its application's handler included, so a connection that comes back while a message is being decided is answered once the decision is in.
+`refused` and `unsure` are left out when there is none. A producer is kept per user: another user's connection cannot reach it. The server decides one producer's messages one at a time, its application's handler included, so a connection that comes back while a message is being decided is answered once the decision is in. The connection whose hello came last holds the producer: what an older one still brings (bytes held up on the way) is not taken, and that connection is closed with 4409, so what the newer one was told holds.
 
 **Answers.** The server answers after its application took a message (a Rust `Handler::message` returned, or the Python server queued it for `drain_inbound` or its callback; a Python server with neither refuses it, `busy`), one `ack` for a batch of frames read, refusals first:
 

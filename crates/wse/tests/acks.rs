@@ -340,6 +340,39 @@ async fn a_client_back_on_the_same_node_goes_on_from_what_was_taken() {
     node.server.stop().await;
 }
 
+/// The client left a connection with a message on its way (its bytes held
+/// up somewhere) and is back on another: told the message was not taken
+/// there, it may let it run out. The old connection's late message is not
+/// taken then, nor answered: that connection goes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_message_late_on_a_connection_the_client_left_is_never_taken() {
+    let mut node = node().await;
+    let (mut old, _, name) = node
+        .client("ann", serde_json::json!({"producer": "p7"}))
+        .await;
+    send(&mut old, "m", 1).await;
+    assert_eq!(node.took().await, taken("m", 1));
+    acked(&mut old, 1).await;
+
+    // Back on another connection, 2 written on the old one.
+    let outbox = serde_json::json!({"producer": "p7", "node": name, "written": 2});
+    let (mut new, reply) = node.answered("ann", outbox).await;
+    assert_eq!(reply["acked"], 1, "{reply}");
+    assert!(
+        reply["unsure"].as_u64().unwrap_or(0) <= 1,
+        "2 told not taken: {reply}"
+    );
+    // 2 reaches the server on the old connection only now.
+    send(&mut old, "m", 2).await;
+    closed(&mut old).await;
+    node.took_nothing().await;
+    // Sent again on the new one, it is taken, once.
+    send(&mut new, "m", 2).await;
+    assert_eq!(node.took().await, taken("m", 2));
+    acked(&mut new, 2).await;
+    node.server.stop().await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn what_the_server_cannot_tell_reaches_the_application_marked() {
     let mut node = node().await;
