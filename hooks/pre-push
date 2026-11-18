@@ -8,42 +8,52 @@
 # that commit remains the authority. Install with `cargo xtask hooks`.
 refs=$(cat)
 ZERO=0000000000000000000000000000000000000000
-push_sha=$(printf '%s\n' "$refs" | awk -v z="$ZERO" '$2 != "" && $2 != z { print $2; exit }')
+# Every commit pushed as a tip, once: a push of several refs checks each.
+tips=$(printf '%s\n' "$refs" | awk -v z="$ZERO" '$2 != "" && $2 != z { print $2 }' | sort -u)
 # Only deletions: nothing to check.
-[ -n "$push_sha" ] || exit 0
+[ -n "$tips" ] || exit 0
 
 repo="$(git rev-parse --show-toplevel)"
 gate="${XDG_CACHE_HOME:-$HOME/.cache}/prepush/$(basename "$repo")"
 mkdir -p "$(dirname "$gate")"
-if [ -d "$gate" ] && git -C "$gate" rev-parse --git-dir > /dev/null 2>&1; then
-  git -C "$gate" checkout --quiet --detach --force "$push_sha" \
-    && git -C "$gate" clean -fdxq -e node_modules || exit 1
-else
-  rm -rf "$gate"
-  git worktree prune
-  git worktree add --detach --quiet "$gate" "$push_sha" || exit 1
-fi
-echo "pre-push: checking $(git -C "$gate" rev-parse --short HEAD) in $gate"
-cd "$gate" || exit 1
 
-# The npm packages of this commit's lock, installed again only when it changed.
-lock="$(git rev-parse HEAD:package-lock.json)"
-if [ "$(cat node_modules/.gate-lock 2> /dev/null)" != "$lock" ]; then
-  npm ci --ignore-scripts --no-audit --no-fund --loglevel=error || exit 1
-  printf '%s\n' "$lock" > node_modules/.gate-lock
-fi
+# CI's quick jobs on the commit `$1`, checked out in the gate's worktree.
+check() (
+  push_sha="$1"
+  if [ -d "$gate" ] && git -C "$gate" rev-parse --git-dir > /dev/null 2>&1; then
+    git -C "$gate" checkout --quiet --detach --force "$push_sha" \
+      && git -C "$gate" clean -fdxq -e node_modules || exit 1
+  else
+    rm -rf "${gate:?}"
+    git worktree prune
+    git worktree add --detach --quiet "$gate" "$push_sha" || exit 1
+  fi
+  echo "pre-push: checking $(git -C "$gate" rev-parse --short HEAD) in $gate"
+  cd "$gate" || exit 1
 
-cargo xtask fast || exit 1
-npx tsc --noEmit || exit 1
-npx vitest run || exit 1
-# The Python client as CI checks it (ruff 0.17.5), through uv when it is here.
-if command -v uvx > /dev/null 2>&1; then
-  uvx --quiet ruff@0.17.5 check python-client/ && uvx --quiet ruff@0.17.5 format --check python-client/ || exit 1
-  uvx --quiet --from pytest --with-editable './python-client[all,dev]' \
-    pytest python-client/tests -q -p no:cacheprovider || exit 1
-else
-  echo "pre-push: no uv here; CI checks the Python client"
-fi
+  # The npm packages of this commit's lock, installed again only when it changed.
+  lock="$(git rev-parse HEAD:package-lock.json)"
+  if [ "$(cat node_modules/.gate-lock 2> /dev/null)" != "$lock" ]; then
+    npm ci --ignore-scripts --no-audit --no-fund --loglevel=error || exit 1
+    printf '%s\n' "$lock" > node_modules/.gate-lock
+  fi
+
+  cargo xtask fast || exit 1
+  npx tsc --noEmit || exit 1
+  npx vitest run || exit 1
+  # The Python client as CI checks it (ruff 0.17.5), through uv when it is here.
+  if command -v uvx > /dev/null 2>&1; then
+    uvx --quiet ruff@0.17.5 check python-client/ && uvx --quiet ruff@0.17.5 format --check python-client/ || exit 1
+    uvx --quiet --from pytest --with-editable './python-client[all,dev]' \
+      pytest python-client/tests -q -p no:cacheprovider || exit 1
+  else
+    echo "pre-push: no uv here; CI checks the Python client"
+  fi
+)
+
+for tip in $tips; do
+  check "$tip" || exit 1
+done
 
 printf '%s\n' "$refs" | while read -r _local_ref local_sha _remote_ref remote_sha; do
   [ -n "$local_sha" ] && [ "$local_sha" != "$ZERO" ] || continue
