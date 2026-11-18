@@ -1,268 +1,111 @@
 # Changelog
 
-## v3.2.0 (unreleased)
+## v3.2.0 (2026-11-18)
 
 Desktop applications and an outbox in every client: Electron and Tauri with
 one connection for every window, Angular and Solid adapters, Java and Kotlin
-on the JVM, messages kept until the server has taken them (each once where
-the server can tell, else marked as a possible repeat), and a conformance
+on the JVM, messages kept until the server has taken them, and a conformance
 server every client is checked against.
 
 ### Added
 
 - One connection for every window: `wse-client/bridge`. An owner holds the
   connection, the token, the keys and the outbox; each window holds a client
-  with the `WSEClient` interface over a channel, which the adapters for
-  React, Vue, Svelte, Angular and Solid take unchanged. The owner subscribes
-  the windows' topics once, hands each window its stream in batches it
-  acknowledges (a slow window holds back only itself; past its limits its
-  topics break off) and routes each send's outcome to its window; the
-  delivery's barrier, resync, commit and checkpoint stay in the window, and
-  a window that pauses gives its share back. The owner is in TypeScript and
-  in Rust (`wse_client::bridge`, feature `bridge`).
-- Electron: `wse-client/electron`. `createWSEOwner` in the main process (the
-  token as a bearer at each attempt, never in a window; the outbox in a file
-  with `fileOutbox` from `wse-client/node`), `owner.serve(webContents)`, the
-  preload (`wsePreloadPath`, or `wse-client/electron/preload` in the
-  application's own preload), and `createElectronClient` in a page
-  (`wse-client/electron/renderer`). Only the top frame of a served window,
-  at a URL the application allows (its own pages by default, never the
-  web's), gets a port; an owner that ends lets go of the windows it served.
-- Tauri: `tauri-plugin-wse` on crates.io, with `wse-client/tauri`. The
-  connection is on the Rust side (`app.wse().start(config)`; the windows get
-  the permission `wse:default`); each page's client goes through the
-  plugin's commands (`createTauriClient({ invoke, Channel })`). A page that
-  reloads, or a window that closes, lets its share go; `sign_out` lets
-  every page go.
-- Angular: `wse-client/angular`, for Angular 20 and newer:
-  `provideWSEClient`, `injectWSEState`, `injectWSETopics`,
-  `injectWSEMessage` and `injectWSEEvent`; signals that take the
-  connection in a browser only, outside Angular's zone, and let it go with
-  their injector.
-- Solid: `wse-client/solid`, for Solid 1.9 and 2.0: `createWSEState`,
-  `createWSETopics`, `onWSEMessage`, `onWSEEvent` and `WSEContext`; nothing
-  is taken on a server or while hydrating.
+  with the `WSEClient` interface over a channel, which the React, Vue,
+  Svelte, Angular and Solid adapters take unchanged. Each window gets its own
+  stream and the outcomes of its own sends; a slow window holds back only
+  itself. The owner is in TypeScript and in Rust (`wse_client::bridge`).
+- Electron: `wse-client/electron`, with `createWSEOwner` in the main process
+  (the token never in a window; the outbox in a file with `fileOutbox`), a
+  preload, and `createElectronClient` in a page. Only the top frame of a
+  served window, at a URL the application allows, gets a port.
+- Tauri: `tauri-plugin-wse` on crates.io, with `wse-client/tauri`: the
+  connection on the Rust side, each page's client through the plugin's
+  commands (`createTauriClient`).
+- Angular (`wse-client/angular`, Angular 20 and newer) and Solid
+  (`wse-client/solid`, Solid 1.9 and 2.0): the state, topics, messages and
+  events as signals, which take the connection in a browser only.
 - The JVM: `io.github.silvermpx:wse-client-jvm` on Maven Central, for Java
   and Kotlin on Java 17 and newer, with the Rust library for Linux (x64 and
-  arm64, glibc and musl), macOS and Windows (x64 and arm64). `Wse` is the
-  client for Java on the JVM and on Android: futures, configuration
-  builders, events read one at a time, plain numbers where Kotlin has
-  unsigned ones.
-- An outbox in every client, which a 3.2 server answers for: every message
-  sent, except a live or signed one, waits until the server confirms it,
-  numbered, and goes again after a reconnect, in the order it was sent, only
-  ever as the user whose connection first wrote it; the server takes each
-  once when it can tell it took it already (a repeat is confirmed and
-  dropped, a refusal said: `busy`, `rate_limited`, `missing`, `not_ready`),
-  and when it cannot (the client's last node is gone, a handler panicked)
-  its application gets the message marked `possible_repeat` and checks
-  its id against what it applied. The application
-  hears what became of each message by its id (`delivered`,
-  `not_delivered`: also `expired`, `user_changed`, `cleared`, `closed`). In
-  memory by default; durable in a file, one format for the Rust client (and
-  Swift, Kotlin, Java, Dart), Python and Node or Electron's main process
-  (`fileOutbox`); in IndexedDB in browsers (TypeScript, and Rust in the
-  browser), a producer for each tab held by a Web Lock; in the app's
-  storage in React Native (`storageOutbox`); a message goes once its store
-  holds it, so that after a crash its number is never another's. At most
+  arm64, glibc and musl), macOS and Windows; `Wse` is the client for Java on
+  the JVM and on Android.
+- An outbox in every client, which a 3.2 server answers for: a message,
+  except a live or signed one, waits until the server confirms it and goes
+  again after a reconnect, in order, only as the user whose connection
+  first wrote it. The server takes each once where it can tell; where it
+  cannot, the application gets the message marked `possible_repeat`. Each
+  message's outcome comes by its id (`delivered`, or `not_delivered`:
+  `expired`, `user_changed`, `cleared`, `closed`). In memory by default;
+  durable in a file (the Rust client and its packages, Python, Node), in
+  IndexedDB in browsers, in the app's storage in React Native. At most
   100,000 messages and 16 MiB wait; one not sent within an hour, or its
-  `ttl`, runs out. The
-  Rust and Python servers, clusters too, keep each producer's state for a
-  day; the protocol is in docs/PROTOCOL.md.
-- `start` beside `connect` in the Rust client (and Swift, Kotlin, Java,
-  Dart) and Python: it returns at once and connects in the background.
-- Recover-or-resync in every client: the Rust client (natively and in the
-  browser) and Python get it, as TypeScript and the mobile packages had it.
-  A send can wait for its topics in every client (`send_requiring`,
-  `sendRequiring`, `send(requires=...)`): it joins the outbox once they are
-  continuous, with them, and they are checked again each time it goes, after
-  a reconnect too; its `ttl` counts from the send.
-- Rust, Swift, Kotlin and Dart send a correlation id (`cid`) and a
-  priority (`pri`), as TypeScript and Python do, live or not, and give
-  them, with the time, on what they receive. Swift, Kotlin and Dart get
-  the reconnect settings (delays, factor, jitter, attempts).
+  `ttl`, runs out. The protocol is in docs/PROTOCOL.md.
+- `start` beside `connect` (the Rust client and its packages, Python): it
+  returns at once and connects in the background.
+- Recover-or-resync in the Rust client (natively and in the browser) and
+  Python, as TypeScript and the mobile packages had it; a send can wait for
+  its topics in every client (`send_requiring`, `sendRequiring`,
+  `send(requires=...)`).
+- Rust, Swift, Kotlin and Dart send a correlation id (`cid`) and a priority
+  (`pri`) and give them on what they receive; Swift, Kotlin and Dart take
+  the reconnect settings.
 - Python: `pause(reason)` and `resume(reason)`. TypeScript: `wake()`,
-  `close(deadlineMs)` and the `wseConnected` event.
+  `close(deadlineMs)` and the `wseConnected` event. Server (Rust):
+  `Connect::msgpack()` and `Connect::sealed()`.
 - The conformance server (`crates/wse-conformance`, not published): 15
-  cases, each on a server of its own, and one judge of what a client
-  recorded (order, no silent loss, no repeat, each message taken once, a
-  live message never late, a held topic until its resync, back soon after a
-  cut). Every client passes them: TypeScript (on its own, through both
-  bridges, in Electron, in Tauri and in a React Native app on Android),
-  Rust (natively and in the browser), Python, Swift (macOS and iOS), Kotlin
-  (the JVM and Android) and Dart (the desktop, iOS and Android); CI checks
-  every report.
-- Example applications for Electron and Tauri: two windows on one
-  connection, in German and English. Applications built against the packed
-  packages run in CI and in the release: Angular 20 to 22 and Solid 1.9 and
-  2.0 on Linux; Electron and Tauri, React's hooks in two windows, on Linux,
-  macOS and Windows.
-- Server (Rust): `Connect::msgpack()` and `Connect::sealed()` say how a
-  connection speaks: MessagePack, and an end-to-end session in which every
-  frame either way is sealed.
-- Conformance: the judge holds `format.msgpack` and `e2e.pinned` to the
-  server's view of the connection (`taken_msgpack`, `taken_sealed`), and
-  `outbox.cut_in_flight` to a send unanswered at the cut and a client back
-  after it (`unanswered_at_cut`); `check` binds each report to the commit
-  checked out (or `--source`) and to the runtime and system its manifest
-  names for the agent.
+  cases and one judge of what a client recorded. Every client passes them on
+  every platform it runs on, and CI checks every report.
+- Example applications for Electron and Tauri, in German and English; the
+  Angular, Solid, Electron and Tauri applications built against the packed
+  packages run in CI and in the release.
 
 ### Changed
 
 - A send with no connection waits in the outbox instead of failing or
-  waiting in an outgoing queue (the Rust client and its packages, Python,
+  waiting in a queue (the Rust client and its packages, Python,
   TypeScript); a disabled outbox keeps the old behaviour.
-- TypeScript: the offline queue of 3.1 is replaced by the outbox, which
-  takes over what it kept, the messages 2.x left in it included, in the
-  order they were queued; `clearOfflineQueue()` clears the outbox, a
-  message's `offline: true` changes nothing, and the `OfflineQueue` class
-  stays exported, unused.
+- TypeScript: the outbox replaces the 3.1 offline queue and takes over what
+  it kept, in order; `clearOfflineQueue()` clears the outbox.
 - Rust client (and Swift, Kotlin, Dart): every message carries an `id`, a
-  random UUID, as from the TypeScript and Python clients.
-- Rust client: the events hear `Event::Continuity` when a topic's messages
-  break off in best effort too; Python's stream and handlers hear
-  `continuity`.
-- The npm package needs Node 22 or newer (Node 18 and 20 are past their
-  end of life): the outbox's file on Linux is locked with a socket an
-  older Node names unlike the Rust and Python clients, so it refuses
-  there.
+  random UUID, as from TypeScript and Python.
+- Rust client: `Event::Continuity` comes in best effort too; Python's
+  stream and handlers hear `continuity`.
+- Cluster: `connect_cluster()` refuses an IPv6 zone given by an
+  interface's name (`%lo0`): give its number (`%1`).
+- The npm package needs Node 22 or newer.
 
 ### Fixed
 
-- Server: `Server::stop` lets its port go as soon as it takes no more
+- Server: `Server::stop` lets its port go once it takes no more
   connections; a client coming back during a restart waited 10 s.
-- TypeScript in Node and Electron's main process, and Rust in the browser:
-  an attempt the WebSocket reported failed with no close after (Node's) is
-  over at its error; it waited for the connect timeout (10 s).
+- Server: a recovery that cannot be whole says `recovered: false`: after a
+  message the memory budget left no room to keep, and for a client that
+  names only its last position when another node's history is gone.
+- Cluster: the catch-up after a lost link is whole and exact. A stream begun
+  while the link was down arrives, a message its origin could not keep is
+  told lost, it starts where the node left off, nothing comes twice, and a
+  message published to one node's subscribers only stays there.
+- Cluster: a node that stops no longer loses what it published just before.
+  A node that comes up anew where one went without SHUTDOWN, however its
+  address is written, is known for another one: its clients hear
+  `recovered: false` for what was lost.
+- TypeScript in Node and Rust in the browser: a connection attempt that
+  fails without a close is over at its error, not at the 10 s timeout.
 - React: `useWSETopics` keeps a topic that stays in a changed list
   subscribed, with its recovery position.
 - TypeScript: a state listener that throws no longer keeps the others from
-  hearing; Node 25's `localStorage` is not taken for a page's; a storage
-  named for a page where there is none keeps memory and says so
-  (`wseStorageError`); a saved checkpoint reads as the Rust and Python
-  clients read it.
-- npm: `wse-client/electron/preload` has its type declarations; the type
-  check of the package failed on it.
-- The outbox's answer says how far the server cannot tell whether it took a
-  message (`unsure`): past it and `acked`, a message the client may have
-  written is as one not written, and runs out on time (TypeScript, Rust and
-  its packages, Python). A page that was reloaded while a send was sealed no
-  longer holds back the sends after it once that one's time ran out: it goes
-  as `expired`, once, where TypeScript tried it again in a loop.
-- TypeScript: an end-to-end encrypted send whose time ran out while it was
-  sealed, to a server that answers the outbox, is said expired, and the
-  sends after it go; they all waited for the next connection.
-- TypeScript window bridge, and the Tauri owner: a window signed out while
-  it was paused or behind hears what the server answered of its sends
-  (`wseDelivered`), then `cleared` for the rest; it heard `cleared` for
-  all. A window that signs out itself does it through its owner and hears
-  the same, once the owner let it go (within 2 s, or it lets itself go). A
-  send from a listener of the sign-out, or made while it signs out, is
-  `dropped` at once, where it said `queued` and waited for good.
-- Python: a connection for another user starts the topics over and drops
-  the last user's queue; `SyncWSEClient` takes `cookie_name`.
-- Python: the initial `topics` are subscribed on the client's first
-  connection only: `connect()` again, on an open connection, after a drop or
-  once the client was closed, keeps the topics as the application left them,
-  where it subscribed a topic unsubscribed since.
-- Python: `SyncWSEClient.connect()` after the connection dropped returns
-  once it is up again (or raises), as after `start()`; it returned at once.
-  An `AsyncWSEClient.connect()` that gave up waiting (a timeout around it)
-  is let go; each one stayed with the client until it connected.
+  hearing; Node 25's `localStorage` is not taken for a page's; a checkpoint
+  reads as the Rust and Python clients read it.
+- Python: the initial `topics` are subscribed on the first connection only;
+  a connection for another user starts the topics over; `connect()` after a
+  drop returns once the connection is up; `SyncWSEClient` takes
+  `cookie_name`, and `correlation_id` in `send()` and `send_with_retry()`.
 - Rust client (and Swift, Kotlin, Dart): a connection that died while the
-  device slept is made again at the first heartbeat after waking (15 s at
-  most, not 40 s).
-- Swift and Kotlin: a new reader of `events()` no longer gets the last
-  reader's batch again.
-- Rust client (and Swift, Kotlin, Dart), natively and in the browser: a
-  message that came right behind 64 others read at once is no longer
-  dropped.
-- Server: a recovery after a message the memory budget left no room to
-  keep (of a new stream, relayed or its own) says `recovered: false`, and
-  so does the recovery of a client that names only its last position
-  (before 3.1) when another node's history of the topic is gone; both
-  replayed what was left as complete.
-- Cluster: a stream a node began while its link to another was down
-  reaches the other node's subscribers once the link is back
-  (`CAP_RESUME_TOPICS`); the catch-up covered only the streams the other
-  node held a message of. A message its origin could not keep while the
-  link was down is told to the other node after the catch-up (LOST): a
-  recovery from before it there says `recovered: false`, where it said it
-  missed nothing.
-- Cluster: a message published to one node's subscribers only
-  (`publish_local`, `broadcast_local` in Python) is no longer sent to other
-  nodes when a link comes up; the catch-up sent it with the rest.
-- Cluster: a node with no room left for history no longer delivers a
-  message relayed to it twice once a lost link is back: its catch-up request
-  names where it stands in the streams it keeps no buffer of, and what was
-  delivered of them already is not delivered again.
-- Cluster: the catch-up after a lost link starts where the node left off
-  (`CAP_ARRIVAL`): relayed messages carry the origin's arrival number, a
-  node names the last one it heard of, and gets what came after it, LOST for
-  what of that is gone (let go of from a full ring, or a record the origin
-  let go of meanwhile), and CAUGHT_UP. A stream longer than its history no
-  longer comes back said whole; what a node had already, its history of it
-  gone, no longer comes again; a loss told once is not told after the next
-  empty outage. What a node publishes to its own subscribers only is a
-  stream of its own: it no longer leaves a gap in the stream other nodes get,
-  nor pushes a message for the cluster out of its history. A link too full
-  for a message is made again, and catches up, instead of dropping it. A
-  node that went without SHUTDOWN while its link was down, another node now
-  at its address, is no longer taken to have published nothing meanwhile.
-- Electron: an application's own preload that imports
-  `wse-client/electron/preload` keeps it once bundled: the package says the
-  preload acts as it is imported, so a bundler no longer drops the import
-  and leaves the window without a port.
-- Window bridge: a window signed out from a listener no longer drops what
-  became of its sends in the rest of the batch, nor what came while it was
-  paused when it resumes before its owner let it go. It no longer gives up
-  on an owner slow to answer the sign-out and says `cleared` of a send the
-  server may have taken: it says nothing of a send until its owner did.
-  A listener of its state that signs it out as its owner lets it go
-  (signing out, ending, or its channel closing) no longer has it say
-  `cleared` of a send whose `wseDelivered` it held paused, and then
-  `wseDelivered` as well: what the server answered is said first, once.
-  Signed out after its owner went without saying, it says nothing of the
-  send, where it said `cleared`; a window its owner refused hears that its
-  sends never went (`closed`). Over a channel that hands a frame on as it is
-  posted, a window signed out from a listener in the middle of a batch, or
-  as it resumes, says what the server answered of its sends in the rest of
-  that batch and in the batches it held before `cleared`, where it said only
-  `cleared`; a batch that comes while it takes the one before waits its
-  turn, where the window stopped. `close()` of a window its owner let go
-  ends at once, where it waited out its deadline. A window a listener
-  pauses in the middle of a batch holds the rest of it until it resumes,
-  where it handed on the next message.
-- Outbox: a message whose bytes were held up on a connection the client
-  left is no longer taken once the client is back on another and was told
-  the server had not taken it. The connection whose hello came last holds
-  the producer; an older one is closed with 4409. Before, the client could
-  hear a message ran out (`expired`) that the application then took.
-- Cluster: a node that comes up anew at the address of one that went
-  without SHUTDOWN is known for one also when it is the node that dials
-  (its HELLO says where it is reached), and while the link of the one gone
-  still looks up; a client whose last message of a topic came from this
-  node's own stream, or through a pattern, is no longer told it missed
-  nothing then. A node dialed by another name than the address it gives
-  (`localhost` for `127.0.0.1`) is known by both, so the one that comes up
-  there and dials in first is known for another node too; and an address is
-  one place however it is spelled: an IPv4 address and its IPv4-mapped IPv6
-  form (as a dual-stack listener sees it), a host name in any case, a port
-  however it is written (`044015` is `44015`); a link-local IPv6 address
-  keeps its zone, so two nodes on two links are not one place. A zone is
-  given by its number: `connect_cluster()` refuses one by an interface's
-  name (`%lo0`), which no link could be dialed by and which was another
-  place than its number.
-- Cluster: a node that stops no longer loses what it published just before
-  the stop. Its run leaves the cluster once it takes no more publishes,
-  after every one it took, and waits (two seconds at most) for each link to
-  write what it had, SHUTDOWN last, and close; the Python server's stop
-  ended its runtime before the links had. The node that hears SHUTDOWN
-  delivers what came before it, and only then takes the end as clean, so a
-  node that comes up in its place leaves its clients' recovery as it was.
-- Swift, Kotlin and Dart: once the client is closed, the events end with
-  what the close said (the messages it will not deliver, the close itself);
-  a reader waiting at the close no longer gets its end before them.
+  device slept comes back at the first heartbeat after waking (15 s, not
+  40 s); a message right behind 64 others read at once is no longer dropped.
+- Swift, Kotlin and Dart: a new reader of `events()` no longer gets the last
+  reader's batch again; once the client is closed, the events end with what
+  the close said.
 
 ## v3.1.0 (2026-11-16)
 
