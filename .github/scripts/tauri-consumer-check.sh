@@ -44,6 +44,17 @@ done
     echo "$name = { path = '$dir' }"
   done
 } >> "$work/src-tauri/Cargo.toml"
+# The application asks for exactly the plugin unpacked: a release in the
+# registry that also matches its range is never taken in its place.
+plugin_dirs=("$work"/crates/tauri-plugin-wse-*/)
+plugin="$(basename "${plugin_dirs[0]%/}")"
+version="${plugin#tauri-plugin-wse-}"
+sed -i.bak -E "s/^tauri-plugin-wse = \"[^\"]*\"/tauri-plugin-wse = \"=$version\"/" "$work/src-tauri/Cargo.toml"
+rm "$work/src-tauri/Cargo.toml.bak"
+grep -q "^tauri-plugin-wse = \"=$version\"" "$work/src-tauri/Cargo.toml" || {
+  echo "the application's tauri-plugin-wse is not pinned to $version" >&2
+  exit 1
+}
 (
   cd "$work"
   npm ci --no-audit --no-fund --loglevel=error
@@ -52,6 +63,19 @@ done
 )
 # Its own target folder: an application's build, not the workspace's.
 CARGO_TARGET_DIR="$target/tauri-check" cargo build --manifest-path "$work/src-tauri/Cargo.toml"
+# Built with the packages unpacked here: none of them came from a registry.
+for dir in "$work"/crates/*/; do
+  name="$(basename "${dir%/}" | sed -E 's/-[0-9]+\.[0-9]+\.[0-9]+.*$//')"
+  if awk -v name="$name" '
+    $0 == "name = \"" name "\"" { inside = 1; next }
+    /^\[\[package\]\]/ { inside = 0 }
+    inside && /^source = / { found = 1 }
+    END { exit !found }
+  ' "$work/src-tauri/Cargo.lock"; then
+    echo "the application took $name from a registry, not the package unpacked" >&2
+    exit 1
+  fi
+done
 program="$target/tauri-check/debug/wse-tauri-check"
 [[ -f "$program.exe" ]] && program="$program.exe"
 
