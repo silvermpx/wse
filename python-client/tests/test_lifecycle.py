@@ -582,6 +582,27 @@ class TestTheStreamsEnd:
                     read.append((await client.recv(timeout=0.5)).payload["n"])
             assert read == [1, 2]
 
+    async def test_a_connect_after_start_returns_once_the_connection_is_up(self):
+        async with FakeWSEServer(upgrade_delay=lambda _index: 0.35) as server:
+            client = make_client(server.url)
+            await client.start()
+            await client.connect()
+            assert client.is_connected
+            assert client.is_ready
+            await client.disconnect()
+
+    async def test_a_connect_after_start_hears_the_client_give_up(self):
+        client = AsyncWSEClient(
+            "ws://127.0.0.1:9/wse",
+            reconnect=ReconnectConfig(
+                base_delay=0.05, max_delay=0.05, max_attempts=2, jitter=False
+            ),
+        )
+        await client.start()
+        with pytest.raises(WSEConnectionError):
+            await asyncio.wait_for(client.connect(), timeout=5)
+        await client.disconnect()
+
     async def test_a_connect_made_while_one_is_on_its_way_gets_its_outcome(self):
         async with FakeWSEServer(upgrade_delay=lambda _index: 0.25) as server:
             client = make_client(server.url)

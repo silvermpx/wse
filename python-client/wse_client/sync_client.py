@@ -69,6 +69,21 @@ class _Stream(queue.Queue):  # type: ignore[type-arg]
             self.unfinished_tasks += 1
             self.not_empty.notify()
 
+    def drop_ends(self) -> None:
+        """The ends of earlier streams go; what came before them stays, in
+        order, however much of it there is."""
+        with self.not_full:
+            kept = [item for item in self.queue if not isinstance(item, _StreamEnd)]
+            gone = len(self.queue) - len(kept)
+            if gone == 0:
+                return
+            self.queue.clear()
+            self.queue.extend(kept)
+            self.unfinished_tasks -= gone
+            if self.unfinished_tasks == 0:
+                self.all_tasks_done.notify_all()
+            self.not_full.notify_all()
+
     def put_dropping(self, item: WSEEvent | _StreamEnd | _Outcome) -> None:
         """A full stream lets its oldest event go for *item*, never an
         outcome or the end."""
@@ -251,9 +266,29 @@ class SyncWSEClient:
             # Another connect() is on its way: its outcome is this one's.
             if wait:
                 self._outcome_of(running, timeout, abandon=False)
+                # One started connects in the background: this call
+                # returns once that connection is up.
+                if not running.wait:
+                    self._connected(running, timeout)
             return
         session.thread.start()  # type: ignore[union-attr]
         self._outcome_of(session, timeout, abandon=True)
+
+    def _connected(self, session: _Session, timeout: float) -> None:
+        """Waits for the connection *session* makes in the background:
+        raises what ended it."""
+        loop, client = session.loop, session.client
+        if loop is None or client is None or loop.is_closed():
+            raise WSEConnectionError("the client ended")
+        try:
+            future = asyncio.run_coroutine_threadsafe(client.connect(), loop)
+        except RuntimeError:
+            raise WSEConnectionError("the client ended") from None
+        try:
+            future.result(timeout=timeout)
+        except concurrent.futures.TimeoutError:
+            future.cancel()
+            raise WSETimeoutError(f"Connection timed out after {timeout}s") from None
 
     def _outcome_of(self, session: _Session, timeout: float, *, abandon: bool) -> None:
         """Waits for *session* to connect (or start): raises what it failed
@@ -892,15 +927,7 @@ class SyncWSEClient:
             )
 
     def _purge_end_markers(self) -> None:
-        kept: list[WSEEvent | _StreamEnd] = []
-        while True:
-            try:
-                kept.append(self._event_queue.get_nowait())
-            except queue.Empty:
-                break
-        for item in kept:
-            if not isinstance(item, _StreamEnd):
-                self._event_queue.put_nowait(item)
+        self._event_queue.drop_ends()
 
     def _storage_report(self, operation: str, why: str) -> None:
         """The outbox's file could not be opened or written: said to the

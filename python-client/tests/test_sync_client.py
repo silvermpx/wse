@@ -337,6 +337,45 @@ class TestSyncOutbox:
             assert client.kept == 0
             client.close()
 
+    def test_outcomes_not_read_yet_wait_for_the_next_connection(self):
+        st = ServerThread()
+        with st as srv:
+            client = SyncWSEClient(srv.url, reconnect=FAST, queue_size=1)
+            delivered: list[str] = []
+            client.on("delivered")(lambda e: delivered.extend(e.payload["ids"]))
+            client.connect(timeout=5)
+            with pytest.raises(WSETimeoutError):
+                while True:
+                    client.recv(timeout=0.05)
+            # Two outcomes nobody read, more than the stream holds of events.
+            for n in (1, 2):
+                client.send("order", {"n": n}, id=f"sent-{n}")
+                deadline = time.monotonic() + 5
+                while client.kept and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                assert client.kept == 0
+            client.close()
+            client.connect(timeout=5)
+            assert client.is_connected
+            deadline = time.monotonic() + 5
+            while (
+                sorted(delivered) != ["sent-1", "sent-2"]
+                and time.monotonic() < deadline
+            ):
+                with pytest.raises(WSETimeoutError):
+                    client.recv(timeout=0.05)
+            assert sorted(delivered) == ["sent-1", "sent-2"]
+            client.close()
+
+    def test_a_connect_after_start_returns_once_the_connection_is_up(self):
+        st = ServerThread(upgrade_delay=lambda _index: 0.35)
+        with st as srv:
+            client = SyncWSEClient(srv.url, reconnect=FAST)
+            client.start()
+            client.connect(timeout=5)
+            assert client.is_connected
+            client.close()
+
     def test_a_connect_made_while_one_is_on_its_way_gets_its_outcome(self):
         st = ServerThread(upgrade_delay=lambda _index: 0.25)
         with st as srv:

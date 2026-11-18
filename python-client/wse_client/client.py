@@ -540,6 +540,10 @@ class AsyncWSEClient:
         self._overflow: deque[WSEEvent | _StreamEnd] = deque()
         # A connect() on its way: another one waits for its outcome.
         self._connecting: asyncio.Future[None] | None = None
+        # connect() calls made while the client connects in the background
+        # (start()): each returns once that connection is up, or with what
+        # ended it.
+        self._waiting_up: list[asyncio.Future[None]] = []
         self._room: asyncio.Event | None = None
 
         # Reconnect config for later use
@@ -677,7 +681,11 @@ class AsyncWSEClient:
             return
         state = self._connection.state
         if state in (ConnectionState.CONNECTING, ConnectionState.RECONNECTING):
-            return  # already connecting in the background
+            # Connecting in the background: returns once it is up.
+            up: asyncio.Future[None] = asyncio.get_running_loop().create_future()
+            self._waiting_up.append(up)
+            await up
+            return
         outcome: asyncio.Future[None] = asyncio.get_running_loop().create_future()
         self._connecting = outcome
         try:
@@ -762,6 +770,7 @@ class AsyncWSEClient:
 
         # Signal iterator to stop (drop oldest if queue is full)
         self._push_stream_end(_StreamEnd(None))
+        self._came_up(WSEConnectionError("the client was disconnected"))
         # Closed, not destroyed: connect() may open the client again.
         await self._connection.disconnect()
 
@@ -1898,9 +1907,22 @@ class AsyncWSEClient:
         self._delivery.connection_lost()
         self._drain_soon()
 
+    def _came_up(self, error: WSEError | None) -> None:
+        """The background connection connect() calls wait for is up, or
+        ended with *error*."""
+        waiting, self._waiting_up = self._waiting_up, []
+        for up in waiting:
+            if up.done():
+                continue
+            if error is None:
+                up.set_result(None)
+            else:
+                up.set_exception(error)
+
     def _on_transport_terminal(self, error: WSEError) -> None:
         """The transport gave up for good: end the event stream with *error*."""
         self._terminal_error = error
+        self._came_up(error)
         _reject(self._handshake, error)
         _reject(self._key_ready, error)
         for topic, epoch in list(self._gaps):
@@ -1964,6 +1986,7 @@ class AsyncWSEClient:
             return  # the connection failed or was replaced
         if handshake is not self._handshake or not self._connection.is_connected:
             return
+        self._came_up(None)
         await self._resubscribe()
         if self._offline_queue.size > 0:
             await self._flush_offline_queue()
