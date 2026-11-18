@@ -403,6 +403,12 @@ impl Client {
             )
             .await;
             let (shared, status) = ended;
+            // A send that waits for a place in the outbox waits no longer,
+            // however the client ended (a handler that panicked, a close
+            // past its deadline).
+            if let Some(room) = &shared.room {
+                room.close();
+            }
             match driven {
                 Ok(Ok(())) => {}
                 // A handler that panics ends the client, which says so.

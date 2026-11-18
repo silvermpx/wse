@@ -550,3 +550,83 @@ async fn a_client_started_with_no_server_sends_once_one_comes() {
     client.close().await;
     server.stop().await;
 }
+
+/// Panics on the first disconnect it hears.
+struct Crasher;
+
+impl wse_client::Handler for Crasher {
+    fn message(&mut self, _message: &wse_client::Message<'_>) {}
+
+    fn event(&mut self, event: Event) {
+        if matches!(event, Event::Disconnected(_)) {
+            panic!("the handler fails");
+        }
+    }
+}
+
+/// A send that waits for a place in a full outbox hears the client end,
+/// however it ends: its handler panicked, or a close past its deadline.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_send_waiting_for_room_hears_the_client_end_however_it_ends() {
+    // The handler panics: its first attempt fails once the test says.
+    let trigger = std::sync::Arc::new(tokio::sync::Notify::new());
+    let fail = std::sync::Arc::clone(&trigger);
+    let mut config = Config::new("ws://127.0.0.1:9/wse");
+    config.token_provider = Some(wse_client::TokenProvider::new(move || {
+        let fail = std::sync::Arc::clone(&fail);
+        async move {
+            fail.notified().await;
+            Err::<String, String>("no token".into())
+        }
+    }));
+    let mut offline = Offline::in_memory();
+    offline.max_messages = 1;
+    config.offline = Some(offline);
+    let client = wse_client::Client::start(config, Crasher).await.unwrap();
+    client.try_send("first", &1).unwrap();
+    let waiting = client.clone();
+    let waiter = tokio::spawn(async move { waiting.send("second", &2).await });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(!waiter.is_finished(), "it waits for a place");
+    trigger.notify_one();
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(5), client.closed())
+            .await
+            .unwrap(),
+        Some(Error::Panicked)
+    );
+    let ended = tokio::time::timeout(Duration::from_secs(2), waiter)
+        .await
+        .expect("the waiting send ends with the client")
+        .unwrap();
+    assert!(ended.is_err());
+
+    // A close past its deadline, the server stalled.
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("ws://{}/wse", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+        let ready = r#"{"c":"WSE","t":"server_ready","p":{"details":{"connection_id":"c1","user_id":"ann","features":{"acks":true}}}}"#;
+        ws.send(Frame::Text(ready.into())).await.unwrap();
+        // No outbox answer, no close answered.
+        std::future::pending::<()>().await;
+    });
+    let mut config = Config::new(url);
+    let mut offline = Offline::in_memory();
+    offline.max_messages = 1;
+    config.offline = Some(offline);
+    let (client, _events) = connect(&config).await;
+    client.try_send("first", &1).unwrap();
+    let waiting = client.clone();
+    let waiter = tokio::spawn(async move { waiting.send("second", &2).await });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(!waiter.is_finished(), "it waits for a place");
+    client.close_within(Duration::from_millis(20)).await;
+    let ended = tokio::time::timeout(Duration::from_secs(2), waiter)
+        .await
+        .expect("the waiting send ends with the client")
+        .unwrap();
+    assert!(ended.is_err());
+    server.abort();
+}
