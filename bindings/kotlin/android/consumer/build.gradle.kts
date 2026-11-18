@@ -34,10 +34,7 @@ android {
 }
 
 dependencies {
-    implementation(files(System.getenv("WSE_AAR") ?: error("WSE_AAR names the AAR to use")))
-    implementation("net.java.dev.jna:jna:5.19.1@aar")
-    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-core:1.11.0")
-    // As the README lists them: the AAR names no dependencies of its own.
-    implementation("androidx.lifecycle:lifecycle-process:2.11.0")
-    implementation("androidx.startup:startup-runtime:1.2.0")
+    // The one dependency an application names: what it needs comes with it,
+    // as the package's POM lists it.
+    implementation("io.github.silvermpx:wse-client-android:${System.getenv("WSE_VERSION") ?: error("WSE_VERSION names the package's version")}")
 }

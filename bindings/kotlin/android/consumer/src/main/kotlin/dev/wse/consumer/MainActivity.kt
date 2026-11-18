@@ -9,6 +9,7 @@ package dev.wse.consumer
 import android.app.Activity
 import android.os.Bundle
 import android.util.Log
+import dev.wse.ffi.WseAppLifecycle
 import dev.wse.ffi.WseClient
 import dev.wse.ffi.WseConfig
 import dev.wse.ffi.WseException
@@ -54,6 +55,10 @@ class MainActivity : Activity() {
         }
 
         val client = connectClient(WseConfig(url = url, topics = listOf("ticks"), insecure = true))
+        // The process's lifecycle as the README has it: the AndroidX types it
+        // is made of come with the package's one dependency.
+        val lifecycle = WseAppLifecycle(client)
+        runOnUiThread { lifecycle.start() }
         client.send("echo", """{"text":"r8"}""")
         client.trySendLive("echo", """{"text":"live"}""")
         val events = client.events()
@@ -61,6 +66,7 @@ class MainActivity : Activity() {
             val item = events.next() ?: return "the events ended without a tick"
             if (item is WseItem.Message && item.message.topic == "ticks") break
         }
+        runOnUiThread { lifecycle.stop() }
         client.disconnect(1_000u)
 
         val sealed = connectClient(WseConfig(url = url, serverIdentityKeys = listOf(identity), insecure = true))

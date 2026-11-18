@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Builds the release AAR (or takes the one WSE_AAR names) and an app that uses
-# it with R8 on (consumer/), and checks on the emulator ANDROID_SERIAL names
+# it with R8 on (consumer/), from a Maven repository with its POM as its one
+# dependency, and checks on the emulator ANDROID_SERIAL names
 # that Android's certificate verifier turns down a server of an unknown CA,
 # that the app hears a tick, that an end-to-end encrypted session echoes and
 # that a signed message gets a signed receipt: what JNA, the bindings and the
@@ -27,7 +28,14 @@ else
   (cd "$here" && "$gradle" --no-daemon -q assembleRelease)
   WSE_AAR="$(ls "$here"/build/outputs/aar/*-release.aar)"
 fi
-export WSE_AAR
+# The AAR as Maven Central gets it, under its name and with its POM, in a
+# repository of its own: the app names that one dependency alone.
+version="$(sed -n 's/^version = "\(.*\)"$/\1/p' "$here/../build.gradle.kts")"
+maven="$target/android-consumer-maven"
+mkdir -p "$maven/dist"
+cp "$WSE_AAR" "$maven/dist/wse-client-android-$version.aar"
+"$root/.github/scripts/maven-central.sh" "$version" "$maven" --repository "$maven/dist/wse-client-android-$version.aar"
+export WSE_MAVEN_REPO="$maven/repository" WSE_VERSION="$version"
 (cd "$here/consumer" && "$gradle" --no-daemon -q assembleRelease)
 apk="$(ls "$here"/consumer/build/outputs/apk/release/*-release.apk)"
 
