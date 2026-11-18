@@ -275,8 +275,11 @@ impl Session {
         }
         let server = json!({"failures": failures, "server": log});
         let _ = writeln!(lines, "{server}");
+        // A clean run has no folder yet when its first case fails.
         let path = self.out.join(file);
-        if let Err(why) = std::fs::write(&path, lines) {
+        if let Err(why) =
+            std::fs::create_dir_all(&self.out).and_then(|()| std::fs::write(&path, lines))
+        {
             eprintln!("wse-conformance: {}: {why}", path.display());
         }
     }
@@ -316,6 +319,22 @@ mod tests {
     use super::*;
     use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
+    /// A session of the driver `agent` that writes into `out`.
+    fn session(out: &std::path::Path, agent: &str) -> Session {
+        Session {
+            catalog: Arc::new(crate::cases::catalog()),
+            out: out.to_owned(),
+            source: Arc::from("test"),
+            host: "127.0.0.1".to_owned(),
+            agent: Some(Agent {
+                agent: agent.to_owned(),
+                ..Agent::default()
+            }),
+            running: None,
+            verdicts: Vec::new(),
+        }
+    }
+
     /// The driver names itself, and a case by its name: the trace of a case
     /// that failed is written in the folder of the reports, whatever names
     /// they gave.
@@ -325,18 +344,7 @@ mod tests {
             std::env::temp_dir().join(format!("wse-conformance-trace-{}", std::process::id()));
         let out = root.join("reports");
         std::fs::create_dir_all(&out).unwrap();
-        let session = Session {
-            catalog: Arc::new(crate::cases::catalog()),
-            out: out.clone(),
-            source: Arc::from("test"),
-            host: "127.0.0.1".to_owned(),
-            agent: Some(Agent {
-                agent: "../escaped".to_owned(),
-                ..Agent::default()
-            }),
-            running: None,
-            verdicts: Vec::new(),
-        };
+        let session = session(&out, "../escaped");
         session.keep_trace(
             "../../case",
             &[json!({"ev": "ready"})],
@@ -354,6 +362,29 @@ mod tests {
             .collect();
         assert_eq!(beside, ["reports"]);
         std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// A clean run has no folder of reports yet when its first case fails:
+    /// the trace makes it, and is kept with the failure in it.
+    #[test]
+    fn the_first_trace_of_a_clean_run_makes_its_folder() {
+        let root = std::env::temp_dir().join(format!(
+            "wse-conformance-first-trace-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let out = root.join("reports");
+        session(&out, "driver").keep_trace(
+            "connect_plain",
+            &[json!({"ev": "ready"})],
+            &Log::default(),
+            &["no welcome".to_owned()],
+        );
+        let kept = std::fs::read_to_string(out.join("driver.connect_plain.trace.jsonl"));
+        std::fs::remove_dir_all(&root).ok();
+        let kept = kept.expect("the trace is written");
+        assert!(kept.starts_with(r#"{"ev":"ready"}"#), "{kept}");
+        assert!(kept.contains("no welcome"), "{kept}");
     }
 
     #[test]
