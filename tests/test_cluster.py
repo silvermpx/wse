@@ -601,9 +601,12 @@ async def _after_an_outage(origin, relay, during, websockets, *, origin_reads=("
     try:
         relay.join(blink)
         await until(lambda: origin.peers == 1 and relay.peers == 1)
+        # Not read while `during` runs, as long as a minute, while the nodes
+        # keep sending: with flow control the client would stop reading its
+        # socket, miss the server's pongs and drop the connection (1011).
         async with (
-            websockets.connect(f"ws://127.0.0.1:{relay.port}/wse") as live,
-            websockets.connect(f"ws://127.0.0.1:{origin.port}/wse") as source,
+            websockets.connect(f"ws://127.0.0.1:{relay.port}/wse", max_queue=None) as live,
+            websockets.connect(f"ws://127.0.0.1:{origin.port}/wse", max_queue=None) as source,
         ):
             await subscribe_next_client(relay, ["news", "barrier"])
             await subscribe_next_client(origin, list(origin_reads))
