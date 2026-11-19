@@ -52,7 +52,15 @@ tasks.test {
     )
     System.getenv("WSE_TEST_URL")?.let { environment("WSE_TEST_URL", it) }
     jvmArgs("--enable-native-access=ALL-UNNAMED")
-    testLogging { events("passed", "failed", "skipped"); showStandardStreams = false }
+    testLogging {
+        events("passed", "failed", "skipped")
+        showStandardStreams = false
+        // A failure names its test and why in a quiet run too (run-tests.sh's).
+        quiet {
+            events("failed")
+            exceptionFormat = org.gradle.api.tasks.testing.logging.TestExceptionFormat.FULL
+        }
+    }
     // What the tests run against, the native library and the servers, is
     // outside Gradle's inputs: they run each time, never taken as done.
     outputs.upToDateWhen { false }

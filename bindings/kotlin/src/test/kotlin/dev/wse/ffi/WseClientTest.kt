@@ -192,29 +192,40 @@ class WseClientTest {
 
     @Test
     fun aClientGivesUpAfterItsAttemptsAsSoonAsItsDelaysSay(): Unit = runBlocking {
-        val began = System.nanoTime()
-        val client = startClient(
-            WseConfig(
-                url = "ws://127.0.0.1:9/wse",
-                reconnectBaseDelayMs = 20u,
-                reconnectMaxDelayMs = 40u,
-                reconnectJitter = false,
-                reconnectMaxAttempts = 3u,
-                insecure = true,
-            ),
-        )
-        val events = client.events()
-        var closed: WseItem.Closed? = null
-        withTimeout(10_000) {
-            while (closed == null) {
-                val item = events.next() ?: error("the events ended unsaid")
-                if (item is WseItem.Closed) closed = item
-            }
+        // A port that takes each connection and closes it: an attempt fails at
+        // once on every system (Windows waits about 2 s on a closed port).
+        val closing = java.net.ServerSocket(0, 50, java.net.InetAddress.getLoopbackAddress())
+        val closer = kotlin.concurrent.thread(isDaemon = true) {
+            while (!closing.isClosed) runCatching { closing.accept().close() }
         }
-        val reason = closed?.reason.orEmpty()
-        assertTrue(reason.startsWith("gave up reconnecting"), reason)
-        // Three attempts at 20 and 40 ms, not at a second and more.
-        assertTrue(System.nanoTime() - began < 3_000_000_000L)
+        try {
+            val began = System.nanoTime()
+            val client = startClient(
+                WseConfig(
+                    url = "ws://127.0.0.1:${closing.localPort}/wse",
+                    reconnectBaseDelayMs = 20u,
+                    reconnectMaxDelayMs = 40u,
+                    reconnectJitter = false,
+                    reconnectMaxAttempts = 3u,
+                    insecure = true,
+                ),
+            )
+            val events = client.events()
+            var closed: WseItem.Closed? = null
+            withTimeout(10_000) {
+                while (closed == null) {
+                    val item = events.next() ?: error("the events ended unsaid")
+                    if (item is WseItem.Closed) closed = item
+                }
+            }
+            val reason = closed?.reason.orEmpty()
+            assertTrue(reason.startsWith("gave up reconnecting"), reason)
+            // Three attempts at 20 and 40 ms, not at a second and more.
+            assertTrue(System.nanoTime() - began < 3_000_000_000L)
+        } finally {
+            closing.close()
+            closer.join(1_000)
+        }
     }
 
     @Test
