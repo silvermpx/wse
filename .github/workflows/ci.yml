@@ -633,6 +633,9 @@ jobs:
           npm run build
           mkdir -p npm-dist
           npm pack --ignore-scripts --pack-destination npm-dist
+          # The plugin's build writes its generated permission files anew, on
+          # Windows in its own way: the packages take the committed ones.
+          git checkout -- bindings/tauri/plugin/permissions
           cargo package --locked --no-verify -p wse -p wse-client
           (cd bindings/tauri && cargo package --locked --no-verify -p tauri-plugin-wse \
             --config 'patch.crates-io.wse-client.path="../../crates/wse-client"' \
