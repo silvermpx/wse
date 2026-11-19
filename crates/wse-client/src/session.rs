@@ -12,7 +12,7 @@ use std::time::Duration;
 use bytes::Bytes;
 use web_time::Instant;
 
-use crate::client::{Queued, Shared};
+use crate::client::{Queued, Shared, Status};
 use crate::decode::{self, Envelope, epoch_of};
 use crate::delivery::{self, Delivered};
 use crate::error::Error;
@@ -136,6 +136,9 @@ pub(crate) struct Session<H> {
     pub(crate) ready: bool,
     /// Became ready on the last frame.
     pub(crate) became_ready: bool,
+    /// The client's status, which reads as connected before the
+    /// application hears of the connection.
+    pub(crate) status: Option<tokio::sync::watch::Sender<Status>>,
     pub(crate) connected_before: bool,
     server_recovery: bool,
     /// The user the server took the connection for: a message the server
@@ -199,6 +202,7 @@ impl<H: Handler> Session<H> {
             clears: 0,
             ready: false,
             became_ready: false,
+            status: None,
             connected_before: false,
             server_recovery: false,
             user_id: None,
@@ -1664,6 +1668,11 @@ impl<H: Handler> Session<H> {
             self.server_recovery
         );
         let reconnected = std::mem::replace(&mut self.connected_before, true);
+        // Connected before the application hears it, so that a status it
+        // reads then says so.
+        if let Some(status) = &self.status {
+            status.send_replace(Status::Connected);
+        }
         self.handler.event(Event::Connected(Connected {
             connection_id,
             user_id,
@@ -2660,6 +2669,39 @@ mod tests {
             "per message: session {all:.0} ns (envelope {envelope:.0} ns); a serde_json::Value {value:.0} ns [{kinds} {}]",
             s.handler.inner.0
         );
+    }
+
+    /// An application that hears of the connection and reads the client's
+    /// status reads it connected.
+    #[test]
+    fn the_status_reads_connected_when_the_application_hears_of_the_connection() {
+        struct Watch(tokio::sync::watch::Receiver<Status>, Option<Status>);
+        impl crate::handler::Handler for Watch {
+            fn message(&mut self, _: &Message<'_>) {}
+            fn event(&mut self, event: crate::handler::Event) {
+                if matches!(event, crate::handler::Event::Connected(_)) {
+                    self.1 = Some(self.0.borrow().clone());
+                }
+            }
+        }
+        let (status, seen) = tokio::sync::watch::channel(Status::Connecting);
+        let shared = Arc::new(Shared::new(None, None));
+        let keys = Arc::new(Keys::from_config(&crate::Config::new("ws://x")).unwrap());
+        let mut s = Session::new(
+            Delivered::passing(Watch(seen, None)),
+            shared,
+            keys,
+            &[],
+            Duration::from_secs(3),
+            Duration::from_secs(40),
+        );
+        s.status = Some(status);
+        s.open(None);
+        s.on_json(
+            r#"{"t":"server_ready","p":{"details":{"user_id":"ann"}}}"#,
+            None,
+        );
+        assert_eq!(s.handler.inner.1, Some(Status::Connected));
     }
 
     #[test]

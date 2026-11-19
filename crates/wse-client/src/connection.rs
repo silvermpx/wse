@@ -70,6 +70,7 @@ impl<H: Handler> Driver<H> {
             config.idle_timeout,
         );
         session.committed = config.committed.clone();
+        session.status = Some(status.clone());
         let paused = config.paused.iter().cloned().collect();
         Self {
             decoder: Decoder::new(
@@ -280,7 +281,6 @@ impl<H: Handler> Driver<H> {
             }
             if std::mem::take(&mut self.session.became_ready) {
                 self.policy.connected();
-                self.status.send_replace(Status::Connected);
                 if let Some(first) = first.take() {
                     let _ = first.send(Ok(()));
                 }

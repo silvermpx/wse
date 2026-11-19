@@ -78,6 +78,9 @@ server every client is checked against.
 
 ### Fixed
 
+- Rust client (and Swift, Kotlin, Dart): an application that hears it is
+  connected reads the client's status as connected; it could still read
+  the last one.
 - Server: `Server::stop` lets its port go once it takes no more
   connections; a client coming back during a restart waited 10 s.
 - Server: a recovery that cannot be whole says `recovered: false`: after a
