@@ -1,6 +1,6 @@
 # Changelog
 
-## v3.2.0 (2026-11-18)
+## v3.2.0 (2026-11-19)
 
 Desktop applications and an outbox in every client: Electron and Tauri with
 one connection for every window, Angular and Solid adapters, Java and Kotlin
