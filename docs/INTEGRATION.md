@@ -254,14 +254,22 @@ A 3.2 client numbers the messages of its outbox: the `"msg"` dict (and
 `on_message`'s data) keeps their number (`s`) and `id`. The server confirms a
 message once drain mode's queue or the connection's callbacks have taken it,
 and takes each once. When it cannot tell whether it took one already (the
-client's last node is gone or does not answer within 2 s, its producer was
-silent for more than a day, a handler panicked), the message comes with
+client's last node is gone or does not answer within 2 s, the node forgot
+the producer, or a handler panicked), the message comes with
 `"possible_repeat": True`: the application checks its `id` against what it
 applied. A message the application has no room for is refused (`busy`), and
 the client hears it was not delivered: drain mode's queue is over
 `max_inbound_queue_size` or `max_inbound_queue_bytes`, 256 callbacks of its
-connection wait, or the server has neither drain mode nor `on_message`. Each
-producer's state is kept for a day.
+connection wait, or the server has neither drain mode nor `on_message`.
+
+After an outbox's last connection closes, the node keeps its delivery
+decisions for up to a day. It keeps at most 262,144 such outboxes across
+all users (or twice `max_connections`, if more, so that a mass disconnect
+forgets none) and forgets the longest-disconnected first when it needs
+room.
+If the node forgot an earlier refusal, it decides the message again
+when the client retries it. A message the client has never written is
+handled without a repeat mark.
 
 ### Callback Mode (alternative)
 

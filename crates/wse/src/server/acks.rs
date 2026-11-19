@@ -9,19 +9,29 @@
 //! gone) reaches the application marked as a possible repeat. A client that
 //! comes from another node names it, and that node is asked once.
 
-use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::collections::{BTreeMap, VecDeque};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
+use std::time::{Duration, Instant};
 
-use dashmap::DashMap;
+use ahash::AHashMap;
 use parking_lot::{Mutex, MutexGuard};
 use tokio_tungstenite::tungstenite::Message;
 
 use super::state::{ConnectionHandle, SharedState};
 
-/// How long a producer's state is kept after its last message: a client
-/// that comes back later is told nothing is known of it.
-pub(crate) const KEPT_FOR_MS: u64 = 24 * 60 * 60 * 1000;
+/// How long a disconnected producer can be remembered.
+const KEPT_FOR: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// The fewest disconnected outboxes a node remembers, across all users.
+const MAX_IDLE: usize = 1 << 18;
+
+/// How many disconnected outboxes a node remembers: [`MAX_IDLE`], or twice
+/// its connection limit when that is more, so that every client of a mass
+/// disconnect (a network blip, a drain) is still known when it comes back.
+pub(super) fn idle_limit(max_connections: usize) -> usize {
+    MAX_IDLE.max(max_connections.saturating_mul(2))
+}
 
 /// How long a node waits for the node a client was on to say what it took.
 const ASK_WITHIN: std::time::Duration = std::time::Duration::from_secs(2);
@@ -110,9 +120,6 @@ pub(crate) struct Decided {
 /// back meanwhile is answered once the decision is in, never halfway.
 pub(crate) struct Slot {
     state: Mutex<SlotState>,
-    /// Its last activity, in epoch milliseconds: the sweep drops it a day
-    /// after.
-    seen: AtomicU64,
 }
 
 /// What a producer's slot holds.
@@ -315,6 +322,19 @@ impl SlotState {
         self.mark = to;
     }
 
+    /// Another node takes the producer over: what was decided here, and
+    /// what could not be told; from now on nothing more is.
+    fn hand_over(&mut self) -> Decided {
+        self.moved = true;
+        Decided {
+            mark: self.mark,
+            holes: self.holes.iter().copied().collect(),
+            forgot: self.forgot,
+            undecided: self.deciding,
+            unsure: self.unsure,
+        }
+    }
+
     /// The highest message decided here.
     #[cfg(test)]
     fn mark(&self) -> u64 {
@@ -323,7 +343,7 @@ impl SlotState {
 }
 
 impl Slot {
-    fn new(now: u64) -> Self {
+    fn new() -> Self {
         Self {
             state: Mutex::new(SlotState {
                 mark: 0,
@@ -334,7 +354,6 @@ impl Slot {
                 unsure: 0,
                 owner: 0,
             }),
-            seen: AtomicU64::new(now),
         }
     }
 
@@ -342,88 +361,256 @@ impl Slot {
     pub(crate) fn lock(&self) -> MutexGuard<'_, SlotState> {
         self.state.lock()
     }
-
-    /// Another node takes the producer over: what was decided here, and
-    /// what could not be told; from now on nothing more is.
-    fn hand_over(&self) -> Decided {
-        let mut state = self.state.lock();
-        state.moved = true;
-        Decided {
-            mark: state.mark,
-            holes: state.holes.iter().copied().collect(),
-            forgot: state.forgot,
-            undecided: state.deciding,
-            unsure: state.unsure,
-        }
-    }
-
-    fn moved(&self) -> bool {
-        self.state.lock().moved
-    }
-
-    pub(crate) fn touch(&self, now: u64) {
-        self.seen.store(now, Ordering::Relaxed);
-    }
 }
 
 type Key = (Option<Box<str>>, Box<str>);
 
-/// Every producer this node took messages of, by user and producer: a
-/// user's producer cannot be reached by another user's connection.
-#[derive(Default)]
-pub(crate) struct Producers {
-    slots: DashMap<Key, Arc<Slot>>,
+/// A producer can have overlapping connections. Only the last one to leave
+/// puts its slot in the order of disconnected producers.
+struct Entry {
+    slot: Arc<Slot>,
+    connections: usize,
+    idle: Option<u64>,
+    handed_over: bool,
 }
 
-impl Producers {
-    /// The slot of `user`'s `producer` here, and whether it is known; one
-    /// that is not (never seen, or moved to another node) starts empty.
-    fn attach(&self, user: Option<&str>, producer: &str, now: u64) -> (Arc<Slot>, bool) {
-        use dashmap::mapref::entry::Entry;
-        let key = (user.map(Box::from), Box::from(producer));
-        match self.slots.entry(key) {
-            Entry::Occupied(entry) if !entry.get().moved() => {
-                entry.get().touch(now);
-                (Arc::clone(entry.get()), true)
-            }
-            Entry::Occupied(mut entry) => {
-                let slot = Arc::new(Slot::new(now));
-                entry.insert(Arc::clone(&slot));
-                (slot, false)
-            }
-            Entry::Vacant(entry) => {
-                let slot = Arc::new(Slot::new(now));
-                entry.insert(Arc::clone(&slot));
-                (slot, false)
-            }
+#[derive(Default)]
+struct Table {
+    slots: AHashMap<Arc<Key>, Entry>,
+    /// Disconnect order, with each outbox's expiry deadline.
+    idle: BTreeMap<u64, (Instant, Arc<Key>)>,
+    next: u64,
+}
+
+impl Table {
+    /// A reconnect or peer query can arrive between the deadline and the
+    /// next periodic cleanup. Check this producer's own deadline then.
+    fn expire_if_due(&mut self, key: &Key) {
+        if let Some(order) = self.slots.get(key).and_then(|entry| entry.idle)
+            && let Some((until, _)) = self.idle.get(&order)
+            && Instant::now() >= *until
+        {
+            self.idle.remove(&order);
+            self.slots.remove(key);
         }
     }
 
-    /// A peer asks for `user`'s `producer`, which went on there: what was
-    /// decided here, and nothing more is. None: nothing is known of it here.
-    pub(crate) fn hand_over(&self, user: Option<&str>, producer: &str) -> Option<Decided> {
-        let key = (user.map(Box::from), Box::from(producer));
-        let slot = self.slots.get(&key).map(|slot| Arc::clone(&slot))?;
-        Some(slot.hand_over())
+    fn forget_oldest(&mut self) {
+        if let Some((_, (_, key))) = self.idle.pop_first() {
+            self.slots.remove(&key);
+        }
+    }
+}
+
+/// Independent parts of the table, by a hash of the producer: a hello or
+/// a connection's end locks only its producer's part, so connections on
+/// many cores do not wait on one lock. Fixed, so the bound is the same on
+/// every machine.
+const SHARDS: usize = 256;
+
+/// One part of the table, with its share of the bound. A connection's
+/// hold keeps its own shard, so that connections on many cores share no
+/// counter.
+struct Shard {
+    table: Mutex<Table>,
+    /// Disconnected outboxes it keeps.
+    limit: usize,
+}
+
+/// The outboxes this node knows, by user and producer. A shard's lock only
+/// protects membership. An application's handler runs with its slot lock.
+pub(crate) struct Producers {
+    shards: Box<[Arc<Shard>]>,
+    hasher: ahash::RandomState,
+}
+
+impl Default for Producers {
+    fn default() -> Self {
+        Self::with_limit(MAX_IDLE)
+    }
+}
+
+/// One connection's hold. A previous incarnation's last connection can
+/// finish after the outbox has come back from another node.
+pub(crate) struct Attached {
+    shard: Arc<Shard>,
+    key: Arc<Key>,
+    slot: Arc<Slot>,
+}
+
+impl std::ops::Deref for Attached {
+    type Target = Slot;
+
+    fn deref(&self) -> &Slot {
+        &self.slot
+    }
+}
+
+impl Drop for Attached {
+    fn drop(&mut self) {
+        let mut table = self.shard.table.lock();
+        let order = table.next;
+        let Some(entry) = table.slots.get_mut(&self.key) else {
+            return;
+        };
+        if !Arc::ptr_eq(&entry.slot, &self.slot) {
+            return;
+        }
+        entry.connections -= 1;
+        if entry.connections == 0 {
+            entry.idle = Some(order);
+            table.next += 1;
+            table
+                .idle
+                .insert(order, (Instant::now() + KEPT_FOR, Arc::clone(&self.key)));
+            if table.idle.len() > self.shard.limit {
+                table.forget_oldest();
+            }
+        }
+    }
+}
+
+impl Producers {
+    /// At most `limit` disconnected outboxes, each shard its share: a shard
+    /// that has more forgets its longest-disconnected.
+    pub(super) fn with_limit(limit: usize) -> Self {
+        Self::sharded(limit, SHARDS)
     }
 
-    /// The link of a connection whose hello is in: known here (the client
-    /// was here last), or not, and then unsure up to what it wrote. With
-    /// it, the refusals the client may not have heard of.
-    fn link(&self, user: Option<&str>, hello: &Hello, here: bool, now: u64) -> (Link, Vec<Hole>) {
-        let (slot, known) = self.attach(user, &hello.producer, now);
-        if known && here {
-            let (start, unsure, told, owner) = {
-                let mut state = slot.lock();
-                let told = state.told_from(hello.from);
+    fn sharded(limit: usize, shards: usize) -> Self {
+        let limit = limit.div_ceil(shards).max(1);
+        Self {
+            shards: (0..shards)
+                .map(|_| {
+                    Arc::new(Shard {
+                        table: Mutex::default(),
+                        limit,
+                    })
+                })
+                .collect(),
+            hasher: ahash::RandomState::new(),
+        }
+    }
+
+    /// One shard: the longest-disconnected of all goes first, exactly.
+    #[cfg(test)]
+    pub(super) fn exact(limit: usize) -> Self {
+        Self::sharded(limit, 1)
+    }
+
+    /// The single shard of an [`exact`](Self::exact) table.
+    #[cfg(test)]
+    fn table(&self) -> MutexGuard<'_, Table> {
+        assert_eq!(self.shards.len(), 1);
+        self.shards[0].table.lock()
+    }
+
+    fn shard(&self, key: &Key) -> &Arc<Shard> {
+        // The remainder is below the shard count, which fits.
+        &self.shards[(self.hasher.hash_one(key) % self.shards.len() as u64) as usize]
+    }
+
+    /// A live connection takes the slot out of the idle order. After a
+    /// handover, or past its day, it starts a fresh slot with a fresh count
+    /// of connections. One lookup: a hello is a connection's start.
+    fn attach(&self, user: Option<&str>, producer: &str) -> (Attached, bool) {
+        use std::collections::hash_map::Entry as MapEntry;
+        let key = Arc::new((user.map(Box::from), Box::from(producer)));
+        let shard = self.shard(&key);
+        let mut table = shard.table.lock();
+        let Table { slots, idle, .. } = &mut *table;
+        let record = slots.entry(key);
+        let key = Arc::clone(record.key());
+        let (entry, known) = match record {
+            MapEntry::Occupied(record) => {
+                let entry = record.into_mut();
+                // Past its day it is forgotten, as the sweep would have,
+                // though the sweep has not come by yet.
+                let expired = entry.idle.take().is_some_and(|order| {
+                    idle.remove(&order)
+                        .is_some_and(|(until, _)| Instant::now() >= until)
+                });
+                let known = !entry.handed_over && !expired;
+                if !known {
+                    entry.slot = Arc::new(Slot::new());
+                    entry.connections = 0;
+                    entry.handed_over = false;
+                }
+                (entry, known)
+            }
+            MapEntry::Vacant(record) => (
+                record.insert(Entry {
+                    slot: Arc::new(Slot::new()),
+                    connections: 0,
+                    idle: None,
+                    handed_over: false,
+                }),
+                false,
+            ),
+        };
+        entry.connections += 1;
+        let slot = Arc::clone(&entry.slot);
+        (
+            Attached {
+                shard: Arc::clone(shard),
+                key,
+                slot,
+            },
+            known,
+        )
+    }
+
+    /// A peer asks what was decided. Wait for the application's decision
+    /// outside the table lock. Only the slot we found has moved.
+    pub(crate) fn hand_over(&self, user: Option<&str>, producer: &str) -> Option<Decided> {
+        let key = (user.map(Box::from), Box::from(producer));
+        let shard = self.shard(&key);
+        loop {
+            let slot = Arc::clone(&shard.table.lock().slots.get(&key)?.slot);
+            let mut state = slot.lock();
+            let mut table = shard.table.lock();
+            table.expire_if_due(&key);
+            let entry = table.slots.get_mut(&key)?;
+            if !Arc::ptr_eq(&entry.slot, &slot) {
+                continue;
+            }
+            entry.handed_over = true;
+            drop(table);
+            return Some(state.hand_over());
+        }
+    }
+
+    /// Attach after any previous node has answered. A peer may take the
+    /// slot while this hello waits for a running handler. In that case
+    /// start again on the replacement before answering the client.
+    fn link(&self, user: Option<&str>, hello: &Hello, last: LastNode<'_>) -> (Link, Vec<Hole>) {
+        loop {
+            let (slot, known) = self.attach(user, &hello.producer);
+            let mut state = slot.lock();
+            if state.moved {
+                continue;
+            }
+            let remembered = match last {
+                LastNode::Here => known,
+                LastNode::Peer(Some(decided)) => {
+                    state.advance(decided);
+                    true
+                }
+                LastNode::Peer(None) => false,
+            };
+            let (start, unsure, told) = if remembered {
                 (
                     state.decided_for(hello.from),
                     state.cannot_tell(hello.from),
-                    told,
-                    state.take(),
+                    state.told_from(hello.from),
                 )
+            } else {
+                state.unsure_up_to(hello.written);
+                (0, hello.written, Vec::new())
             };
-            (
+            let owner = state.take();
+            drop(state);
+            return (
                 Link {
                     slot,
                     start,
@@ -431,88 +618,43 @@ impl Producers {
                     owner,
                 },
                 told,
-            )
-        } else {
-            let owner = {
-                let mut state = slot.lock();
-                state.unsure_up_to(hello.written);
-                state.take()
-            };
-            let unsure = hello.written;
-            (
-                Link {
-                    slot,
-                    start: 0,
-                    unsure,
-                    owner,
-                },
-                Vec::new(),
-            )
+            );
         }
     }
 
-    /// The link of a client that came from another node, with what that
-    /// node decided of it: None when it knew nothing or did not answer.
-    fn taken_over(
-        &self,
-        user: Option<&str>,
-        hello: &Hello,
-        decided: Option<Decided>,
-        now: u64,
-    ) -> (Link, Vec<Hole>) {
-        let (slot, _) = self.attach(user, &hello.producer, now);
-        match decided {
-            Some(decided) => {
-                let (start, unsure, told, owner) = {
-                    let mut state = slot.lock();
-                    state.advance(&decided);
-                    let told = state.told_from(hello.from);
-                    (
-                        state.decided_for(hello.from),
-                        state.cannot_tell(hello.from),
-                        told,
-                        state.take(),
-                    )
+    /// Expire disconnected producers in order, shard by shard, giving other
+    /// connections and the runtime a turn when many outboxes reach their
+    /// deadline.
+    pub(crate) async fn sweep(&self, now: Instant) {
+        for shard in &self.shards {
+            loop {
+                let done = {
+                    let mut table = shard.table.lock();
+                    (0..256).all(|_| {
+                        let due = table
+                            .idle
+                            .first_key_value()
+                            .is_some_and(|(_, (until, _))| now >= *until);
+                        if due {
+                            table.forget_oldest();
+                        }
+                        due
+                    })
                 };
-                (
-                    Link {
-                        slot,
-                        start,
-                        unsure,
-                        owner,
-                    },
-                    told,
-                )
-            }
-            None => {
-                let owner = {
-                    let mut state = slot.lock();
-                    state.unsure_up_to(hello.written);
-                    state.take()
-                };
-                let unsure = hello.written;
-                (
-                    Link {
-                        slot,
-                        start: 0,
-                        unsure,
-                        owner,
-                    },
-                    Vec::new(),
-                )
+                if !done {
+                    break;
+                }
+                tokio::task::yield_now().await;
             }
         }
     }
+}
 
-    /// Drops the producers silent for longer than [`KEPT_FOR_MS`]. One that
-    /// a connection holds (its `Link`) stays, however long it is silent: a
-    /// new connection of it finds what this one decided.
-    pub(crate) fn sweep(&self, now: u64) {
-        self.slots.retain(|_, slot| {
-            Arc::strong_count(slot) > 1
-                || now.saturating_sub(slot.seen.load(Ordering::Relaxed)) < KEPT_FOR_MS
-        });
-    }
+/// Where to look for this outbox's decisions. An unreachable peer and one
+/// that already forgot the outbox both leave its written messages unsure.
+enum LastNode<'a> {
+    Here,
+    Peer(Option<&'a Decided>),
 }
 
 /// What a client's `client_hello` says of its outbox (`p.outbox`).
@@ -557,7 +699,7 @@ impl Hello {
 
 /// A connection's producer, once known.
 pub(crate) struct Link {
-    pub(crate) slot: Arc<Slot>,
+    pub(crate) slot: Attached,
     /// What the client was told was decided: where its messages on this
     /// connection go on from.
     pub(crate) start: u64,
@@ -567,13 +709,6 @@ pub(crate) struct Link {
     /// Its hello's hold on the producer: a later hello of the client's takes
     /// it, and this connection's messages are not taken from then on.
     pub(crate) owner: u64,
-}
-
-/// The connection ends: its producer is kept for a day from now.
-impl Drop for Link {
-    fn drop(&mut self) {
-        self.slot.touch(now_ms());
-    }
 }
 
 /// A connection's outbox: its hello, and its producer once the connection
@@ -602,13 +737,6 @@ impl Holder {
         let hello = self.hello.get()?;
         (!self.started.swap(true, Ordering::AcqRel)).then_some(hello)
     }
-}
-
-/// Milliseconds since the Unix epoch: a producer's last activity.
-pub(crate) fn now_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
 }
 
 /// Starts the connection's producer once its hello and its admission are
@@ -640,12 +768,17 @@ pub(crate) fn start(state: &Arc<SharedState>, handle: &ConnectionHandle, user: O
             let (link, told) =
                 state
                     .producers
-                    .taken_over(user.as_deref(), hello, decided, now_ms());
+                    .link(user.as_deref(), hello, LastNode::Peer(decided.as_ref()));
             finish(&state, &handle, link, &told);
         });
         return;
     }
-    let (link, told) = state.producers.link(user, hello, last.is_none(), now_ms());
+    let last = if last.is_none() {
+        LastNode::Here
+    } else {
+        LastNode::Peer(None)
+    };
+    let (link, told) = state.producers.link(user, hello, last);
     finish(state, handle, link, &told);
 }
 
@@ -811,7 +944,7 @@ mod tests {
 
     #[test]
     fn a_message_is_handed_on_once() {
-        let slot = Slot::new(0);
+        let slot = Slot::new();
         assert_eq!(
             claim(&slot, 1),
             Claim::First {
@@ -833,7 +966,7 @@ mod tests {
             "skipped: refused again"
         );
         assert_eq!(
-            slot.hand_over(),
+            slot.lock().hand_over(),
             Decided {
                 mark: 3,
                 holes: vec![Hole {
@@ -850,7 +983,7 @@ mod tests {
 
     #[test]
     fn a_refused_message_stays_refused_until_the_client_heard() {
-        let slot = Slot::new(0);
+        let slot = Slot::new();
         let mut state = slot.lock();
         assert_eq!(
             state.claim(1, Refusal::Missing),
@@ -896,7 +1029,7 @@ mod tests {
 
     #[test]
     fn a_refusal_forgotten_past_the_bound_is_never_taken_for_a_take() {
-        let slot = Slot::new(0);
+        let slot = Slot::new();
         let mut state = slot.lock();
         // Taken and refused in turn: one run of refusals each.
         for n in 0..(MAX_HOLES as u64 + 1) {
@@ -921,7 +1054,7 @@ mod tests {
 
     #[test]
     fn a_decision_whose_handler_never_ended_is_not_said_taken() {
-        let slot = Slot::new(0);
+        let slot = Slot::new();
         let mut state = slot.lock();
         assert_eq!(
             state.claim(1, Refusal::Missing),
@@ -951,7 +1084,7 @@ mod tests {
 
     #[test]
     fn a_refusal_of_one_the_server_could_not_tell_keeps_its_place() {
-        let slot = Slot::new(0);
+        let slot = Slot::new();
         let mut state = slot.lock();
         for n in 0..(MAX_HOLES as u64 + 1) {
             let refused = 2 * n + 1;
@@ -980,7 +1113,7 @@ mod tests {
 
     #[test]
     fn a_client_that_makes_numbers_up_is_kept_within_bounds() {
-        let slot = Slot::new(0);
+        let slot = Slot::new();
         let mut state = slot.lock();
         for n in 0..(MAX_HOLES as u64 + 10) {
             state.claim(2 * n + 2, Refusal::Missing);
@@ -990,14 +1123,14 @@ mod tests {
 
     #[test]
     fn a_producer_is_one_users() {
-        let producers = Producers::default();
-        let (ann, known) = producers.attach(Some("ann"), "p1", 0);
+        let producers = Arc::new(Producers::default());
+        let (ann, known) = producers.attach(Some("ann"), "p1");
         assert!(!known);
         claim(&ann, 5);
-        let (again, known) = producers.attach(Some("ann"), "p1", 0);
+        let (again, known) = producers.attach(Some("ann"), "p1");
         assert!(known);
         assert_eq!(again.lock().mark(), 5);
-        let (bob, known) = producers.attach(Some("bob"), "p1", 0);
+        let (bob, known) = producers.attach(Some("bob"), "p1");
         assert!(!known, "another user's producer of the same name");
         assert_eq!(bob.lock().mark(), 0);
         // Handed over to another node: what comes back here starts over.
@@ -1012,7 +1145,7 @@ mod tests {
             }]
         );
         assert_eq!(producers.hand_over(Some("cy"), "p1"), None);
-        let (back, known) = producers.attach(Some("ann"), "p1", 0);
+        let (back, known) = producers.attach(Some("ann"), "p1");
         assert!(!known);
         assert_eq!(back.lock().mark(), 0);
     }
@@ -1021,19 +1154,19 @@ mod tests {
     /// an older one brings late is not taken, whatever its number.
     #[test]
     fn a_message_on_a_connection_the_client_left_is_not_taken() {
-        let producers = Producers::default();
+        let producers = Arc::new(Producers::default());
         let hello = |written| Hello {
             producer: Box::from("p"),
             node: None,
             written,
             from: 1,
         };
-        let (old, _) = producers.link(None, &hello(0), true, 0);
+        let (old, _) = producers.link(None, &hello(0), LastNode::Here);
         assert!(matches!(
             old.slot.lock().claim_by(old.owner, 1, Refusal::Missing),
             Claim::First { .. }
         ));
-        let (new, _) = producers.link(None, &hello(2), true, 0);
+        let (new, _) = producers.link(None, &hello(2), LastNode::Here);
         assert_eq!(new.start, 1);
         assert_eq!(
             old.slot.lock().claim_by(old.owner, 2, Refusal::Missing),
@@ -1045,41 +1178,184 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn a_producer_whose_connection_is_open_is_kept_however_long_it_is_silent() {
-        let producers = Producers::default();
-        let (slot, _) = producers.attach(None, "p", 0);
-        let link = Link {
-            slot,
-            start: 0,
-            unsure: 0,
-            owner: 1,
-        };
-        producers.sweep(3 * KEPT_FOR_MS);
-        let (again, known) = producers.attach(None, "p", 3 * KEPT_FOR_MS);
+    #[tokio::test]
+    async fn a_producer_whose_connection_is_open_is_kept_however_long_it_is_silent() {
+        let producers = Arc::new(Producers::default());
+        let (link, _) = producers.link(None, &hello("here", 0), LastNode::Here);
+        producers.sweep(Instant::now() + 3 * KEPT_FOR).await;
+        let (again, known) = producers.attach(None, "p");
         assert!(known);
-        assert!(Arc::ptr_eq(&link.slot, &again));
-        // Its connection ends: the day counts from then.
+        assert!(Arc::ptr_eq(&link.slot.slot, &again.slot));
         drop(again);
-        let before = now_ms();
+        let before = Instant::now();
         drop(link);
-        let slot = producers
-            .slots
+        producers
+            .sweep(before + KEPT_FOR - Duration::from_millis(1))
+            .await;
+        assert!(producers.hand_over(None, "p").is_some());
+    }
+
+    #[tokio::test]
+    async fn a_silent_producer_is_forgotten_after_a_day() {
+        let producers = Arc::new(Producers::exact(MAX_IDLE));
+        let before = Instant::now();
+        drop(producers.attach(None, "p"));
+        producers
+            .sweep(before + KEPT_FOR - Duration::from_millis(1))
+            .await;
+        assert_eq!(producers.table().slots.len(), 1);
+        producers.sweep(Instant::now() + KEPT_FOR).await;
+        assert_eq!(producers.table().slots.len(), 0);
+    }
+
+    /// Each shard keeps its share of the bound: however the outboxes fall,
+    /// the node keeps no more than the bound, and never forgets one a
+    /// connection holds.
+    #[test]
+    fn the_bound_holds_across_the_shards() {
+        let producers = Arc::new(Producers::with_limit(SHARDS * 2));
+        let (held, _) = producers.attach(None, "held");
+        for n in 0..10_000 {
+            drop(producers.attach(None, &format!("p{n}")).0);
+        }
+        let idle: usize = producers
+            .shards
             .iter()
-            .next()
-            .map(|e| Arc::clone(e.value()))
-            .unwrap();
-        assert!(slot.seen.load(Ordering::Relaxed) >= before);
+            .map(|shard| shard.table.lock().idle.len())
+            .sum();
+        assert!(idle <= SHARDS * 2, "{idle} kept");
+        assert!(idle >= SHARDS, "{idle} kept");
+        assert!(producers.hand_over(None, "held").is_some());
+        drop(held);
+    }
+
+    /// Every outbox of a mass disconnect (a network blip, a drain) is still
+    /// known when its client comes back: a node keeps twice its connections.
+    #[test]
+    fn a_node_keeps_twice_its_connections_when_that_is_more() {
+        assert_eq!(idle_limit(1_000), MAX_IDLE);
+        assert_eq!(idle_limit(500_000), 1_000_000);
+        assert_eq!(idle_limit(usize::MAX), usize::MAX);
     }
 
     #[test]
-    fn a_silent_producer_is_forgotten_after_a_day() {
-        let producers = Producers::default();
-        producers.attach(None, "p", 0);
-        producers.sweep(KEPT_FOR_MS - 1);
-        assert_eq!(producers.slots.len(), 1);
-        producers.sweep(KEPT_FOR_MS);
-        assert_eq!(producers.slots.len(), 0);
+    fn only_the_two_most_recently_disconnected_producers_are_remembered() {
+        let producers = Arc::new(Producers::exact(2));
+        let connect = |user| {
+            producers
+                .link(Some(user), &hello("here", 0), LastNode::Here)
+                .0
+        };
+        let active = connect("active");
+        for user in ["ann", "bob", "ann", "cy"] {
+            drop(connect(user));
+        }
+        assert!(producers.hand_over(Some("bob"), "p").is_none());
+        for user in ["active", "ann", "cy"] {
+            assert!(producers.hand_over(Some(user), "p").is_some(), "{user}");
+        }
+        drop(active);
+    }
+
+    #[test]
+    fn the_last_connection_of_the_current_producer_puts_it_in_the_idle_table() {
+        let producers = Arc::new(Producers::exact(1));
+        let connect = |user| {
+            producers
+                .link(Some(user), &hello("here", 0), LastNode::Here)
+                .0
+        };
+        let first = connect("ann");
+        let second = connect("ann");
+        drop(first);
+        drop(connect("bob"));
+        assert!(producers.hand_over(Some("ann"), "p").is_some());
+        let replacement = connect("ann");
+        drop(second);
+        drop(connect("cy"));
+        assert!(producers.hand_over(Some("bob"), "p").is_none());
+        assert_eq!(
+            claim(&replacement.slot, 1),
+            Claim::First {
+                gap: None,
+                unsure: false
+            }
+        );
+        drop(replacement);
+        assert!(producers.hand_over(Some("cy"), "p").is_none());
+        assert_eq!(producers.hand_over(Some("ann"), "p").unwrap().mark, 1);
+    }
+
+    #[test]
+    fn a_query_waiting_on_a_forgotten_slot_hands_over_the_current_one() {
+        let producers = Arc::new(Producers::exact(1));
+        let (first, _) = producers.attach(None, "p");
+        let old = Arc::clone(&first.slot);
+        drop(first);
+        let deciding = old.lock();
+        std::thread::scope(|scope| {
+            let query = scope.spawn(|| producers.hand_over(None, "p").unwrap());
+            // The table and this test hold two references. The third is
+            // the query, waiting for the decision on the original slot.
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while Arc::strong_count(&old) < 3 {
+                assert!(Instant::now() < deadline);
+                std::thread::yield_now();
+            }
+            drop(producers.attach(None, "other"));
+            let (current, known) = producers.attach(None, "p");
+            assert!(!known);
+            claim(&current, 2);
+            drop(deciding);
+            assert_eq!(query.join().unwrap().mark, 2);
+            assert_eq!(claim(&current, 3), Claim::Moved);
+        });
+    }
+
+    #[test]
+    fn a_reconnect_waiting_on_a_handover_takes_the_replacement_slot() {
+        let producers = Arc::new(Producers::exact(MAX_IDLE));
+        let (old, _) = producers.attach(None, "p");
+        let mut decision = old.lock();
+        std::thread::scope(|scope| {
+            let back = scope.spawn(|| producers.link(None, &hello("here", 1), LastNode::Here).0);
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while producers.table().slots[&old.key].connections != 2 {
+                assert!(Instant::now() < deadline);
+                std::thread::yield_now();
+            }
+            // The query holds the decision lock before the hello can read
+            // the mark. Complete the handover in that order.
+            producers
+                .table()
+                .slots
+                .get_mut(&old.key)
+                .unwrap()
+                .handed_over = true;
+            decision.hand_over();
+            drop(decision);
+            let back = back.join().unwrap();
+            assert_eq!(
+                claim(&back.slot, 1),
+                Claim::First {
+                    gap: None,
+                    unsure: true
+                }
+            );
+        });
+    }
+
+    #[test]
+    fn an_expired_outbox_cannot_be_queried_or_resumed_before_the_next_sweep() {
+        let producers = Arc::new(Producers::exact(MAX_IDLE));
+        for name in ["query", "resume"] {
+            drop(producers.attach(None, name));
+        }
+        for (until, _) in producers.table().idle.values_mut() {
+            *until = Instant::now();
+        }
+        assert!(producers.hand_over(None, "query").is_none());
+        assert!(!producers.attach(None, "resume").1);
     }
 
     #[test]
@@ -1111,8 +1387,8 @@ mod tests {
 
     #[test]
     fn a_client_from_another_node_is_unsure_up_to_what_it_wrote() {
-        let producers = Producers::default();
-        let (link, _) = producers.link(Some("ann"), &hello("other", 4), false, 0);
+        let producers = Arc::new(Producers::default());
+        let (link, _) = producers.link(Some("ann"), &hello("other", 4), LastNode::Peer(None));
         assert_eq!((link.start, link.slot.lock().unsure), (0, 4));
 
         // Back on this node, which decided messages of it: they are known,
@@ -1122,7 +1398,7 @@ mod tests {
             state.claim(9, Refusal::Missing);
             state.refuse(9, 9, Refusal::Busy);
         }
-        let (link, told) = producers.link(Some("ann"), &hello("here", 11), true, 0);
+        let (link, told) = producers.link(Some("ann"), &hello("here", 11), LastNode::Here);
         // What it could not tell stays: none of those comes unmarked.
         assert_eq!((link.start, link.slot.lock().unsure), (9, 4));
         assert_eq!(
@@ -1144,7 +1420,7 @@ mod tests {
 
     #[test]
     fn what_the_last_node_decided_counts_here() {
-        let producers = Producers::default();
+        let producers = Arc::new(Producers::default());
         let holes = vec![Hole {
             from: 7,
             to: 7,
@@ -1155,7 +1431,11 @@ mod tests {
             holes: holes.clone(),
             ..Decided::default()
         };
-        let (link, told) = producers.taken_over(Some("ann"), &hello("other", 12), Some(decided), 0);
+        let (link, told) = producers.link(
+            Some("ann"),
+            &hello("other", 12),
+            LastNode::Peer(Some(&decided)),
+        );
         assert_eq!((link.start, link.slot.lock().unsure), (10, 0));
         assert_eq!(told, holes);
         assert_eq!(claim(&link.slot, 10), Claim::Repeat);
@@ -1168,36 +1448,36 @@ mod tests {
             }
         );
         // The last node did not answer: unsure up to what was written.
-        let (link, told) = producers.taken_over(Some("bob"), &hello("other", 12), None, 0);
+        let (link, told) = producers.link(Some("bob"), &hello("other", 12), LastNode::Peer(None));
         assert_eq!((link.start, link.slot.lock().unsure), (0, 12));
         assert!(told.is_empty());
     }
 
     #[test]
     fn a_client_back_is_told_how_far_the_server_cannot_tell() {
-        let producers = Producers::default();
-        let (link, _) = producers.link(Some("ann"), &hello("here", 0), true, 0);
+        let producers = Arc::new(Producers::default());
+        let (link, _) = producers.link(Some("ann"), &hello("here", 0), LastNode::Here);
         link.slot.lock().claim(1, Refusal::Missing);
         // Back on this node, having written up to 3: 2 and 3 were not taken.
-        let (link, _) = producers.link(Some("ann"), &hello("here", 3), true, 0);
+        let (link, _) = producers.link(Some("ann"), &hello("here", 3), LastNode::Here);
         assert_eq!((link.start, link.unsure), (1, 0));
         let reply: serde_json::Value =
             serde_json::from_str(&outbox_reply(link.start, "n", &[], link.unsure)).unwrap();
         assert_eq!(reply["p"], serde_json::json!({"acked": 1, "node": "n"}));
         // From a node that cannot be asked: up to what it wrote.
-        let (link, _) = producers.link(Some("bob"), &hello("other", 3), false, 0);
+        let (link, _) = producers.link(Some("bob"), &hello("other", 3), LastNode::Peer(None));
         assert_eq!((link.start, link.unsure), (0, 3));
         let reply: serde_json::Value =
             serde_json::from_str(&outbox_reply(link.start, "n", &[], link.unsure)).unwrap();
         assert_eq!(reply["p"]["unsure"], 3);
         // A message whose handler never ended.
-        let (link, _) = producers.link(Some("cid"), &hello("here", 0), true, 0);
+        let (link, _) = producers.link(Some("cid"), &hello("here", 0), LastNode::Here);
         {
             let mut state = link.slot.lock();
             state.claim(1, Refusal::Missing);
             state.deciding(1);
         }
-        let (link, _) = producers.link(Some("cid"), &hello("here", 2), true, 0);
+        let (link, _) = producers.link(Some("cid"), &hello("here", 2), LastNode::Here);
         assert_eq!((link.start, link.unsure), (0, 1));
     }
 
@@ -1215,27 +1495,27 @@ mod tests {
 
     #[test]
     fn a_client_waiting_for_a_refusal_let_go_is_not_told_it_was_taken() {
-        let producers = Producers::default();
-        let (link, _) = producers.link(Some("ann"), &hello("here", 0), true, 0);
+        let producers = Arc::new(Producers::default());
+        let (link, _) = producers.link(Some("ann"), &hello("here", 0), LastNode::Here);
         let last = past_the_bound(&mut link.slot.lock());
         let comes_back = |from| Hello {
             from,
             ..hello("here", last)
         };
         // Waiting from 1 on: 1 may have been refused, and comes again.
-        let (link, told) = producers.link(Some("ann"), &comes_back(1), true, 0);
+        let (link, told) = producers.link(Some("ann"), &comes_back(1), LastNode::Here);
         assert_eq!(link.start, 0);
         assert_eq!(told.len(), MAX_HOLES);
         assert_eq!(claim(&link.slot, 1), Claim::Unsure);
         // A client that heard of 1 is told everything as it stands.
-        let (link, _) = producers.link(Some("ann"), &comes_back(2), true, 0);
+        let (link, _) = producers.link(Some("ann"), &comes_back(2), LastNode::Here);
         assert_eq!(link.start, last);
     }
 
     #[test]
     fn what_the_last_node_could_not_tell_it_cannot_tell_here_either() {
-        let a = Producers::default();
-        let (link, _) = a.link(Some("ann"), &hello("a", 0), true, 0);
+        let a = Arc::new(Producers::default());
+        let (link, _) = a.link(Some("ann"), &hello("a", 0), LastNode::Here);
         let last = {
             let mut state = link.slot.lock();
             let last = past_the_bound(&mut state);
@@ -1247,12 +1527,12 @@ mod tests {
         let decided = a.hand_over(Some("ann"), "p").unwrap();
         assert_eq!((decided.forgot, decided.undecided), (1, Some(last + 1)));
 
-        let b = Producers::default();
+        let b = Arc::new(Producers::default());
         let comes = Hello {
             from: 1,
             ..hello("a", last + 1)
         };
-        let (link, told) = b.taken_over(Some("ann"), &comes, Some(decided.clone()), 0);
+        let (link, told) = b.link(Some("ann"), &comes, LastNode::Peer(Some(&decided)));
         assert_eq!(link.start, 0, "1 may have been refused");
         assert_eq!(told.len(), MAX_HOLES);
         assert_eq!(claim(&link.slot, 1), Claim::Unsure);
@@ -1264,12 +1544,12 @@ mod tests {
         );
 
         // A client that heard of all but the last is told up to before it.
-        let c = Producers::default();
+        let c = Arc::new(Producers::default());
         let comes = Hello {
             from: last + 1,
             ..hello("a", last + 1)
         };
-        let (link, _) = c.taken_over(Some("ann"), &comes, Some(decided), 0);
+        let (link, _) = c.link(Some("ann"), &comes, LastNode::Peer(Some(&decided)));
         assert_eq!(link.start, last);
         assert_eq!(claim(&link.slot, last + 1), Claim::Unsure);
     }

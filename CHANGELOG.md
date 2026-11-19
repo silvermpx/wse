@@ -34,7 +34,9 @@ server every client is checked against.
   again after a reconnect, in order, only as the user whose connection
   first wrote it. The server takes each once where it can tell; where it
   cannot, the application gets the message marked `possible_repeat`. Each
-  message's outcome comes by its id (`delivered`, or `not_delivered`:
+  node keeps at most 262,144 idle outboxes (or twice `max_connections`,
+  if more) for up to a day, forgetting the longest-disconnected first. Each message's outcome comes by its id
+  (`delivered`, or `not_delivered`:
   `expired`, `user_changed`, `cleared`, `closed`). In memory by default;
   durable in a file (the Rust client and its packages, Python, Node), in
   IndexedDB in browsers, in the app's storage in React Native. At most

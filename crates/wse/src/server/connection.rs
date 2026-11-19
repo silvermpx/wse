@@ -1224,9 +1224,6 @@ impl<H: Handler> Reader<'_, H> {
         for answer in self.acks.answers() {
             conn.handle.send_control(Message::Text(answer.into()));
         }
-        if let Some(link) = conn.handle.out.acks.link.get() {
-            link.slot.touch(acks::now_ms());
-        }
     }
 
     /// One frame from the client.

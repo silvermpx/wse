@@ -300,8 +300,9 @@ the browser, `Offline::in_indexed_db(name)` keeps it in the IndexedDB
 database `name`, so that it outlives the page: each tab keeps a producer of
 its own there, held by a Web Lock while the tab lives, and sends on its own
 connection; a page that opens takes over what a closed or crashed tab left,
-under that tab's producer, so the server still knows a repeat of each. It
-is the database the TypeScript client keeps. Web Locks need a secure
+under that tab's producer, keeping each message's number. The server
+recognizes repeats while it retains that producer's decisions. The
+TypeScript client uses the same database. Web Locks need a secure
 context (HTTPS, or localhost): without them, or without IndexedDB, it is an
 `Event::StorageFailed` and the outbox stays in memory. `config.offline =
 None` has no outbox: a message goes on the connection that is ready, or the

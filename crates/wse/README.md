@@ -91,9 +91,10 @@ with, and the `wse-client` crate's `chat_client` example talks to it.
   dropped, a refusal said (`busy` when `Handler::message` returns false;
   `not_ready`, `rate_limited`, `missing`). One it cannot tell it took
   already is handed on with `"possible_repeat": true`, and the application
-  checks its `id`. Each producer's state is kept for a day, across the
-  cluster too; a newer connection of the producer closes the older one
-  (4409).
+  checks its `id`. Each node keeps decisions for at most 262,144 idle
+  outboxes (or twice `max_connections`, if more) for up to a day after
+  disconnect, forgetting the longest-disconnected first. Another node can ask the last one for its
+  decisions. A newer connection of the producer closes the older one (4409).
 - **Presence.** Who is on a topic, with their data, across the cluster.
 - **Users.** `send_to_user` reaches every tab and device of a user,
   `disconnect_user` closes them all.

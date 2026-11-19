@@ -77,8 +77,9 @@ storage name, the consumer and the realm (the first endpoint, or `realm`) -- so 
 another part of the application never reads it. Each client of the scope (each tab) keeps a producer
 of its own there, held by a Web Lock while the tab lives, and sends what it holds on its own
 connection, as its own user. A page that opens takes over what a closed or crashed tab of the scope
-left (or the page it reloads), and sends it under that tab's producer, so the server still knows each
-message by its number; another user's connection drops it (`user_changed`). The changes of a turn of the event
+left (or the page it reloads), and sends each message under that tab's producer with its original
+number. The server recognizes repeats while it retains that producer's decisions. Another user's
+connection drops the message (`user_changed`). The changes of a turn of the event
 loop go to the database in one transaction. The page that goes (`pagehide`) lets its producer go, so
 the back/forward cache can keep it, and reads the database again when it is back. Web Locks need a
 secure context (HTTPS, or localhost): without them the outbox stays in memory. What the queue of 3.1

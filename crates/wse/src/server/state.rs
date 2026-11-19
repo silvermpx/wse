@@ -1026,7 +1026,9 @@ impl SharedState {
                 max_entries: 50_000,
             }),
             topic_message_counts: Arc::new(DashMap::new()),
-            producers: Arc::default(),
+            producers: Arc::new(super::acks::Producers::with_limit(super::acks::idle_limit(
+                cfg.max_connections,
+            ))),
             producer_links: Arc::default(),
             node_id: uuid::Uuid::now_v7().to_string().into(),
         }

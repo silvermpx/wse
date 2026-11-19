@@ -866,3 +866,141 @@ fn a_cluster_address_with_a_zone_by_name_is_refused() {
     assert!(!named("localhost:7000"));
     assert!(!named("10.0.0.1:7000"));
 }
+
+/// Dropping a connection before reading its ACK leaves the outbox's messages
+/// unanswered. Once this node forgets the producer, it must deliver them
+/// marked on replay, but not mark the next, newly written message.
+#[tokio::test]
+async fn a_forgotten_outbox_replays_its_unanswered_messages_as_possible_repeats() {
+    use futures_util::{SinkExt, StreamExt};
+    use serde_json::{Value, json};
+    use std::time::Duration;
+    use tokio::net::{TcpListener, TcpStream};
+    use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, tungstenite::Message};
+
+    type Socket = WebSocketStream<MaybeTlsStream<TcpStream>>;
+    struct App {
+        publisher: Publisher,
+        taken: mpsc::UnboundedSender<Value>,
+    }
+    impl Handler for App {
+        type Connection = ();
+
+        fn connect(&self, connect: &Connect<'_>) -> Option<()> {
+            self.publisher
+                .accept(connect.conn_id, "ann")
+                .unwrap()
+                .then_some(())
+        }
+
+        fn message(&self, _: &mut (), message: Inbound, _: usize) -> bool {
+            if let Inbound::Json(value) = message {
+                self.taken.send(value).unwrap();
+            }
+            true
+        }
+
+        fn signed(&self, _: &mut (), _: Value, _: usize) -> bool {
+            false
+        }
+        fn disconnect(&self, _: ()) {}
+    }
+
+    async fn next(ws: &mut Socket, kind: &str) -> Value {
+        loop {
+            let frame = ws.next().await.expect("open socket").unwrap();
+            if let Message::Text(text) = frame {
+                let message: Value = serde_json::from_str(&text).unwrap();
+                if message["t"] == kind {
+                    return message["p"].clone();
+                }
+            }
+        }
+    }
+    async fn open(addr: std::net::SocketAddr, outbox: Value) -> (Socket, Value) {
+        let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/wse"))
+            .await
+            .unwrap();
+        let hello = json!({"t":"client_hello","p":{"protocol_version":2,"outbox":outbox}});
+        ws.send(Message::Text(hello.to_string().into()))
+            .await
+            .unwrap();
+        let response = next(&mut ws, "outbox").await;
+        (ws, response)
+    }
+    async fn disconnect(ws: Socket, state: &SharedState) {
+        let connection = Arc::downgrade(&state.connections.read().values().next().unwrap().out);
+        drop(ws);
+        while connection.strong_count() != 0 {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    }
+    async fn deliver(
+        ws: &mut Socket,
+        taken: &mut mpsc::UnboundedReceiver<Value>,
+        s: u64,
+        repeat: bool,
+    ) {
+        let message = format!(r#"{{"s":{s},"t":"order","p":{{}},"id":"m{s}"}}"#);
+        ws.send(Message::Text(message.into())).await.unwrap();
+        let called = taken.recv().await.expect("application delivery");
+        assert_eq!(called["s"], s);
+        assert_eq!(called["id"], format!("m{s}"));
+        assert_eq!(
+            called.get("possible_repeat"),
+            repeat.then_some(&Value::Bool(true))
+        );
+    }
+
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut state = Config::default().into_state().unwrap();
+        state.producers = Arc::new(acks::Producers::exact(1));
+        let state = Arc::new(state);
+        let publisher = Publisher::new(Arc::clone(&state));
+        let (tx, mut taken) = mpsc::unbounded_channel();
+        let app = Arc::new(App {
+            publisher: publisher.clone(),
+            taken: tx,
+        });
+        let running = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let started = run::start(&state, &app, addr.port());
+        let server = tokio::spawn(run::serve(
+            Arc::clone(&state),
+            started,
+            listener,
+            app,
+            Arc::clone(&running),
+        ));
+
+        let (mut ws, first) = open(addr, json!({"producer":"orders"})).await;
+        assert_eq!(first["acked"], 0);
+        for s in 1..=2 {
+            deliver(&mut ws, &mut taken, s, false).await;
+        }
+        // The application took both. The client hasn't read either ACK.
+        disconnect(ws, &state).await;
+        let (other, _) = open(addr, json!({"producer":"another-outbox"})).await;
+        // Its disconnect takes the idle table over the limit of one.
+        disconnect(other, &state).await;
+
+        let (mut back, reply) = open(
+            addr,
+            json!({"producer":"orders","node":first["node"],"from":1,"written":2}),
+        )
+        .await;
+        assert_eq!(reply["acked"], 0, "forgotten decisions cannot be confirmed");
+        assert_eq!(reply["unsure"], 2);
+        deliver(&mut back, &mut taken, 1, true).await;
+        deliver(&mut back, &mut taken, 2, true).await;
+        deliver(&mut back, &mut taken, 3, false).await;
+        while next(&mut back, "ack").await["s"] != 3 {}
+
+        running.store(false, Ordering::SeqCst);
+        publisher.command(ServerCommand::Shutdown).unwrap();
+        server.await.unwrap();
+    })
+    .await
+    .expect("outbox replay completes");
+}

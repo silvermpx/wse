@@ -145,14 +145,14 @@ pub(crate) async fn serve<H: Handler>(
             }
         });
     }
-    // The clients' producers: one silent for a day is forgotten.
+    // Disconnected outboxes expire a day after their last connection ends.
     {
-        let producers_state = shared.clone();
+        let producers = Arc::clone(&shared.producers);
         let stop = stop.clone();
         tasks.spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(60));
             while tick(&mut interval, &stop).await {
-                producers_state.producers.sweep(super::acks::now_ms());
+                producers.sweep(std::time::Instant::now()).await;
             }
         });
     }
