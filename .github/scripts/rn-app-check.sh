@@ -210,4 +210,6 @@ echo "React Native's conformance cases: ${said:-no answer in 600 s}"
 if [[ -z "$said" ]]; then
   adb -s "$device" logcat -d -s ReactNativeJS:V AndroidRuntime:E | tail -40 >&2 || true
 fi
-"$target/debug/wse-conformance" check --manifest "$root/tests/conformance/react-native.json" --reports "$work/conformance"
+# From the checkout, whose commit the reports are checked against (in a copy
+# with no git, WSE_SOURCE names it).
+(cd "$root" && "$target/debug/wse-conformance" check --manifest tests/conformance/react-native.json --reports "$work/conformance")
