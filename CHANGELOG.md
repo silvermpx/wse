@@ -75,6 +75,8 @@ server every client is checked against.
 - Cluster: `connect_cluster()` refuses an IPv6 zone given by an
   interface's name (`%lo0`): give its number (`%1`).
 - The npm package needs Node 22 or newer.
+- Server: chrono is gone (unmaintained, RUSTSEC-2026-0543); the server
+  writes and reads its RFC 3339 times itself.
 
 ### Fixed
 
