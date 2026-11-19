@@ -13,7 +13,8 @@ void main() {
 
   setUpAll(() async => WseClient.init());
 
-  test('the Dart package passes every case it can', () async {
+  // A named body: Dart's formatters of every Flutter in CI lay it out alike.
+  Future<void> everyCase() async {
     if (control == null) {
       expect(
         Platform.environment['WSE_CONFORMANCE_REQUIRED'],
@@ -23,5 +24,11 @@ void main() {
       return;
     }
     expect(await runCases(control, agent: 'dart'), isEmpty);
-  }, timeout: const Timeout(Duration(minutes: 10)));
+  }
+
+  test(
+    'the Dart package passes every case it can',
+    everyCase,
+    timeout: const Timeout(Duration(minutes: 10)),
+  );
 }
