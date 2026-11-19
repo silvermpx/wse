@@ -956,7 +956,7 @@ async fn a_forgotten_outbox_replays_its_unanswered_messages_as_possible_repeats(
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let mut state = Config::default().into_state().unwrap();
-        state.producers = Arc::new(acks::Producers::exact(1));
+        state.producers = Arc::new(acks::Producers::with_limit(1));
         let state = Arc::new(state);
         let publisher = Publisher::new(Arc::clone(&state));
         let (tx, mut taken) = mpsc::unbounded_channel();
@@ -982,8 +982,10 @@ async fn a_forgotten_outbox_replays_its_unanswered_messages_as_possible_repeats(
         // The application took both. The client hasn't read either ACK.
         disconnect(ws, &state).await;
         let (other, _) = open(addr, json!({"producer":"another-outbox"})).await;
-        // Its disconnect takes the idle table over the limit of one.
+        // Its disconnect takes the idle table over the limit of one, and
+        // the server's next look forgets the longest-disconnected.
         disconnect(other, &state).await;
+        state.producers.bound(0);
 
         let (mut back, reply) = open(
             addr,

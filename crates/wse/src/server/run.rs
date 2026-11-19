@@ -145,14 +145,31 @@ pub(crate) async fn serve<H: Handler>(
             }
         });
     }
-    // Disconnected outboxes expire a day after their last connection ends.
+    // The clients' producers: past the bound the longest-disconnected are
+    // forgotten within a second, and every one a day after its last
+    // connection ended.
+    // A pass through the table runs on a thread of its own: tens of
+    // milliseconds on a large one, never on a thread connections run on.
     {
-        let producers = Arc::clone(&shared.producers);
+        let state = shared.clone();
         let stop = stop.clone();
         tasks.spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_secs(60));
+            let mut interval = tokio::time::interval(Duration::from_secs(1));
+            let mut ticks = 0u32;
             while tick(&mut interval, &stop).await {
-                producers.sweep(std::time::Instant::now()).await;
+                ticks = ticks.wrapping_add(1);
+                let connections = state.connection_count.load(Ordering::Relaxed);
+                let day = ticks.is_multiple_of(60);
+                if day || state.producers.over(connections) {
+                    let state = Arc::clone(&state);
+                    let _ = tokio::task::spawn_blocking(move || {
+                        state.producers.bound(connections);
+                        if day {
+                            state.producers.sweep(super::acks::now_ms());
+                        }
+                    })
+                    .await;
+                }
             }
         });
     }

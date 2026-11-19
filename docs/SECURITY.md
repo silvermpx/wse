@@ -463,7 +463,7 @@ The frontend `RateLimiter` prevents excessive sends.
 - `max_connections` caps total concurrent WebSocket connections; a full server answers the upgrade with HTTP 503 and `Retry-After: 5`
 - `max_subscriptions_per_connection` caps topics per connection (0 = unlimited). Prevents topic explosion DoS where a single client creates millions of unique topics
 - Inbound queue bounded at 131,072 events
-- Each node retains delivery decisions for at most 262,144 idle client outboxes across all users (or twice `max_connections`, if more), for up to a day after their last connection closes. Past the bound, the node forgets the longest-disconnected first (each of the table's 256 parts keeps its share). Active outboxes retain their state separately. After eviction, an unanswered message the client may already have sent can reach the application marked `possible_repeat`.
+- Each node retains delivery decisions for at most 262,144 idle client outboxes across all users (or twice `max_connections`, if more), for up to a day after their last connection closes. Past the bound, the node forgets the longest-disconnected first, within a second. Active outboxes retain their state separately. After eviction, an unanswered message the client may already have sent can reach the application marked `possible_repeat`.
 - `send_event` deduplication: one server-wide window of the last 50,000 (connection, id) pairs, oldest out first
 
 ## Topic ACL
