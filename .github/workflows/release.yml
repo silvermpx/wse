@@ -586,15 +586,20 @@ jobs:
         run: python -m twine check --strict python-client-dist/*
 
       # The tests' conftest puts python-client/ on sys.path; run a copy of
-      # them outside the tree so they import the installed wheel instead.
+      # them outside the tree so they import the installed wheel instead,
+      # laid out as in the repository beside the files they share with the
+      # other clients (the vectors) and the examples they run.
       - name: Test the built wheel
         run: |
           wheel="$(ls python-client-dist/*.whl)"
           python -m pip install "${wheel}[all]" pytest pytest-asyncio
           work="$RUNNER_TEMP/client-wheel-test"
-          mkdir -p "$work"
-          cp -r python-client/tests python-client/pyproject.toml "$work/"
-          cd "$work"
+          mkdir -p "$work/python-client" "$work/crates/wse/tests" "$work/crates/wse-client/tests"
+          cp -r python-client/tests python-client/pyproject.toml "$work/python-client/"
+          cp -r crates/wse/tests/vectors "$work/crates/wse/tests/"
+          cp -r crates/wse-client/tests/vectors "$work/crates/wse-client/tests/"
+          cp -r examples "$work/"
+          cd "$work/python-client"
           python -c "import wse_client; print(wse_client.__file__, wse_client.__version__)"
           python -m pytest tests/ -v --tb=short -p no:cacheprovider
 
@@ -999,8 +1004,10 @@ jobs:
           targets: ${{ matrix.targets }}
 
       # In a container: stable Rust with the target, through the container's
-      # rustup or a new one. Windows: aws-lc's assembly from the objects it
-      # ships, without NASM.
+      # rustup or a new one. The container's own stable is removed first: an
+      # image may ship it without the files of a component (clippy), and
+      # rustup cannot then update it in place. Windows: aws-lc's assembly
+      # from the objects it ships, without NASM.
       - name: Build
         shell: bash
         env:
@@ -1015,6 +1022,7 @@ jobs:
           fi
           docker run --rm -v "$PWD:/io" -w /io "$CONTAINER" bash -euo pipefail -c '
             if command -v rustup > /dev/null; then
+              rustup toolchain uninstall stable > /dev/null 2>&1 || true
               rustup toolchain install stable --profile minimal --target "$1" > /dev/null
               rustup default stable > /dev/null
             else

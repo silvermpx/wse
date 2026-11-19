@@ -238,14 +238,20 @@ import pytest  # noqa: E402
 
 from wse_client import outbox as outbox_module  # noqa: E402
 
-VECTOR = json.loads(
-    (
-        pathlib.Path(__file__).resolve().parents[2]
-        / "crates/wse-client/tests/vectors/outbox.json"
-    ).read_text(encoding="utf-8")
+VECTOR_FILE = (
+    pathlib.Path(__file__).resolve().parents[2]
+    / "crates/wse-client/tests/vectors/outbox.json"
+)
+# The repository's file, shared with the Rust client; a package built without
+# the repository skips its tests.
+VECTOR = (
+    json.loads(VECTOR_FILE.read_text(encoding="utf-8"))
+    if VECTOR_FILE.exists()
+    else None
 )
 
 
+@pytest.mark.skipif(VECTOR is None, reason="no shared vectors here")
 class TestTheFileFormat:
     """The file of the Rust client's, line by line (tests/vectors/outbox.json)."""
 
@@ -302,7 +308,9 @@ class TestTheFileFormat:
             for r in state["records"]
         ]
 
-    @pytest.mark.parametrize("damaged", VECTOR["damaged"], ids=lambda d: d["why"])
+    @pytest.mark.parametrize(
+        "damaged", VECTOR["damaged"] if VECTOR else [], ids=lambda d: d["why"]
+    )
     def test_a_damaged_file_is_read_up_to_where_it_checks(self, damaged):
         read = outbox_module._read(damaged["file"].encode())
         if damaged["records"] is None:
