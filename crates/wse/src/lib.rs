@@ -24,6 +24,8 @@ mod recovery;
 #[cfg(feature = "server")]
 mod reliability;
 #[cfg(feature = "server")]
+mod rfc3339;
+#[cfg(feature = "server")]
 mod server;
 
 #[cfg(feature = "server")]

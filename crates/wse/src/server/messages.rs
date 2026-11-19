@@ -193,7 +193,7 @@ pub(super) fn build_auth_failed(reason: &str) -> String {
 }
 
 pub(super) fn build_error_json(code: &str, message: &str) -> String {
-    let ts = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    let ts = crate::rfc3339::now(3);
     let payload = serde_json::json!({
         "c": "WSE",
         "t": "error",
@@ -219,7 +219,7 @@ pub(super) fn build_server_hello(
     let recovery_enabled = state.recovery.is_some();
     let cluster_enabled = state.cluster_cmd_tx.load().is_some();
     let encryption_enabled = encryption_pubkey.is_some() || e2e.is_some();
-    let ts = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    let ts = crate::rfc3339::now(3);
     let mut val = serde_json::json!({
         "c": "WSE",
         "t": "server_hello",
@@ -281,7 +281,7 @@ pub(super) fn build_server_ready(
     cnf: Option<&str>,
 ) -> String {
     let recovery_enabled = state.recovery.is_some();
-    let ts = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    let ts = crate::rfc3339::now(3);
     let msg_id = Uuid::now_v7().to_string();
     let mut val = serde_json::json!({
         "c": "WSE",

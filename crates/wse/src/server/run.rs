@@ -260,8 +260,7 @@ pub(crate) async fn serve<H: Handler>(
                     if handle.closer.is_closing() || !handle.out.admitted.load(Ordering::Acquire) {
                         continue;
                     }
-                    let ts =
-                        chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+                    let ts = crate::rfc3339::now(3);
                     let ping_msg = format!(
                         "{{\"c\":\"WSE\",\"t\":\"ping\",\"p\":{{\"server_time\":\"{ts}\"}}}}"
                     );

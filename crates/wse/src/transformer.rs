@@ -1,4 +1,3 @@
-use chrono::{DateTime, Utc};
 use pyo3::prelude::*;
 use pyo3::sync::PyOnceLock;
 use pyo3::types::{
@@ -229,29 +228,9 @@ fn dict_get<'py>(dict: &Bound<'py, PyDict>, key: &str) -> PyResult<Option<Bound<
 /// Parse an ISO 8601 timestamp string and compute milliseconds from then to now.
 /// Returns None if parsing fails or the timestamp is not available.
 fn compute_latency_ms(timestamp_str: &str) -> Option<i64> {
-    // Handle 'Z' suffix -> '+00:00'
-    let normalized = if let Some(stripped) = timestamp_str.strip_suffix('Z') {
-        format!("{}+00:00", stripped)
-    } else {
-        timestamp_str.to_string()
-    };
-
-    // Try parsing with chrono
-    if let Ok(dt) = DateTime::parse_from_rfc3339(&normalized) {
-        let now = Utc::now();
-        let delta = now.signed_duration_since(dt.with_timezone(&Utc));
-        return Some(delta.num_milliseconds());
-    }
-
-    // Fallback: try parsing without timezone (assume UTC)
-    if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(timestamp_str, "%Y-%m-%dT%H:%M:%S%.f") {
-        let utc_dt = dt.and_utc();
-        let now = Utc::now();
-        let delta = now.signed_duration_since(utc_dt);
-        return Some(delta.num_milliseconds());
-    }
-
-    None
+    // RFC 3339, or the same without an offset, read as UTC.
+    let then = crate::rfc3339::parse_millis(timestamp_str)?;
+    Some(crate::rfc3339::now_millis() - then)
 }
 
 // ---------------------------------------------------------------------------
@@ -393,7 +372,7 @@ pub fn rust_transform_event<'py>(
                 let converted: Py<PyAny> = ensure_str(py, &val)?;
                 converted.bind(py).str()?.to_string()
             }
-            None => Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Micros, true),
+            None => crate::rfc3339::now(6),
         }
     };
 

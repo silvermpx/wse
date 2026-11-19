@@ -398,7 +398,7 @@ impl Publisher {
             );
         }
         if !map.contains_key("ts") {
-            let ts = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+            let ts = crate::rfc3339::now(3);
             map.insert("ts".to_owned(), serde_json::Value::String(ts));
         }
         map.insert("v".to_owned(), serde_json::Value::Number(1.into()));
