@@ -189,11 +189,8 @@ pub(crate) fn connect(
     let (inbound_links, main_port_tx, links_port) = match settings.port {
         Some(port) => {
             let host = settings.host.as_deref().unwrap_or("0.0.0.0");
-            let listener = std::net::TcpListener::bind((host, port))
-                .and_then(|listener| {
-                    listener.set_nonblocking(true)?;
-                    tokio::net::TcpListener::from_std(listener)
-                })
+            let listener = super::run::listen(host, port)
+                .and_then(tokio::net::TcpListener::from_std)
                 .map_err(|e| {
                     Error::Io(
                         e.kind(),

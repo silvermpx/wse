@@ -102,9 +102,8 @@ impl RustWSEServer {
             .thread_name("wse-runtime")
             .build()
             .map_err(|e| PyRuntimeError::new_err(format!("cannot start the runtime: {e}")))?;
-        let listener = std::net::TcpListener::bind((self.host.as_str(), self.port))
+        let listener = run::listen(self.host.as_str(), self.port)
             .and_then(|listener| {
-                listener.set_nonblocking(true)?;
                 let _runtime = rt.enter();
                 TcpListener::from_std(listener)
             })

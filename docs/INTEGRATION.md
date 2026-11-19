@@ -564,7 +564,7 @@ server.connect_cluster(
 )
 ```
 
-Peers' links come in on `cluster_port` (on all interfaces; `cluster_host="10.0.0.1"` binds one). The links are TLS, always: every node derives the same key from the cluster's secret, at least 32 random bytes, and proves it when a link opens, so a node without the secret cannot join. Left out, the secret comes from `WSE_CLUSTER_SECRET`. Without a secret or certificates, `connect_cluster()` raises `ValueError`.
+Peers' links come in on `cluster_port` (on all IPv4 interfaces; `cluster_host="::"` adds IPv6, `cluster_host="10.0.0.1"` binds one). The links are TLS, always: every node derives the same key from the cluster's secret, at least 32 random bytes, and proves it when a link opens, so a node without the secret cannot join. Left out, the secret comes from `WSE_CLUSTER_SECRET`. Without a secret or certificates, `connect_cluster()` raises `ValueError`.
 
 **Single port:** the links can share the WebSocket port, in TLS as on their own:
 

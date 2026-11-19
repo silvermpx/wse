@@ -652,7 +652,8 @@ impl RustWSEServer {
     /// they come from WSE_CLUSTER_SECRET, or from WSE_CLUSTER_TLS_CERT/KEY/CA.
     ///
     /// Peers' links come in on `cluster_port` (bound on `cluster_host`,
-    /// 0.0.0.0 by default), or with `single_port=True` on the WebSocket port.
+    /// 0.0.0.0 by default; `::` is IPv6 and IPv4), or with `single_port=True`
+    /// on the WebSocket port.
     /// One of the two is required.
     ///
     /// Addresses are `host:port`; an IPv6 address carries its zone by number

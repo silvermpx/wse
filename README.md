@@ -257,7 +257,7 @@ Sizes are in bytes, times in seconds.
 
 | Option | Default | |
 |--------|---------|---|
-| `host`, `port` | required | The address to listen on |
+| `host`, `port` | required | The address to listen on (`::`: IPv6 and IPv4) |
 | `max_connections` | 1000 | Connections at once |
 | `jwt_secret` | `None` | The key that checks tokens: the shared secret for HS256/384/512 (at least 32, 48 or 64 bytes), or the PEM public key for the RSA, ECDSA and EdDSA algorithms. Without it the application checks each connection itself and calls `accept_connection()` |
 | `jwt_algorithm` | `"HS256"` | The algorithm tokens must use; a token's own `alg` header never overrides it |

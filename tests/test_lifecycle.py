@@ -57,6 +57,21 @@ class TestStart:
         finally:
             srv.stop()
 
+    def test_every_ipv6_address_is_every_ipv4_one_too(self, server_port):
+        """On ``::`` the server takes IPv4 as well, on every system: Windows
+        keeps such a socket to IPv6 unless it is told."""
+        try:
+            with socket.socket(socket.AF_INET6) as probe:
+                probe.bind(("::", 0))
+        except OSError:
+            pytest.skip("no IPv6 here")
+        srv = RustWSEServer("::", server_port)
+        srv.start()
+        try:
+            socket.create_connection(("127.0.0.1", server_port), timeout=5).close()
+        finally:
+            srv.stop()
+
     def test_context_manager_starts_and_stops(self, server_port):
         with RustWSEServer("127.0.0.1", server_port) as srv:
             assert srv.is_running()

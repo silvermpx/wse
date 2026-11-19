@@ -85,6 +85,9 @@ server every client is checked against.
   the last one.
 - Server: `Server::stop` lets its port go once it takes no more
   connections; a client coming back during a restart waited 10 s.
+- Server: the server's port and the cluster port bound on `::` take IPv4
+  too on every system, as on Linux; on Windows they took IPv6 only. Up to
+  1024 connections wait to be taken, not 128, as on a tokio listener.
 - Server: a recovery that cannot be whole says `recovered: false`: after a
   message the memory budget left no room to keep, and for a client that
   names only its last position when another node's history is gone.

@@ -30,6 +30,45 @@ fn tcp_keepalive() -> socket2::TcpKeepalive {
     keepalive
 }
 
+/// A listener on `host:port`, nonblocking for the runtime: each address the
+/// host names in turn, as `std::net::TcpListener::bind` takes them, with
+/// tokio's queue of 1024 connections not yet taken. An IPv6 address takes
+/// IPv4 too where the system can: `::` is every address on every system,
+/// as on Linux (Windows keeps such a socket to IPv6 unless it is told).
+pub(crate) fn listen(host: &str, port: u16) -> std::io::Result<std::net::TcpListener> {
+    use std::net::ToSocketAddrs;
+    let mut failed = None;
+    for addr in (host, port).to_socket_addrs()? {
+        match listen_at(addr) {
+            Ok(listener) => return Ok(listener),
+            Err(e) => failed = Some(e),
+        }
+    }
+    Err(failed.unwrap_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "could not resolve to any addresses",
+        )
+    }))
+}
+
+fn listen_at(addr: std::net::SocketAddr) -> std::io::Result<std::net::TcpListener> {
+    use socket2::{Domain, Protocol, Socket, Type};
+    let socket = Socket::new(Domain::for_address(addr), Type::STREAM, Some(Protocol::TCP))?;
+    // A port bound again at once after a restart, as std and tokio bind it;
+    // on Windows it would let another socket take a port in use.
+    #[cfg(not(windows))]
+    socket.set_reuse_address(true)?;
+    if addr.is_ipv6() {
+        // Where a socket is IPv6 only whatever it asks (OpenBSD), it stays so.
+        let _ = socket.set_only_v6(false);
+    }
+    socket.bind(&addr.into())?;
+    socket.listen(1024)?;
+    socket.set_nonblocking(true)?;
+    Ok(socket.into())
+}
+
 /// What a server's start makes before it serves: the command queue, and a
 /// delivery task for each lane, running before the first command.
 pub(crate) struct Started {
@@ -444,4 +483,25 @@ pub(crate) fn stopped(shared: &SharedState) {
     shared.cluster_cmd_tx.store(None);
     *shared.cluster_main_port.write().unwrap() = None;
     *shared.cluster_instance_id.lock().unwrap() = None;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::listen;
+
+    #[test]
+    fn a_listener_on_every_ipv6_address_takes_ipv4_too() {
+        // Nothing to show on a system without IPv6.
+        let Ok(listener) = listen("::", 0) else {
+            return;
+        };
+        let port = listener.local_addr().unwrap().port();
+        std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+    }
+
+    #[test]
+    fn a_host_name_is_listened_on_at_an_address_it_names() {
+        let listener = listen("localhost", 0).unwrap();
+        assert!(listener.local_addr().unwrap().ip().is_loopback());
+    }
 }
