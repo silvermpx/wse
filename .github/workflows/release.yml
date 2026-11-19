@@ -1674,13 +1674,23 @@ jobs:
 
       # A matrix job reports success to `needs` though one of its legs was
       # cancelled (GitHub gave it no runner): each job of the run is read on
-      # its own, in its latest attempt.
+      # its own, in its latest attempt. In pages of 30, asked again on an
+      # error: GitHub answers a large page of a run run again with a 502.
       - name: Every leg of every job passed
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          failed="$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/jobs?filter=latest&per_page=100" --paginate \
-            --jq '.jobs[] | select(.name != "Release gate" and .name != "GitHub release" and (.name | startswith("Publish") | not)) | select(.status == "completed" and (.conclusion == "failure" or .conclusion == "cancelled" or .conclusion == "timed_out")) | "\(.name): \(.conclusion)"')"
+          for attempt in 1 2 3 4 5; do
+            if failed="$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/jobs?filter=latest&per_page=30" --paginate \
+              --jq '.jobs[] | select(.name != "Release gate" and .name != "GitHub release" and (.name | startswith("Publish") | not)) | select(.status == "completed" and (.conclusion == "failure" or .conclusion == "cancelled" or .conclusion == "timed_out")) | "\(.name): \(.conclusion)"')"; then
+              break
+            fi
+            if [ "$attempt" = 5 ]; then
+              echo "::error::GitHub did not list this run's jobs."
+              exit 1
+            fi
+            sleep $((attempt * 15))
+          done
           if [ -n "$failed" ]; then
             echo "::error::Jobs of this run that did not pass:"
             printf '%s\n' "$failed"
