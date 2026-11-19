@@ -1124,6 +1124,8 @@ jobs:
             runner: windows-latest
           - name: Windows arm64
             runner: windows-11-arm
+            # Temurin ships no Java 17 for Windows on Arm; Microsoft's does.
+            java: microsoft
     defaults:
       run:
         shell: bash
@@ -1138,7 +1140,7 @@ jobs:
 
       - uses: actions/setup-java@d1374f8ac74474200d16ef8ecee22c7ae7a51880  # v6.3.0
         with:
-          distribution: temurin
+          distribution: ${{ matrix.java || 'temurin' }}
           java-version: '17'
 
       - uses: gradle/actions/setup-gradle@8da46b539cd8fe6ab27ca75128919a18d757604c  # v6.4.1
