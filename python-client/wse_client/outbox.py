@@ -864,6 +864,13 @@ def _record(body: str, value: object) -> _Kept | None:
     )
 
 
+# Bytes as they are: Windows opens a file as text otherwise, a newline
+# written as two bytes, and no line of it checks.
+_BINARY = getattr(os, "O_BINARY", 0)
+_APPEND = os.O_WRONLY | os.O_CREAT | os.O_APPEND | _BINARY
+_CREATE = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | _BINARY
+
+
 def _sync(fd: int) -> None:
     """To the disk: on Apple's systems past the drive's own cache."""
     if sys.platform == "darwin":
@@ -970,7 +977,7 @@ class _Log:
     ) -> tuple[_Log, _Read | None]:
         """The file at *path*, the client's alone from now on, and what it
         holds (None: a new file, or not one of this format)."""
-        lock_fd = os.open(path + ".lock", os.O_RDWR | os.O_CREAT, 0o600)
+        lock_fd = os.open(path + ".lock", os.O_RDWR | os.O_CREAT | _BINARY, 0o600)
         if not _lock(lock_fd):
             os.close(lock_fd)
             raise OSError("it is another client's")
@@ -1054,9 +1061,7 @@ class _Writer:
         # The log whose mark it raises, and who hears it rose.
         self.log = log
         self.wrote = wrote
-        self.fd: int | None = os.open(
-            path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600
-        )
+        self.fd: int | None = os.open(path, _APPEND, 0o600)
         # A write failed: what is appended waits for the file anew.
         self.skipping = False
         # The last failure was said; the next is said after a success.
@@ -1137,7 +1142,7 @@ class _Writer:
     def rewrite(self, data: bytes) -> None:
         """The new file beside the old, on the disk, then in its place."""
         try:
-            fd = os.open(self.tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            fd = os.open(self.tmp, _CREATE, 0o600)
             try:
                 _write_all(fd, data)
                 _sync(fd)
@@ -1160,7 +1165,7 @@ class _Writer:
                 os.remove(self.tmp)
             except OSError:
                 pass
-            self.fd = os.open(self.path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+            self.fd = os.open(self.path, _APPEND, 0o600)
             raise
         if sys.platform != "win32":
             directory = os.path.dirname(self.path) or "."
@@ -1172,4 +1177,4 @@ class _Writer:
                     os.close(dfd)
             except OSError:
                 pass
-        self.fd = os.open(self.path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        self.fd = os.open(self.path, _APPEND, 0o600)
