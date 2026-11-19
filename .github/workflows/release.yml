@@ -511,7 +511,8 @@ jobs:
       - name: Install the wheel in python:3.12-alpine and run the tests
         run: |
           docker run --rm -v "$PWD:/src:ro" python:3.12-alpine sh -euc '
-            cp -r /src/tests /src/pyproject.toml /src/python-client /tmp/
+            # The tests run the examples and a benchmark beside them.
+            cp -r /src/tests /src/pyproject.toml /src/python-client /src/examples /src/benchmarks /tmp/
             cd /tmp
             python -m pip install --no-index --find-links /src/dist wse-server
             python -m pip install pytest pytest-asyncio httpx websockets cryptography prometheus-client ./python-client
