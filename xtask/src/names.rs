@@ -21,7 +21,13 @@ pub struct Finding {
 }
 
 /// Names from libraries we call.
-const LIBRARY_NAMES: &[&str] = &["now_v7", "new_v4", "new_v7", "get_version_num"];
+const LIBRARY_NAMES: &[&str] = &[
+    "now_v7",
+    "new_v4",
+    "new_v7",
+    "get_version_num",
+    "set_only_v6",
+];
 
 fn ident() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
@@ -107,6 +113,7 @@ mod tests {
             "run_test_1",
             "sha256",
             "now_v7",
+            "set_only_v6",
             "ipv4",
             "Ipv6Addr",
             "dev",
