@@ -62,7 +62,7 @@ web-sys = { version = "0.3", features = [
     "IdbKeyRange", "IdbObjectStore", "IdbObjectStoreParameters", "IdbOpenDbRequest", "IdbRequest",
     "IdbTransaction", "IdbTransactionMode", "MessageEvent", "WebSocket",
 ] }
-gloo-timers = { version = "0.3", features = ["futures"] }
+gloo-timers = { version = "0.4", features = ["futures"] }
 
 [features]
 default = ["aws-lc"]
