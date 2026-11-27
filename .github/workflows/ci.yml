@@ -1106,7 +1106,7 @@ jobs:
         with:
           gradle-version: '9.9.1'
 
-      - uses: taiki-e/install-action@ab49d3c64680143e184118bed66a46419fc15519  # v2.90.5
+      - uses: taiki-e/install-action@75a7c0f87bd666af3cdb75c5b9e9d03ab6044e6f  # v2.90.6
         with:
           tool: cargo-ndk@4.1.2
 
@@ -1221,7 +1221,7 @@ jobs:
           workspaces: ". -> target"
           key: dart
 
-      - uses: taiki-e/install-action@ab49d3c64680143e184118bed66a46419fc15519  # v2.90.5
+      - uses: taiki-e/install-action@75a7c0f87bd666af3cdb75c5b9e9d03ab6044e6f  # v2.90.6
         with:
           tool: cargo-expand@1.0.127,flutter_rust_bridge_codegen@2.13.0
 
